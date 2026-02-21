@@ -6,7 +6,7 @@ dmaplane is a Linux kernel module for learning the host-side data path between A
 
 ## Current Phase
 
-Phase 1 — Driver Foundations & Concurrency. See `docs/reference/MASTER_PLAN.md` Phase 1 for full spec and acceptance criteria.
+Phase 1 — Driver Foundations & Concurrency — **COMPLETE**. See `docs/reference/MASTER_PLAN.md` for the next phase spec.
 
 ## Key References
 
@@ -23,8 +23,8 @@ Read these before implementing anything:
 - `MODULE_LICENSE("GPL v2")` in the kernel module
 
 ### Headers
-- `driver/dmaplane.h` — kernel-internal header. Kernel-only types behind `#ifdef __KERNEL__`.
-- `include/dmaplane_uapi.h` — userspace-visible API. Ioctl numbers, parameter structs, constants. Must be includable from both kernel and userspace. Keep in sync with `driver/dmaplane.h`.
+- `include/dmaplane_uapi.h` — userspace-visible API (primary definition point). Ioctl numbers, parameter structs, constants. Must be includable from both kernel and userspace.
+- `driver/dmaplane.h` — kernel-internal header. Includes `dmaplane_uapi.h` and adds kernel-only types behind `#ifdef __KERNEL__`.
 
 ### Logging
 - Use `pr_fmt(fmt) KBUILD_MODNAME ": " fmt` at the top of every `.c` file for consistent `dmaplane:` prefix.
@@ -40,6 +40,9 @@ Read these before implementing anything:
 - Magic: `0xE4`
 - Groups: buffer management `0x01`–`0x09`, RDMA `0x10`–`0x19`, MR `0x20`–`0x29`, benchmarks `0x30`–`0x39`, stats `0x40`–`0x49`, NUMA `0x50`–`0x59`, GPU `0x60`–`0x69`, peer QP `0x70`–`0x79`, WRITEIMM `0x80`–`0x89`
 - Phase 1 uses `0x01`–`0x04` (create channel, submit, complete, get stats)
+
+### Build system
+- `driver/Makefile` uses `$(CURDIR)` (not `$(PWD)`) for the Kbuild `M=` path. `$(PWD)` inherits from the parent make invocation and resolves to the wrong directory when called via `make -C driver`.
 
 ### Build
 ```bash
@@ -86,7 +89,7 @@ dmaplane-master/
 
 | Phase | Status | Topic |
 |-------|--------|-------|
-| 1 | **CURRENT** | Driver foundations & concurrency |
+| 1 | **COMPLETE** | Driver foundations & concurrency |
 | 2 | Planned | DMA memory allocation |
 | 3 | Planned | NUMA topology & placement |
 | 4 | Planned | RDMA engine |
