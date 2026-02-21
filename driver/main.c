@@ -1,11 +1,50 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * dmaplane — Character device driver with submission/completion rings
+ * dmaplane main.c — Character device driver and ioctl dispatch
  * Copyright (c) 2026 Graziano Labs Corp.
  *
  * Phase 1: Driver foundations and concurrency.
- * Character device at /dev/dmaplane, ioctl-driven, per-channel worker
- * threads with spinlock-protected ring buffers.
+ *
+ * This is the entry point for the dmaplane kernel module.  It registers
+ * a character device at /dev/dmaplane, dispatches ioctls to per-command
+ * handlers, and manages per-file context (one channel per open fd).
+ *
+ * Architecture:
+ *   userspace ioctl → dmaplane_ioctl (this file) → handler functions
+ *   Each open fd gets a dmaplane_file_ctx.  Channel creation spawns a
+ *   kthread that drains the submission ring and fills the completion ring.
+ *   File close tears down the channel and stops the kthread.
+ *
+ * Data flow:
+ *   userspace --[IOCTL_SUBMIT]--> sub_ring --[worker]--> comp_ring
+ *             <--[IOCTL_COMPLETE]--
+ *
+ * Locking summary:
+ *   dev_mutex (struct mutex)
+ *     Protects: channel slot allocation and deallocation in
+ *               dma_dev->channels[].
+ *     Acquired by: dmaplane_ioctl_create_channel, dmaplane_release,
+ *                  dmaplane_exit.
+ *     Why mutex: only taken in process/ioctl context where sleeping is
+ *                permitted; never on the submit/complete hot path.
+ *     Ordering: outermost lock; never held while acquiring ring locks.
+ *
+ *   sub_ring.lock / comp_ring.lock (spinlock_t, irqsave)
+ *     Protects: ring entries[] array and head/tail index updates for
+ *               the respective ring.
+ *     Acquired by: ioctl submit/complete paths (producer or consumer)
+ *                  and the worker thread (the other side).
+ *     Why spinlock: ring operations are very short and may be called
+ *                   from contexts where sleeping is not desired.
+ *     Ordering: never nested; each ring lock is independent.
+ *
+ * Memory ordering:
+ *   smp_store_release() is used on every head/tail advancement to
+ *   ensure that the entry write (or read) is visible to the other side
+ *   before the index update becomes visible.  The matching acquire
+ *   semantics are provided by spin_lock_irqsave() on the consumer/
+ *   producer side.  This is a no-op on x86 (TSO) but required for
+ *   correctness on ARM and RISC-V.
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -28,13 +67,20 @@ MODULE_AUTHOR("Graziano Labs Corp.");
 MODULE_DESCRIPTION("dmaplane — host-side data path for AI-scale systems");
 MODULE_VERSION("0.1.0");
 
-/* Singleton device context */
+/* Singleton device context — allocated in dmaplane_init, freed in dmaplane_exit */
 static struct dmaplane_dev *dma_dev;
 
 /* ------------------------------------------------------------------ */
 /* Ring buffer operations                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * dmaplane_ring_init - Zero-initialise a ring buffer and its lock.
+ * @ring: ring to initialise.
+ *
+ * Called once per ring during channel creation.  No locking required
+ * because the channel is not yet visible to other threads.
+ */
 static void dmaplane_ring_init(struct dmaplane_ring *ring)
 {
 	memset(ring->entries, 0, sizeof(ring->entries));
@@ -53,6 +99,23 @@ static void dmaplane_ring_init(struct dmaplane_ring *ring)
  * Drains submissions from the submission ring, "processes" each entry
  * (Phase 1: increments payload by 1 to prove the worker touched it),
  * and pushes results onto the completion ring.
+ *
+ * Locking:
+ *   Acquires sub_ring.lock (consumer side) to read submissions and
+ *   comp_ring.lock (producer side) to write completions.  No lock is
+ *   held during entry processing or sleep, minimising contention.
+ *
+ * Backpressure:
+ *   If the completion ring is full, the worker yields via cond_resched()
+ *   in a spin-wait loop rather than dropping entries.  This applies
+ *   backpressure upstream: the submission ring fills, and userspace
+ *   gets -ENOSPC on the next submit, forcing it to drain completions.
+ *
+ * Shutdown:
+ *   The outer loop checks kthread_should_stop().  The wait_event also
+ *   checks kthread_should_stop() so the worker wakes up on stop.
+ *   The completion ring yield loop additionally checks kthread_should_stop()
+ *   to ensure the worker can exit even if the ring stays full.
  */
 static int dmaplane_worker_fn(void *data)
 {
@@ -64,10 +127,18 @@ static int dmaplane_worker_fn(void *data)
 	pr_debug("worker %u started\n", chan->id);
 
 	while (!kthread_should_stop()) {
-		/* Sleep until there is work or we are told to stop */
+		/*
+		 * Sleep until the submission ring is non-empty or the
+		 * kthread stop flag is set.  wait_event_interruptible
+		 * puts the worker to sleep on chan->wait_queue and
+		 * re-checks the condition atomically on each wakeup,
+		 * preventing the lost-wakeup race where a wake_up
+		 * arrives between the condition check and the sleep.
+		 */
 		wait_event_interruptible(chan->wait_queue,
 			!dmaplane_ring_empty(sub) || kthread_should_stop());
 
+		/* If stopped and ring is drained, exit cleanly */
 		if (kthread_should_stop() && dmaplane_ring_empty(sub))
 			break;
 
@@ -77,24 +148,51 @@ static int dmaplane_worker_fn(void *data)
 			struct dmaplane_ring_entry entry;
 			unsigned long flags;
 
-			/* Read one submission */
+			/* Read one submission under the lock */
 			spin_lock_irqsave(&sub->lock, flags);
+			/* Re-check under lock — the unlocked check above
+			 * is an optimisation; this is the authoritative one */
 			if (dmaplane_ring_empty(sub)) {
 				spin_unlock_irqrestore(&sub->lock, flags);
 				break;
 			}
 			entry = sub->entries[sub->tail % DMAPLANE_RING_SIZE];
+			/* smp_store_release: ensure the entry read above
+			 * is complete before the tail advance becomes
+			 * visible to the submit-side producer. */
 			smp_store_release(&sub->tail, sub->tail + 1);
 			spin_unlock_irqrestore(&sub->lock, flags);
 
-			/* Process: increment payload by 1 */
+			/*
+			 * Phase 1 processing: increment payload by 1 to
+			 * prove the worker touched the entry.  Future phases
+			 * replace this with DMA ops, RDMA posts, or GPU
+			 * transfers.
+			 */
 			entry.payload += 1;
 
-			/* Push to completion ring, yielding if full */
+			/*
+			 * Push to completion ring with backpressure.
+			 *
+			 * If the completion ring is full (userspace is not
+			 * draining completions fast enough), we spin-yield
+			 * rather than dropping the entry:
+			 *  1. Acquire comp_ring lock.
+			 *  2. If room, write entry, advance head with
+			 *     smp_store_release, and break.
+			 *  3. If full, release lock, cond_resched() to
+			 *     yield CPU, then retry.
+			 *  4. If kthread_should_stop() during wait, bail
+			 *     to done — entry is lost, acceptable during
+			 *     channel teardown.
+			 */
 			for (;;) {
 				spin_lock_irqsave(&comp->lock, flags);
 				if (!dmaplane_ring_full(comp)) {
 					comp->entries[comp->head % DMAPLANE_RING_SIZE] = entry;
+					/* smp_store_release: entry store must
+					 * be visible before head advance
+					 * reaches the complete-ioctl consumer */
 					smp_store_release(&comp->head, comp->head + 1);
 					spin_unlock_irqrestore(&comp->lock, flags);
 					break;
@@ -110,7 +208,7 @@ static int dmaplane_worker_fn(void *data)
 			chan->stats.total_completions++;
 			batch++;
 
-			/* Yield periodically to avoid hogging CPU */
+			/* Yield every 64 entries to avoid hogging CPU */
 			if (batch % 64 == 0)
 				cond_resched();
 		}
@@ -125,6 +223,15 @@ done:
 /* Channel management                                                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * dmaplane_channel_init - Reset all channel state to initial values.
+ * @chan: channel to initialise.
+ * @id:  channel index in dma_dev->channels[].
+ *
+ * Called under dev_mutex during IOCTL_CREATE_CHANNEL.  Initialises both
+ * rings, the wait queue, counters, and the stats block.  The channel is
+ * not yet marked active, so no other thread can observe it.
+ */
 static void dmaplane_channel_init(struct dmaplane_channel *chan, unsigned int id)
 {
 	dmaplane_ring_init(&chan->sub_ring);
@@ -139,8 +246,20 @@ static void dmaplane_channel_init(struct dmaplane_channel *chan, unsigned int id
 }
 
 /*
- * Stop a channel's worker thread and mark the channel as inactive.
- * Called from release() or module exit.
+ * dmaplane_channel_destroy - Stop a channel's worker and mark inactive.
+ * @chan: channel to destroy.
+ *
+ * Must be called under dev_mutex (from release or module exit).
+ *
+ * Teardown sequence:
+ *  1. Set chan->shutdown = true to signal the worker.
+ *  2. Wake the worker so it can observe the flag and kthread_should_stop().
+ *  3. kthread_stop() waits for the worker to return, then puts the
+ *     task_struct.  This is a blocking call.
+ *  4. Mark chan->active = false so the slot can be reused.
+ *
+ * After return, the worker is guaranteed stopped and ring memory is safe
+ * to reuse (but not zeroed — stats remain readable until re-init).
  */
 static void dmaplane_channel_destroy(struct dmaplane_channel *chan)
 {
@@ -163,6 +282,28 @@ static void dmaplane_channel_destroy(struct dmaplane_channel *chan)
 /* Ioctl handlers                                                      */
 /* ------------------------------------------------------------------ */
 
+/*
+ * dmaplane_ioctl_create_channel - Allocate a channel and start its worker.
+ * @ctx: file context (carries the owning dev pointer and channel slot).
+ * @arg: userspace pointer to struct dmaplane_channel_params (output).
+ *
+ * Finds the first free slot in dev->channels[], initialises it, creates
+ * a kthread with kthread_create() (which does NOT start it), stores the
+ * task pointer, then wake_up_process() makes it runnable.  The two-step
+ * create/wake pattern ensures chan->worker is set before the thread can
+ * run, preventing a race where the worker dereferences itself before
+ * the pointer is stored.
+ *
+ * Concurrency: dev_mutex serialises slot search and active-flag set so
+ * two concurrent CREATE_CHANNEL calls cannot claim the same slot.
+ *
+ * Returns:
+ *   0       on success (channel_id written to userspace via @arg).
+ *  -EBUSY   if this fd already owns a channel (one channel per fd).
+ *  -ENOSPC  if all DMAPLANE_MAX_CHANNELS slots are in use.
+ *  -EFAULT  if copy_to_user fails.
+ *  -errno   if kthread_create fails (propagated via PTR_ERR).
+ */
 static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
 					   unsigned long arg)
 {
@@ -172,13 +313,16 @@ static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
 	struct task_struct *worker;
 	int i;
 
-	/* One channel per fd */
+	/* One channel per fd — simplifies lifecycle; future phases may relax */
 	if (ctx->chan)
 		return -EBUSY;
 
 	mutex_lock(&dev->dev_mutex);
 
-	/* Find a free channel slot */
+	/*
+	 * Linear scan of DMAPLANE_MAX_CHANNELS slots.  Deliberate
+	 * simplicity — IDR/bitmap would be overkill for 4 slots.
+	 */
 	for (i = 0; i < DMAPLANE_MAX_CHANNELS; i++) {
 		if (!dev->channels[i].active)
 			break;
@@ -192,7 +336,11 @@ static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
 	dmaplane_channel_init(chan, i);
 	chan->active = true;
 
-	/* Create worker kthread */
+	/*
+	 * kthread_create allocates the task but does NOT start it.
+	 * We store chan->worker first, then wake_up_process makes it
+	 * runnable, ensuring the pointer is visible before the thread runs.
+	 */
 	worker = kthread_create(dmaplane_worker_fn, chan, "dmaplane/%d", i);
 	if (IS_ERR(worker)) {
 		chan->active = false;
@@ -216,6 +364,28 @@ static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
 	return 0;
 }
 
+/*
+ * dmaplane_ioctl_submit - Enqueue one entry into the submission ring.
+ * @ctx: file context (must have an assigned channel).
+ * @arg: userspace pointer to struct dmaplane_submit_params (input).
+ *
+ * Copies the entry from userspace, acquires sub_ring.lock, writes the
+ * entry at head % RING_SIZE, advances head with smp_store_release, and
+ * wakes the worker.  When the ring is full, returns -ENOSPC — userspace
+ * must drain completions to make progress (backpressure mechanism).
+ *
+ * High watermark tracking: after the entry is written but before the
+ * lock is released, we snapshot the occupancy and update the stat.
+ * Safe because the lock is held; the stat field is a plain u32 (not
+ * atomic), only written here under the lock and only read by GET_STATS
+ * which accepts racy snapshots.
+ *
+ * Returns:
+ *   0       on success.
+ *  -ENODEV  if no channel has been created on this fd.
+ *  -EFAULT  if copy_from_user fails.
+ *  -ENOSPC  if the submission ring is full.
+ */
 static long dmaplane_ioctl_submit(struct dmaplane_file_ctx *ctx,
 				   unsigned long arg)
 {
@@ -241,9 +411,10 @@ static long dmaplane_ioctl_submit(struct dmaplane_file_ctx *ctx,
 	}
 
 	ring->entries[ring->head % DMAPLANE_RING_SIZE] = params.entry;
+	/* smp_store_release: entry store must be visible before head advance */
 	smp_store_release(&ring->head, ring->head + 1);
 
-	/* Track high watermark */
+	/* Track high watermark (safe: we hold the lock) */
 	occupancy = dmaplane_ring_count(ring);
 	if (occupancy > chan->stats.ring_high_watermark)
 		chan->stats.ring_high_watermark = occupancy;
@@ -253,12 +424,26 @@ static long dmaplane_ioctl_submit(struct dmaplane_file_ctx *ctx,
 	atomic_inc(&chan->in_flight);
 	chan->stats.total_submissions++;
 
-	/* Wake the worker */
+	/* Wake the worker so it sees the new entry */
 	wake_up_interruptible(&chan->wait_queue);
 
 	return 0;
 }
 
+/*
+ * dmaplane_ioctl_complete - Dequeue one entry from the completion ring.
+ * @ctx: file context (must have an assigned channel).
+ * @arg: userspace pointer to struct dmaplane_complete_params (output).
+ *
+ * Non-blocking: returns -EAGAIN immediately if the completion ring is
+ * empty.  Userspace should poll/retry or interleave with submits.
+ *
+ * Returns:
+ *   0       on success (entry copied to userspace).
+ *  -ENODEV  if no channel has been created on this fd.
+ *  -EAGAIN  if the completion ring is empty (try again later).
+ *  -EFAULT  if copy_to_user fails.
+ */
 static long dmaplane_ioctl_complete(struct dmaplane_file_ctx *ctx,
 				     unsigned long arg)
 {
@@ -280,6 +465,7 @@ static long dmaplane_ioctl_complete(struct dmaplane_file_ctx *ctx,
 	}
 
 	params.entry = ring->entries[ring->tail % DMAPLANE_RING_SIZE];
+	/* smp_store_release: entry read must be complete before tail advance */
 	smp_store_release(&ring->tail, ring->tail + 1);
 
 	spin_unlock_irqrestore(&ring->lock, flags);
@@ -290,6 +476,21 @@ static long dmaplane_ioctl_complete(struct dmaplane_file_ctx *ctx,
 	return 0;
 }
 
+/*
+ * dmaplane_ioctl_get_stats - Copy per-channel statistics to userspace.
+ * @ctx: file context (must have an assigned channel).
+ * @arg: userspace pointer to struct dmaplane_stats (output).
+ *
+ * Copies the raw stats struct.  This is a racy snapshot — fields are
+ * updated without locks on the hot path.  Values are monotonically
+ * increasing and individually consistent, but the set may be momentarily
+ * inconsistent.  Acceptable for observability.
+ *
+ * Returns:
+ *   0       on success.
+ *  -ENODEV  if no channel has been created on this fd.
+ *  -EFAULT  if copy_to_user fails.
+ */
 static long dmaplane_ioctl_get_stats(struct dmaplane_file_ctx *ctx,
 				      unsigned long arg)
 {
@@ -308,6 +509,17 @@ static long dmaplane_ioctl_get_stats(struct dmaplane_file_ctx *ctx,
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
 
+/*
+ * dmaplane_open - Allocate per-fd context for a new open().
+ * @inode: unused (single device).
+ * @filp:  file pointer; private_data will be set.
+ *
+ * Allocates a dmaplane_file_ctx with kzalloc (GFP_KERNEL — process
+ * context, may sleep).  The ctx starts with chan == NULL; the user
+ * must issue IOCTL_CREATE_CHANNEL before submit/complete are usable.
+ *
+ * Returns 0 on success, -ENOMEM on allocation failure.
+ */
 static int dmaplane_open(struct inode *inode, struct file *filp)
 {
 	struct dmaplane_file_ctx *ctx;
@@ -324,6 +536,19 @@ static int dmaplane_open(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+/*
+ * dmaplane_release - Clean up per-fd state when the file is closed.
+ * @inode: unused.
+ * @filp:  file pointer carrying the dmaplane_file_ctx.
+ *
+ * If a channel was created on this fd, acquires dev_mutex and calls
+ * dmaplane_channel_destroy to stop the worker and free the slot.
+ * Then frees the file context.  This ensures that closing the fd
+ * (including process exit without explicit close) releases all kernel
+ * resources — no explicit "destroy channel" ioctl is needed.
+ *
+ * Returns 0 always.
+ */
 static int dmaplane_release(struct inode *inode, struct file *filp)
 {
 	struct dmaplane_file_ctx *ctx = filp->private_data;
@@ -339,6 +564,15 @@ static int dmaplane_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
+/*
+ * dmaplane_ioctl - Top-level ioctl dispatcher.
+ * @filp: file pointer carrying the dmaplane_file_ctx.
+ * @cmd:  ioctl command number (DMAPLANE_IOCTL_*).
+ * @arg:  userspace pointer argument.
+ *
+ * Routes to the specific handler based on cmd.  Returns -ENOTTY for
+ * unrecognised commands (standard convention for bad ioctl numbers).
+ */
 static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 			    unsigned long arg)
 {
@@ -369,6 +603,21 @@ static const struct file_operations dmaplane_fops = {
 /* Module init/exit                                                    */
 /* ------------------------------------------------------------------ */
 
+/*
+ * dmaplane_init - Module entry point.
+ *
+ * Standard character device registration sequence:
+ *  1. kzalloc the singleton dmaplane_dev.
+ *  2. alloc_chrdev_region for a dynamic major number (kernel assigns
+ *     an unused number; avoids the need to reserve a fixed major).
+ *  3. cdev_init + cdev_add to register the file_operations.
+ *  4. class_create so udev can see the device class.
+ *  5. device_create to create the /dev/dmaplane node.
+ *
+ * On any failure, goto-based cleanup tears down in reverse order.
+ * Channel slots are zero-initialised by kzalloc and are set up on
+ * demand in create_channel — no explicit init here.
+ */
 static int __init dmaplane_init(void)
 {
 	int ret;
@@ -379,14 +628,14 @@ static int __init dmaplane_init(void)
 
 	mutex_init(&dma_dev->dev_mutex);
 
-	/* Dynamic major number */
+	/* Dynamic major number — kernel assigns unused number */
 	ret = alloc_chrdev_region(&dma_dev->devno, 0, 1, DMAPLANE_NAME);
 	if (ret < 0) {
 		pr_err("alloc_chrdev_region failed: %d\n", ret);
 		goto err_free_dev;
 	}
 
-	/* Character device */
+	/* Character device — register our file_operations */
 	cdev_init(&dma_dev->cdev, &dmaplane_fops);
 	dma_dev->cdev.owner = THIS_MODULE;
 	ret = cdev_add(&dma_dev->cdev, dma_dev->devno, 1);
@@ -395,7 +644,7 @@ static int __init dmaplane_init(void)
 		goto err_unreg_region;
 	}
 
-	/* Device class for udev */
+	/* Device class — lets udev see us */
 	dma_dev->class = class_create(DMAPLANE_NAME);
 	if (IS_ERR(dma_dev->class)) {
 		ret = PTR_ERR(dma_dev->class);
@@ -426,6 +675,15 @@ err_free_dev:
 	return ret;
 }
 
+/*
+ * dmaplane_exit - Module cleanup.
+ *
+ * Acquires dev_mutex and destroys any channels that are still active
+ * (e.g., if a user process was killed without closing the fd and the
+ * release path has not yet run).  Then tears down device node, class,
+ * cdev, region, and finally frees dmaplane_dev — exact reverse order
+ * of dmaplane_init.
+ */
 static void __exit dmaplane_exit(void)
 {
 	int i;

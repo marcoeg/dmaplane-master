@@ -2,6 +2,16 @@
 /*
  * dmaplane Phase 1 test — stress test for character device + rings
  * Copyright (c) 2026 Graziano Labs Corp.
+ *
+ * Userspace test suite that exercises the Phase 1 ioctl interface:
+ * channel creation, submit/complete data flow, ring full backpressure,
+ * single-channel stress (1M entries), multi-channel concurrency
+ * (4 channels x 250K entries via pthreads), and resource cleanup on
+ * close.  Each test prints PASS/FAIL; main() returns 0 if all pass,
+ * 1 otherwise.
+ *
+ * Must be run as root (or with suitable /dev/dmaplane permissions)
+ * after loading the dmaplane.ko module.
  */
 
 #include <stdio.h>
@@ -17,9 +27,12 @@
 #include "dmaplane_uapi.h"
 
 #define DEV_PATH	"/dev/dmaplane"
-#define STRESS_COUNT	1000000	/* 1M entries for stress tests */
-#define MULTI_PER_CHAN	250000	/* 250K per channel in multi-channel test */
-#define BATCH_SIZE	256	/* Submit this many before completing */
+#define STRESS_COUNT	1000000	/* 1M entries: large enough to expose races */
+#define MULTI_PER_CHAN	250000	/* Per-channel count in multi-channel test;
+				 * 4 channels x 250K = 1M total */
+#define BATCH_SIZE	256	/* Submit this many before attempting to
+				 * drain completions — balances ring
+				 * occupancy against completion latency */
 
 static int tests_passed;
 static int tests_failed;
@@ -36,7 +49,11 @@ static int tests_failed;
 	tests_failed++; \
 } while (0)
 
-/* Helper: open device */
+/*
+ * dev_open - Open /dev/dmaplane read-write.
+ *
+ * Returns fd >= 0 on success, -1 on error (prints perror).
+ */
 static int dev_open(void)
 {
 	int fd = open(DEV_PATH, O_RDWR);
@@ -46,7 +63,13 @@ static int dev_open(void)
 	return fd;
 }
 
-/* Helper: create channel, return channel ID or -1 on error */
+/*
+ * create_channel - Issue IOCTL_CREATE_CHANNEL and return the assigned ID.
+ * @fd: open file descriptor to /dev/dmaplane.
+ *
+ * Returns channel_id (>= 0) on success, -1 on error.
+ * One channel per fd — a second call on the same fd returns -EBUSY.
+ */
 static int create_channel(int fd)
 {
 	struct dmaplane_channel_params params;
@@ -59,7 +82,15 @@ static int create_channel(int fd)
 	return (int)params.channel_id;
 }
 
-/* Helper: submit one entry */
+/*
+ * submit_entry - Submit a single ring entry via IOCTL_SUBMIT.
+ * @fd:      open fd with a channel already created.
+ * @payload: the u64 payload to enqueue.
+ * @flags:   per-entry flags (reserved, pass 0 for Phase 1).
+ *
+ * Returns 0 on success, -1 on error (errno set by ioctl).
+ * Common errors: ENOSPC (ring full), ENODEV (no channel).
+ */
 static int submit_entry(int fd, __u64 payload, __u32 flags)
 {
 	struct dmaplane_submit_params p;
@@ -70,7 +101,15 @@ static int submit_entry(int fd, __u64 payload, __u32 flags)
 	return ioctl(fd, DMAPLANE_IOCTL_SUBMIT, &p);
 }
 
-/* Helper: complete one entry, returns 0 on success */
+/*
+ * complete_entry - Dequeue one completion via IOCTL_COMPLETE.
+ * @fd:  open fd with a channel already created.
+ * @out: if non-NULL and the call succeeds, the dequeued entry is
+ *       written here.
+ *
+ * Non-blocking: returns -1 with errno == EAGAIN if the completion
+ * ring is empty.  Returns 0 on success.
+ */
 static int complete_entry(int fd, struct dmaplane_ring_entry *out)
 {
 	struct dmaplane_complete_params p;
@@ -83,7 +122,17 @@ static int complete_entry(int fd, struct dmaplane_ring_entry *out)
 	return ret;
 }
 
-/* Helper: poll for a completion with timeout */
+/*
+ * complete_poll - Poll for a completion with bounded retry.
+ * @fd:          open fd with a channel already created.
+ * @out:         output entry (see complete_entry).
+ * @max_retries: maximum number of 100 us sleeps before giving up.
+ *
+ * Userspace busy-poll loop: calls complete_entry with 100 us sleeps
+ * between retries.  Effective timeout ~ max_retries * 100 us.
+ *
+ * Returns 0 if a completion was obtained, -1 if timed out.
+ */
 static int complete_poll(int fd, struct dmaplane_ring_entry *out,
 			 int max_retries)
 {
@@ -99,6 +148,12 @@ static int complete_poll(int fd, struct dmaplane_ring_entry *out,
 /* ------------------------------------------------------------------ */
 /* Test 1: Basic open/close                                            */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Validates that /dev/dmaplane can be opened and closed without error.
+ * Most fundamental smoke test — if it fails, the module is not loaded
+ * or the device node does not exist.
+ */
 static void test_open_close(void)
 {
 	int fd = dev_open();
@@ -113,6 +168,15 @@ static void test_open_close(void)
 /* ------------------------------------------------------------------ */
 /* Test 2: Channel creation                                            */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Opens two independent fds, creates a channel on each, and verifies
+ * that the returned channel IDs are 0 and 1 (sequential allocation
+ * from the lowest free slot).  Validates:
+ *  - Multiple channels can coexist.
+ *  - Each fd gets its own channel.
+ *  - IDs are assigned sequentially.
+ */
 static void test_channel_creation(void)
 {
 	int fd1, fd2, ch1, ch2;
@@ -146,6 +210,16 @@ static void test_channel_creation(void)
 /* ------------------------------------------------------------------ */
 /* Test 3: Submit and complete                                         */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Single-entry round-trip: submits one entry with a known payload
+ * (0xDEADBEEF), waits for the worker to process it, and verifies
+ * that the completed payload equals original + 1.  Proves:
+ *  - Submit enqueues into the submission ring.
+ *  - Worker dequeues, processes (payload += 1), and enqueues into
+ *    the completion ring.
+ *  - Complete dequeues from the completion ring.
+ */
 static void test_submit_complete(void)
 {
 	int fd, ch;
@@ -178,6 +252,7 @@ static void test_submit_complete(void)
 		return;
 	}
 
+	/* Worker should have incremented payload by 1 */
 	if (entry.payload != payload + 1) {
 		TEST_FAIL("submit/complete",
 			  "expected payload 0x%llx, got 0x%llx",
@@ -193,6 +268,18 @@ static void test_submit_complete(void)
 /* ------------------------------------------------------------------ */
 /* Test 4: Ring full behavior                                          */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Rapidly submits entries until the submission ring returns -ENOSPC,
+ * then drains all completions and verifies payload integrity (each
+ * payload == original + 1, in FIFO order).  Validates:
+ *  - Ring correctly rejects entries when full.
+ *  - Worker continues to process under full-ring conditions.
+ *  - No entries are lost or reordered.
+ *
+ * If the worker drains faster than we can submit, the ring never fills
+ * — this is noted but still counted as a pass (the ring is working).
+ */
 static void test_ring_full(void)
 {
 	int fd, ch, ret;
@@ -241,7 +328,7 @@ static void test_ring_full(void)
 		       "ring full not triggered\n");
 	}
 
-	/* Drain all completions */
+	/* Drain all completions and verify FIFO ordering */
 	int completed = 0;
 	while (completed < submitted) {
 		if (complete_poll(fd, &entry, 50000) != 0) {
@@ -251,7 +338,7 @@ static void test_ring_full(void)
 			close(fd);
 			return;
 		}
-		/* Verify: entry payload should be original + 1 */
+		/* Verify: payload should be (original + 1) in FIFO order */
 		if (entry.payload != (__u64)completed + 1) {
 			TEST_FAIL("ring full",
 				  "payload mismatch at %d: expected 0x%llx got 0x%llx",
@@ -271,6 +358,17 @@ static void test_ring_full(void)
 /* ------------------------------------------------------------------ */
 /* Test 5: Stress test (single channel)                                */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Pushes STRESS_COUNT (1M) entries through one channel using batched
+ * submit/complete cycles.  Measures wall-clock throughput (ops/sec).
+ * Validates:
+ *  - Ring and worker sustain high throughput without deadlock.
+ *  - No entries are lost under sustained load.
+ *  - ENOSPC (ring full) and EAGAIN (ring empty) are handled correctly
+ *    in the retry loops: ENOSPC means stop submitting and drain
+ *    completions; EAGAIN means stop draining and submit more.
+ */
 static void test_stress_single(void)
 {
 	int fd, ch;
@@ -302,6 +400,7 @@ static void test_stress_single(void)
 				submitted++;
 				batch++;
 			} else if (errno == ENOSPC) {
+				/* Ring full — switch to draining completions */
 				break;
 			} else {
 				TEST_FAIL("stress single",
@@ -317,6 +416,7 @@ static void test_stress_single(void)
 			if (complete_entry(fd, &entry) == 0) {
 				completed++;
 			} else if (errno == EAGAIN) {
+				/* Ring empty — switch back to submitting */
 				break;
 			} else {
 				TEST_FAIL("stress single",
@@ -349,21 +449,40 @@ static void test_stress_single(void)
 /* ------------------------------------------------------------------ */
 /* Test 6: Multi-channel stress                                        */
 /* ------------------------------------------------------------------ */
+
+/* Per-thread state for multi-channel test */
 struct thread_args {
-	int fd;
-	int channel_id;
-	int count;
-	int ok;		/* Set to 1 on success */
+	int fd;		/* Open fd with a channel already created */
+	int channel_id;	/* Channel index returned by create_channel */
+	int count;	/* Number of entries this thread should process */
+	int ok;		/* Result: set to 1 on success, 0 on failure */
 };
 
+/*
+ * multi_channel_thread - Per-channel worker for test 6.
+ * @arg: pointer to struct thread_args.
+ *
+ * Each pthread drives one channel: submits 'count' entries, completes
+ * all of them, and verifies payload integrity.  The payload base is
+ * set to (channel_id * count) so each channel operates on a unique
+ * non-overlapping range — if a completion from channel A appeared on
+ * channel B, the payload check would catch it (cross-contamination).
+ *
+ * ENOSPC on submit and EAGAIN on complete are handled by switching
+ * between submit and complete phases (same batching strategy as
+ * test_stress_single).
+ */
 static void *multi_channel_thread(void *arg)
 {
 	struct thread_args *ta = arg;
 	int submitted = 0, completed = 0;
 	struct dmaplane_ring_entry entry;
 	/*
-	 * Use payload base = channel_id * count so each channel
-	 * has a unique range, allowing cross-contamination detection.
+	 * Payload base = channel_id * count.  This gives each channel a
+	 * unique, non-overlapping range of payload values:
+	 *   ch0: [0, count)    ch1: [count, 2*count)    etc.
+	 * After the worker adds 1, expected completion payload at index i
+	 * is (base + i + 1).  A mismatch means cross-channel contamination.
 	 */
 	__u64 base = (__u64)ta->channel_id * (__u64)ta->count;
 
@@ -375,6 +494,7 @@ static void *multi_channel_thread(void *arg)
 				submitted++;
 				batch++;
 			} else if (errno == ENOSPC) {
+				/* Ring full — drain completions before retrying */
 				break;
 			} else {
 				fprintf(stderr, "  ch%d submit error: %s\n",
@@ -401,6 +521,7 @@ static void *multi_channel_thread(void *arg)
 				}
 				completed++;
 			} else if (errno == EAGAIN) {
+				/* Ring empty — submit more before retrying */
 				break;
 			} else {
 				fprintf(stderr, "  ch%d complete error: %s\n",
@@ -415,6 +536,15 @@ static void *multi_channel_thread(void *arg)
 	return NULL;
 }
 
+/*
+ * Stress all DMAPLANE_MAX_CHANNELS (4) channels in parallel via pthreads.
+ * Each thread independently processes MULTI_PER_CHAN (250K) entries.
+ * Measures aggregate throughput.  Validates:
+ *  - Multiple channels operate concurrently without interference.
+ *  - Per-channel locking (ring locks) does not cause cross-channel
+ *    contention or deadlock.
+ *  - No payload cross-contamination between channels.
+ */
 static void test_stress_multi(void)
 {
 	int fds[DMAPLANE_MAX_CHANNELS];
@@ -485,6 +615,18 @@ static void test_stress_multi(void)
 /* ------------------------------------------------------------------ */
 /* Test 7: Cleanup on close                                            */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Creates a channel, submits 100 entries without draining completions,
+ * then closes the fd.  The close triggers release(), which calls
+ * dmaplane_channel_destroy → kthread_stop on the worker.  Validates:
+ *  - Kernel does not crash or hang when a channel is closed with
+ *    in-flight (uncompleted) work.
+ *  - Worker thread terminates cleanly despite pending ring entries.
+ *  - This test cannot programmatically verify resource leaks — the
+ *    user should check dmesg for WARN_ON or lockdep warnings after
+ *    running the full suite.
+ */
 static void test_cleanup_on_close(void)
 {
 	int fd, ch;
@@ -522,6 +664,11 @@ static void test_cleanup_on_close(void)
 /* ------------------------------------------------------------------ */
 /* Main                                                                */
 /* ------------------------------------------------------------------ */
+
+/*
+ * Run all tests in sequence.  Print per-test PASS/FAIL and a summary.
+ * Returns 0 if all pass, 1 if any fail.
+ */
 int main(void)
 {
 	printf("=== dmaplane Phase 1 Test Suite ===\n\n");
