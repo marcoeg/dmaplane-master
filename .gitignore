@@ -53,3 +53,7 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Compiled test binaries (exclude source files)
+tests/test_phase*
+!tests/test_phase*.c
