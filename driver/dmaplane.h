@@ -6,12 +6,12 @@
  * Internal data structures for the dmaplane kernel module.
  * This file includes the UAPI header for shared types (ioctl numbers,
  * parameter structs, constants) and adds kernel-only types: ring
- * buffers, channels, device context, and file context.
+ * buffers, channels, buffers, device context, and file context.
  *
  * Architecture:
- *   main.c includes this header.  Userspace test programs include only
- *   dmaplane_uapi.h (via -I../include).  Kernel-only types are behind
- *   #ifdef __KERNEL__.
+ *   main.c and dmabuf_rdma.c include this header.  Userspace test
+ *   programs include only dmaplane_uapi.h (via -I../include).
+ *   Kernel-only types are behind #ifdef __KERNEL__.
  */
 #ifndef _DMAPLANE_H
 #define _DMAPLANE_H
@@ -22,13 +22,20 @@
 
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/dma-mapping.h>
 #include <linux/kref.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
+#include <linux/platform_device.h>
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/cache.h>
+
+/* ── Phase 2: Buffer constants ──────────────────────────── */
+
+#define DMAPLANE_MAX_BUFFERS	64
+#define DMAPLANE_MAX_BUF_SIZE	(1ULL << 30)	/* 1 GB hard limit */
 
 /*
  * Ring buffer: fixed-size array with monotonically increasing head and tail.
@@ -92,6 +99,10 @@ struct dmaplane_stats_kern {
 					 * atomic_t (32-bit) is sufficient */
 	atomic_t   dropped_count;	/* Entries dropped (Phase 1: always 0;
 					 * worker yields instead of dropping) */
+
+	/* Phase 2: buffer lifecycle counters */
+	atomic64_t buffers_created;	/* Lifetime buffers created */
+	atomic64_t buffers_destroyed;	/* Lifetime buffers destroyed */
 };
 
 /*
@@ -194,11 +205,69 @@ struct dmaplane_channel {
 	struct dmaplane_stats_kern stats;
 };
 
+/* ── Phase 2: Buffer tracking ───────────────────────────── */
+
+/*
+ * Per-buffer tracking.
+ *
+ * Two allocation paths, chosen by alloc_type:
+ *
+ *   BUF_TYPE_COHERENT — dma_alloc_coherent gives physically contiguous,
+ *   cache-coherent memory with a single DMA address.  Used for small, hot
+ *   control structures (CQ entries, doorbells) where CPU and device need
+ *   coherent access without explicit sync barriers.  NUMA placement is not
+ *   controllable — the DMA allocator uses the device's local node.
+ *
+ *   BUF_TYPE_PAGES — alloc_pages gives scattered physical pages that are
+ *   vmapped into a contiguous kernel VA.  Used for large streaming buffers
+ *   (gradients, weights, KV-cache).  NUMA-steerable in Phase 3 via
+ *   alloc_pages_node().  These pages are later handed to ib_dma_map_sg()
+ *   during MR registration (Phase 4) to build the scatterlist the NIC
+ *   needs for DMA access.
+ *
+ * Both paths support mmap to userspace, completing the zero-copy chain:
+ * userspace writes → same physical pages → NIC reads for TX.
+ */
+struct dmaplane_buffer {
+	unsigned int id;	/* Handle returned to userspace.  Monotonically
+				 * increasing, never reused within a session.
+				 * 0 is never assigned (sentinel for "no buffer"). */
+	int alloc_type;		/* BUF_TYPE_COHERENT or BUF_TYPE_PAGES */
+	size_t size;		/* Requested size in bytes */
+	bool in_use;		/* Slot is occupied.  Protected by buf_lock. */
+
+	/* Kernel mapping — valid for both allocation paths.
+	 * Coherent: vaddr from dma_alloc_coherent (physically contiguous).
+	 * Pages: vaddr from vmap() (virtually contiguous over scattered pages). */
+	void *vaddr;
+
+	/* Coherent path only — DMA handle for the contiguous allocation.
+	 * Used by dma_free_coherent() and dma_mmap_coherent().  Zero for pages. */
+	dma_addr_t dma_handle;
+
+	/* Page-backed path only — array of struct page pointers.
+	 * NULL for coherent.  These pages are owned by the module and freed
+	 * individually via __free_page() on destroy. */
+	struct page **pages;
+	unsigned int nr_pages;	/* Number of pages allocated */
+
+	/* mmap refcount — prevents destroy while userspace holds a mapping.
+	 * Incremented in dmaplane_mmap(), decremented in vma_close callback.
+	 * Atomic because mmap and munmap can race from different threads. */
+	atomic_t mmap_count;
+};
+
 /*
  * Device context: one per module instance (singleton).
- * Owns all channels and the character device registration.
+ * Owns all channels, buffers, and the character device registration.
  */
 struct dmaplane_dev {
+	/* Platform device — provides the struct device * for DMA API calls.
+	 * All dma_alloc_coherent, dma_map_sg, dma_mmap_coherent use
+	 * &pdev->dev, not the char device's device pointer.  Created in
+	 * module init before the char device registration. */
+	struct platform_device *pdev;
+
 	struct dmaplane_channel channels[DMAPLANE_MAX_CHANNELS];
 
 	/*
@@ -210,7 +279,8 @@ struct dmaplane_dev {
 	 *            from interrupt or softirq context.
 	 * Ordering: outermost lock.  Always acquired before channel->lock
 	 *           (see dmaplane_channel_destroy).  Never held while
-	 *           acquiring ring spinlocks directly.
+	 *           acquiring ring spinlocks directly.  Independent of
+	 *           buf_lock (never nested).
 	 */
 	struct mutex dev_mutex;
 
@@ -219,11 +289,37 @@ struct dmaplane_dev {
 	dev_t devno;			/* Major/minor number pair */
 	struct device *device;		/* /dev/dmaplane device node */
 
+	/* ── Phase 2: Buffer management ── */
+
+	/* Buffer array — global, not per-channel.  Fixed-size array with
+	 * linear scan.  64 slots is deliberate simplicity — avoids IDR/hash
+	 * complexity for a learning project. */
+	struct dmaplane_buffer buffers[DMAPLANE_MAX_BUFFERS];
+
+	/*
+	 * buf_lock: Protects the buffers[] array — slot allocation, lookup,
+	 * and deallocation.  Also held during mmap to prevent the buffer from
+	 * being destroyed while vm_insert_page is in progress.
+	 *
+	 * Acquired by: IOCTL_CREATE_BUFFER, IOCTL_DESTROY_BUFFER,
+	 *              IOCTL_GET_MMAP_INFO, dmaplane_mmap.
+	 * Why mutex: sleeping context OK — all acquirers are in process context.
+	 * Ordering: independent of dev_mutex (never nested).  Independent of
+	 *           channel locks (different resource).  In Phase 4+, ordering
+	 *           will be: rdma_sem (read) → buf_lock if both needed.
+	 */
+	struct mutex buf_lock;
+
+	unsigned int next_buf_id;	/* Monotonically increasing.  Wraps to 1
+					 * (skips 0) to avoid handle 0 ambiguity. */
+
 	/*
 	 * Device-level statistics — atomic for lock-free updates from
-	 * open/close/create_channel paths.  Readable via pr_info at
+	 * open/close/create_channel/buffer paths.  Readable via pr_info at
 	 * module unload; Phase 7 will export through debugfs.
 	 */
+	struct dmaplane_stats_kern stats;	/* Shared stats (channel + buffer) */
+
 	atomic_t   active_channels;		/* Currently active channels */
 	atomic64_t total_opens;			/* Lifetime fd opens */
 	atomic64_t total_closes;		/* Lifetime fd closes */

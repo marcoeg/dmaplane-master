@@ -111,4 +111,72 @@ struct dmaplane_stats {
 #define DMAPLANE_IOCTL_GET_STATS \
 	_IOR(DMAPLANE_IOC_MAGIC, 0x04, struct dmaplane_stats)
 
+/* ── Phase 2: Buffer management ──────────────────────────── */
+
+/*
+ * Buffer allocation types.
+ *
+ * BUF_TYPE_COHERENT: dma_alloc_coherent — physically contiguous, cache-
+ *   coherent memory with a single DMA address.  Used for small, hot control
+ *   structures (CQ entries, doorbells) where CPU and device need coherent
+ *   access without explicit sync barriers.
+ *
+ * BUF_TYPE_PAGES: alloc_pages + vmap — scattered physical pages vmapped
+ *   into a contiguous kernel VA.  Used for large streaming buffers
+ *   (gradients, weights, KV-cache).  NUMA-steerable in Phase 3 via
+ *   alloc_pages_node().  These pages are later handed to ib_dma_map_sg()
+ *   during MR registration (Phase 4).
+ */
+#define DMAPLANE_BUF_TYPE_COHERENT	0
+#define DMAPLANE_BUF_TYPE_PAGES		1
+
+/*
+ * Buffer creation parameters: passed to IOCTL_CREATE_BUFFER.
+ * On success, buf_id is filled with the assigned buffer handle.
+ */
+struct dmaplane_buf_params {
+	__u32 buf_id;		/* out — assigned buffer handle (never 0) */
+	__u32 alloc_type;	/* in  — DMAPLANE_BUF_TYPE_* */
+	__u64 size;		/* in  — buffer size in bytes */
+};
+
+/*
+ * mmap information: returned by IOCTL_GET_MMAP_INFO.
+ * Userspace uses mmap_offset and mmap_size to call mmap(2):
+ *   mmap(NULL, mmap_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, mmap_offset)
+ */
+struct dmaplane_mmap_info {
+	__u32 buf_id;		/* in  — buffer handle */
+	__u32 _pad;		/* padding — explicit pad for natural alignment */
+	__u64 mmap_offset;	/* out — offset to pass to mmap(2) */
+	__u64 mmap_size;	/* out — mappable size in bytes */
+};
+
+/*
+ * Buffer statistics: returned by IOCTL_GET_BUF_STATS.
+ * Racy snapshot — individually consistent, collectively approximate.
+ */
+struct dmaplane_buf_stats {
+	__u64 buffers_created;	/* out — Lifetime buffers created */
+	__u64 buffers_destroyed;/* out — Lifetime buffers destroyed */
+};
+
+/* Phase 2 ioctl commands: 0x05–0x09 */
+
+/* Allocate a DMA buffer; returns buffer handle in buf_id. */
+#define DMAPLANE_IOCTL_CREATE_BUFFER \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x05, struct dmaplane_buf_params)
+
+/* Destroy a buffer by handle (bare __u32, not a struct). */
+#define DMAPLANE_IOCTL_DESTROY_BUFFER \
+	_IOW(DMAPLANE_IOC_MAGIC, 0x06, __u32)
+
+/* Get mmap offset and size for a buffer. */
+#define DMAPLANE_IOCTL_GET_MMAP_INFO \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x08, struct dmaplane_mmap_info)
+
+/* Get buffer allocation statistics. */
+#define DMAPLANE_IOCTL_GET_BUF_STATS \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x09, struct dmaplane_buf_stats)
+
 #endif /* _DMAPLANE_UAPI_H */

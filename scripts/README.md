@@ -1,3 +1,7 @@
 # Scripts
 
-Build, setup, and benchmark automation. Populated in Phase 4+.
+Build, setup, and benchmark automation.
+
+| Script | Phase | Description |
+|--------|-------|-------------|
+| `setup_hugepages.sh` | 2 | Reserve hugepages for future DMA allocation benchmarks |

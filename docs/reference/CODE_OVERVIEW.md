@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 1 — Driver Foundations & Concurrency
+## Current State: Phase 2 — DMA Memory Allocation
 
 ## Licensing
 
@@ -33,7 +33,14 @@ The userspace-visible API header. This is the primary definition point for all t
 - Channel stats (`dmaplane_stats`): `__u64 total_submissions`, `__u64 total_completions`, `__u32 ring_high_watermark`, `__u32 dropped_count`
 - Ioctl command defines: `DMAPLANE_IOCTL_CREATE_CHANNEL` (`_IOR`, 0x01), `DMAPLANE_IOCTL_SUBMIT` (`_IOW`, 0x02), `DMAPLANE_IOCTL_COMPLETE` (`_IOWR`, 0x03), `DMAPLANE_IOCTL_GET_STATS` (`_IOR`, 0x04)
 
-All userspace consumers (`tests/`) include this header via `-I../include`.
+**Phase 2 additions:**
+- Buffer type constants: `DMAPLANE_BUF_TYPE_COHERENT` (0), `DMAPLANE_BUF_TYPE_PAGES` (1)
+- Buffer creation parameters (`dmaplane_buf_params`): `__u32 buf_id` (out), `__u32 alloc_type` (in), `__u64 size` (in)
+- mmap info (`dmaplane_mmap_info`): `__u32 buf_id` (in), `__u64 mmap_offset` (out), `__u64 mmap_size` (out)
+- Buffer stats (`dmaplane_buf_stats`): `__u64 buffers_created`, `__u64 buffers_destroyed`
+- Ioctl commands: `DMAPLANE_IOCTL_CREATE_BUFFER` (`_IOWR`, 0x05), `DMAPLANE_IOCTL_DESTROY_BUFFER` (`_IOW`, 0x06, bare `__u32`), `DMAPLANE_IOCTL_GET_MMAP_INFO` (`_IOWR`, 0x08), `DMAPLANE_IOCTL_GET_BUF_STATS` (`_IOR`, 0x09)
+
+All userspace consumers (`tests/`, `examples/misc/`) include this header via `-I../include` or `-I../../include`.
 
 ### `driver/dmaplane.h`
 
@@ -41,9 +48,10 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 **Kernel-internal types:**
 - `struct dmaplane_ring`: array of `dmaplane_ring_entry[RING_SIZE]`, `spinlock_t lock`, `unsigned int head` (producer writes, `____cacheline_aligned_in_smp`), `unsigned int tail` (consumer reads, `____cacheline_aligned_in_smp`). Head and tail are monotonically increasing — modulo is applied only when indexing into the array. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`.
-- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`. Safe for concurrent updates (worker) and reads (ioctl). `IOCTL_GET_STATS` reads atomics into the UAPI `dmaplane_stats` struct before `copy_to_user`. The UAPI struct is unchanged (plain `__u64`/`__u32`).
+- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`. Safe for concurrent updates (worker) and reads (ioctl). `IOCTL_GET_STATS` reads atomics into the UAPI `dmaplane_stats` struct before `copy_to_user`. The UAPI struct is unchanged (plain `__u64`/`__u32`).
 - `struct dmaplane_channel`: `struct kref refcount` (channel lifetime), `struct mutex lock` (per-channel state lock), `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use, set to false by kref release callback), `struct dmaplane_stats_kern stats` (atomic counters).
-- `struct dmaplane_dev`: `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
+- `struct dmaplane_buffer` (Phase 2): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped).
+- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
 - `struct dmaplane_file_ctx`: `struct dmaplane_dev *dev`, `struct dmaplane_channel *chan` (NULL until CREATE_CHANNEL).
 - `dmaplane_channel_release()`: kref release callback — marks slot inactive (`active = false`), decrements `active_channels`, increments `total_channels_destroyed`. Called when the last kref drops to zero.
 - Inline helpers: `dmaplane_ring_full()`, `dmaplane_ring_empty()`, `dmaplane_ring_count()`.
@@ -58,26 +66,30 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 ### `driver/main.c`
 
-Character device driver with ioctl dispatch and per-channel worker threads. Singleton `struct dmaplane_dev *dma_dev` at module scope.
+Character device driver with ioctl dispatch, mmap support, and per-channel worker threads. Singleton `struct dmaplane_dev *dma_dev` at module scope.
 
 **Module init** (`dmaplane_init`):
 - `kzalloc` the device context
+- `platform_device_alloc("dmaplane_dma")` + `platform_device_add` + `dma_set_mask_and_coherent` (64-bit, fallback 32-bit) — creates a DMA-capable device. `device_create` alone is NOT DMA-capable; the DMA API requires a bus-registered device with a DMA mask.
+- `mutex_init` for `buf_lock`, `next_buf_id = 1`
 - `alloc_chrdev_region` for dynamic major number
 - `cdev_init` + `cdev_add`
 - `class_create` + `device_create` for `/dev/dmaplane` udev node
-- Clean teardown in reverse order on failure (goto-based cleanup: `err_class_destroy`, `err_cdev_del`, `err_unreg_region`, `err_free_dev`)
+- Clean teardown in reverse order on failure (goto-based cleanup: `err_class_destroy`, `err_cdev_del`, `err_unreg_region`, `err_unreg_pdev`, `err_put_pdev`, `err_free_dev`). Distinction: `platform_device_put` for devices allocated but never added; `platform_device_unregister` for devices both allocated and added.
 
-**Module init** also explicitly initialises device-level atomic counters (`atomic_set` / `atomic64_set`) for clarity, even though `kzalloc` zeroes them.
-
-**Module exit** (`dmaplane_exit`):
-- Acquires `dev_mutex`, stops any remaining active worker kthreads via `dmaplane_channel_destroy`
-- Prints lifetime summary via `pr_info`: total opens, closes, channels created, channels destroyed
-- `device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region` + `kfree`
+**Module exit** (`dmaplane_exit`) — ordering is critical:
+1. Acquires `dev_mutex`, stops any remaining active worker kthreads via `dmaplane_channel_destroy`
+2. Prints lifetime summary via `pr_info`: total opens, closes, channels created, channels destroyed, buffers created, buffers destroyed
+3. Tears down char device (`device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region`) — prevents new ioctls/opens from racing with cleanup
+4. Destroys remaining buffers — warns on leaked mmap references (`mmap_count > 0`). Must happen AFTER char device teardown (prevents racing creates) but BEFORE platform device unregister (`dma_free_coherent` needs the platform device alive)
+5. `platform_device_unregister`
+6. `kfree`
 
 **File operations:**
-- `dmaplane_open`: Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`. Does not create a channel — that happens via ioctl.
+- `dmaplane_open`: Checks `capable(CAP_SYS_ADMIN)` — DMA buffer allocation and mmap of kernel pages are privileged operations. Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`.
 - `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
-- `dmaplane_ioctl`: Dispatches to per-command handlers via switch.
+- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09).
+- `dmaplane_mmap`: Maps DMA buffer pages into userspace. Extracts `buf_id = vma->vm_pgoff`, finds buffer under `buf_lock`. Sets `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Coherent: `dma_mmap_coherent` (resets `vm_pgoff = 0` first — `dma_mmap_coherent` interprets pgoff as offset into the allocation). Pages: `vm_insert_page` loop. Increments `mmap_count` on success (NOT via `vma_open` — Linux does not call `vma_open` for the initial mmap). VMA ops: `dmaplane_vma_open` (increment on fork/mremap), `dmaplane_vma_close` (decrement on munmap/exit).
 
 **Ioctl handlers:**
 
@@ -87,6 +99,10 @@ Character device driver with ioctl dispatch and per-channel worker threads. Sing
 | `DMAPLANE_IOCTL_SUBMIT` | `dmaplane_ioctl_submit` | `copy_from_user`, acquire submission ring spinlock, check full (return `-ENOSPC`), write entry at `head % RING_SIZE`, `smp_store_release` on head, track high watermark via `atomic_set`, release lock, `atomic_inc(in_flight)`, `atomic64_inc(total_submissions)`, `wake_up_interruptible` worker |
 | `DMAPLANE_IOCTL_COMPLETE` | `dmaplane_ioctl_complete` | Acquire completion ring spinlock, check empty (return `-EAGAIN`), read entry at `tail % RING_SIZE`, `smp_store_release` on tail, release lock, `copy_to_user` |
 | `DMAPLANE_IOCTL_GET_STATS` | `dmaplane_ioctl_get_stats` | Reads `dmaplane_stats_kern` atomics into a plain `dmaplane_stats` UAPI struct, then `copy_to_user`. Each atomic read is individually consistent; the set may be momentarily inconsistent |
+| `DMAPLANE_IOCTL_CREATE_BUFFER` | `dmaplane_ioctl_create_buffer` | `copy_from_user`, delegates to `dmabuf_rdma_create_buffer`, `copy_to_user` result. **copy_to_user undo**: if `copy_to_user` fails after buffer creation, destroys the buffer to prevent an orphaned allocation that userspace can never reference |
+| `DMAPLANE_IOCTL_DESTROY_BUFFER` | `dmaplane_ioctl_destroy_buffer` | `copy_from_user` bare `__u32` handle, delegates to `dmabuf_rdma_destroy_buffer`. Returns `-EBUSY` if `mmap_count > 0` |
+| `DMAPLANE_IOCTL_GET_MMAP_INFO` | `dmaplane_ioctl_get_mmap_info` | Looks up buffer under `buf_lock`, returns `mmap_offset = buf_id << PAGE_SHIFT` and `mmap_size = buf->size`. Userspace uses these to call `mmap(2)` |
+| `DMAPLANE_IOCTL_GET_BUF_STATS` | `dmaplane_ioctl_get_buf_stats` | Reads `buffers_created` and `buffers_destroyed` atomics into `dmaplane_buf_stats` UAPI struct |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -103,12 +119,40 @@ Character device driver with ioctl dispatch and per-channel worker threads. Sing
 - `dmaplane_channel_destroy`: acquires `channel->lock`, sets `shutdown = true`, releases lock, `wake_up_interruptible`, `kthread_stop` (blocking wait for thread exit), then two `kref_put` calls (worker ref + file_ctx ref). The second `kref_put` triggers `dmaplane_channel_release` which sets `active = false` and updates device-level counters.
 - `dmaplane_channel_release`: kref release callback — sets `active = false`, `atomic_dec(active_channels)`, `atomic64_inc(total_channels_destroyed)`.
 
-**Locking model (4 locks):**
-- Device mutex (`dev_mutex`): protects channel slot allocation/deallocation. Sleeping context OK — only acquired from ioctl and release (process context). Outermost lock in the ordering.
+**Locking model (5 locks):**
+- Device mutex (`dev_mutex`): protects channel slot allocation/deallocation. Sleeping context OK — only acquired from ioctl and release (process context). Outermost lock in the ordering. Independent of `buf_lock` (never nested).
+- Buffer mutex (`buf_lock`): protects `buffers[]` array — slot allocation, lookup, deallocation, and mmap. Sleeping context OK. Independent of `dev_mutex` (never nested). In Phase 4+, ordering will be: `rdma_sem` (read) → `buf_lock`.
 - Per-channel mutex (`channel->lock`): protects channel state transitions (shutdown flag, worker pointer). Separate from ring spinlocks (which protect ring data) and from dev_mutex (which protects slot allocation). Ordering: `dev_mutex` → `channel->lock` → ring spinlocks.
 - Submission ring spinlock (`sub_ring.lock`): protects ring entries between ioctl submit (producer, advances head) and worker thread (consumer, advances tail).
 - Completion ring spinlock (`comp_ring.lock`): protects ring entries between worker thread (producer, advances head) and ioctl complete (consumer, advances tail).
 - Worker shutdown: acquire `channel->lock`, set `channel->shutdown = true`, release lock, `wake_up_interruptible` + `kthread_stop` (blocking wait for thread exit). The completion ring yield loop also checks `kthread_should_stop` to ensure the worker exits even if the ring stays full.
+
+---
+
+### `driver/dmabuf_rdma.h`
+
+Header declaring three buffer management functions with locking contracts: `dmabuf_rdma_create_buffer` and `dmabuf_rdma_destroy_buffer` acquire `buf_lock` internally; `dmabuf_rdma_find_buffer` requires the caller to hold `buf_lock` for the pointer's lifetime.
+
+### `driver/dmabuf_rdma.c`
+
+Buffer allocation and lookup. Two allocation paths:
+
+**`dmabuf_rdma_create_buffer`**:
+- Validates size (> 0, <= 1 GB) and alloc_type. Acquires `buf_lock`, linear scan for free slot.
+- Zeroes the slot via `memset` to clear stale pointers from a previous occupant.
+- Assigns `next_buf_id++` (wraps to 1, skipping 0 — sentinel for "no buffer").
+- **Coherent path** (`BUF_TYPE_COHERENT`): `dma_alloc_coherent(&dev->pdev->dev, ...)` + `memset` zero. Returns physically contiguous, cache-coherent memory with a single DMA address.
+- **Page-backed path** (`BUF_TYPE_PAGES`): `kvcalloc` page array, `alloc_page(GFP_KERNEL | __GFP_ZERO)` loop with unwind on failure (frees all previously allocated pages), `vmap()` for contiguous kernel VA. `__GFP_ZERO` prevents leaking kernel data to userspace via mmap.
+- All three error paths (no slots, allocation failure, vmap failure) properly unwind with reverse-order cleanup.
+
+**`dmabuf_rdma_destroy_buffer`**:
+- Acquires `buf_lock`, finds buffer. Refuses with `-EBUSY` if `mmap_count > 0`.
+- Pages: `vunmap` → `__free_page` loop → `kvfree(pages)`.
+- Coherent: `dma_free_coherent(&dev->pdev->dev, ...)`.
+
+**`dmabuf_rdma_find_buffer`**: Linear scan. Caller must hold `buf_lock`.
+
+All three are `EXPORT_SYMBOL_GPL` for use by future modules (Phase 4 rdma_engine).
 
 ---
 
@@ -128,6 +172,32 @@ Userspace stress test for the driver. Opens `/dev/dmaplane`, exercises all ioctl
 7. **Cleanup on close** — submit 100 entries without completing, close fd, verify no kernel crash (user checks dmesg)
 
 Reports PASS/FAIL per test and a summary. Exit code 0 if all pass, 1 if any fail.
+
+### `tests/test_phase2_dma.c`
+
+Userspace test suite for Phase 2 DMA buffer management. Opens `/dev/dmaplane`, exercises buffer creation, mmap, destroy, and stats. Includes helpers: `create_buffer`, `destroy_buffer`, `get_mmap_info`, `map_buffer`, `get_buf_stats`.
+
+**Test cases:**
+1. **Coherent alloc + mmap** — create 4 KB coherent buffer, mmap, write `0xDEADBEEF` pattern, read back and verify, munmap, destroy
+2. **Page-backed alloc + mmap** — create 1 MB page-backed buffer, same write/verify cycle with `0xCAFEBABE`
+3. **Destroy with active mmap** — create buffer, mmap, try destroy (must fail with `EBUSY`), munmap, destroy again (must succeed)
+4. **Allocation stress** — 1000 create/destroy cycles, verify `buf_stats` match
+5. **Max buffers** — allocate 64 buffers, verify 65th returns `ENOMEM`, free all
+6. **Handle uniqueness** — 10 create/destroy cycles, verify handles are monotonically increasing and never 0
+7. **Large buffer** — 16 MB page-backed buffer, mmap, write incrementing pattern, verify
+8. **Invalid parameters** — size 0 → `EINVAL`, bad alloc_type → `EINVAL`, destroy non-existent → `ENOENT`, mmap_info non-existent → `ENOENT`
+
+---
+
+## Examples (`examples/`)
+
+### `examples/misc/dma_explorer.c`
+
+Interactive demo that creates one buffer of each type (coherent, page-backed), mmaps each, writes a pattern, verifies, and cleans up. Prints buffer details (handle, mmap offset, size) and final stats.
+
+### `examples/misc/dma_sweep.c`
+
+Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full create/mmap/write/verify/munmap/destroy cycle. Outputs a table of: size, create time, map time, write time, total time, and page count. Shows linear scaling with page count.
 
 ---
 
@@ -150,3 +220,17 @@ Reports PASS/FAIL per test and a summary. Exit code 0 if all pass, 1 if any fail
 **Error paths**: All error paths use goto-based cleanup with reverse-order resource release. This pattern will be used throughout the project.
 
 **Log prefix**: All kernel messages use the `dmaplane:` prefix via `pr_fmt(fmt) KBUILD_MODNAME ": " fmt`. Lifecycle messages use `pr_info`, per-operation messages use `pr_debug`.
+
+**Why platform_device**: `device_create` produces a device node for udev but the underlying `struct device` has no bus registration and no DMA mask. The DMA API (`dma_alloc_coherent`, `dma_map_sg`) requires a device registered with a bus. `platform_device` solves this — it represents a virtual hardware device on the platform bus. Without it, `dma_alloc_coherent` returns NULL or triggers WARN on IOMMU-enabled machines.
+
+**Two allocation paths**: Coherent (`dma_alloc_coherent`) gives physically contiguous, cache-coherent memory — good for small control structures where CPU and device need consistent access. Page-backed (`alloc_pages` + `vmap`) gives scattered physical pages with a contiguous kernel VA — good for large buffers (gradients, weights, KV-cache) where NUMA steering matters (Phase 3) and SG tables are needed for RDMA (Phase 4). The module owns all pages; there is no user-pinned path.
+
+**mmap zero-copy chain**: `alloc_pages` → `vmap` (kernel access) → `mmap` via `vm_insert_page` (userspace access) → NIC reads via `ib_dma_map_sg` (Phase 4). The same physical pages serve all three consumers with zero copies.
+
+**mmap_count and the vma_open gotcha**: `mmap_count` prevents buffer destruction while userspace holds a mapping. The count is incremented in `dmaplane_mmap` (the initial call) and in `vma_open` (fork/mremap). Linux does **not** call `vma_open` for the initial mmap — only for fork and mremap. If you only increment in `vma_open`, the initial mmap is untracked. `VM_DONTCOPY` blocks fork inheritance and `VM_DONTEXPAND` blocks mremap, so `vma_open` is a defensive increment that should rarely fire.
+
+**dma_mmap_coherent pgoff reset**: The driver encodes the buffer ID in `vma->vm_pgoff` (via `IOCTL_GET_MMAP_INFO` → `mmap(fd, offset)`). But `dma_mmap_coherent` interprets `vm_pgoff` as a page offset into the coherent allocation. A non-zero pgoff (the buffer ID) causes `ENXIO` because the offset exceeds the allocation size. The fix: reset `vma->vm_pgoff = 0` before calling `dma_mmap_coherent`.
+
+**copy_to_user undo pattern**: `IOCTL_CREATE_BUFFER` creates the buffer first, then copies the result to userspace. If `copy_to_user` fails, the buffer exists in the kernel but userspace has no handle to reference or destroy it — an orphaned allocation. The undo pattern destroys the buffer on `copy_to_user` failure.
+
+**buf_lock vs dev_mutex separation**: These protect different resources (buffers vs channels) and are never nested. This allows concurrent buffer and channel operations — important for Phase 4+ where RDMA operations touch both.

@@ -1,23 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * dmaplane main.c — Character device driver and ioctl dispatch
+ * dmaplane main.c — Character device driver, ioctl dispatch, and mmap
  * Copyright (c) 2026 Graziano Labs Corp.
  *
- * Phase 1: Driver foundations and concurrency.
- *
  * This is the entry point for the dmaplane kernel module.  It registers
- * a character device at /dev/dmaplane, dispatches ioctls to per-command
- * handlers, and manages per-file context (one channel per open fd).
+ * a platform device for DMA operations, a character device at
+ * /dev/dmaplane, dispatches ioctls to per-command handlers, provides
+ * mmap support for DMA buffers, and manages per-file context.
  *
  * Architecture:
  *   userspace ioctl → dmaplane_ioctl (this file) → handler functions
  *   Each open fd gets a dmaplane_file_ctx.  Channel creation spawns a
  *   kthread that drains the submission ring and fills the completion ring.
- *   File close tears down the channel and stops the kthread.
+ *   Buffer management is a separate subsystem (dmabuf_rdma.c) — buffers
+ *   are global resources, not per-channel.  mmap maps DMA buffer pages
+ *   directly into userspace for zero-copy I/O.
  *
- * Data flow:
+ * Data flow (channels):
  *   userspace --[IOCTL_SUBMIT]--> sub_ring --[worker]--> comp_ring
  *             <--[IOCTL_COMPLETE]--
+ *
+ * Data flow (buffers):
+ *   userspace --[IOCTL_CREATE_BUFFER]--> dmabuf_rdma_create_buffer
+ *   userspace --[mmap]--> dmaplane_mmap --> vm_insert_page / dma_mmap_coherent
  *
  * Locking summary:
  *   dev_mutex (struct mutex)
@@ -27,7 +32,13 @@
  *                  dmaplane_exit.
  *     Why mutex: only taken in process/ioctl context where sleeping is
  *                permitted; never on the submit/complete hot path.
- *     Ordering: outermost lock.
+ *     Ordering: outermost lock.  Independent of buf_lock.
+ *
+ *   buf_lock (struct mutex)
+ *     Protects: buffer array, slot allocation, mmap lookups.
+ *     Acquired by: buffer ioctl handlers, dmaplane_mmap.
+ *     Why mutex: sleeping context OK — only from process context.
+ *     Ordering: independent of dev_mutex (never nested).
  *
  *   channel->lock (struct mutex)
  *     Protects: channel state (shutdown flag, worker pointer).
@@ -60,13 +71,18 @@
 #include <linux/fs.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/mm.h>
+#include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
 #include <linux/sched.h>
 #include <linux/delay.h>
+#include <linux/capability.h>
 
 #include "dmaplane.h"
+#include "dmabuf_rdma.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
@@ -581,6 +597,297 @@ static long dmaplane_ioctl_get_stats(struct dmaplane_file_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/* mmap support                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * VMA close — decrement mmap refcount when munmap'd or process exits.
+ * This is the counterpart to the atomic_inc in dmaplane_mmap().
+ */
+static void dmaplane_vma_close(struct vm_area_struct *vma)
+{
+	struct dmaplane_buffer *buf = vma->vm_private_data;
+
+	if (buf)
+		atomic_dec(&buf->mmap_count);
+}
+
+/*
+ * VMA open — increment on fork/mremap.
+ * VM_DONTCOPY prevents fork inheritance, so this should only fire
+ * on mremap (which VM_DONTEXPAND also blocks).  Defensive increment.
+ */
+static void dmaplane_vma_open(struct vm_area_struct *vma)
+{
+	struct dmaplane_buffer *buf = vma->vm_private_data;
+
+	if (buf)
+		atomic_inc(&buf->mmap_count);
+}
+
+static const struct vm_operations_struct dmaplane_vm_ops = {
+	.open  = dmaplane_vma_open,
+	.close = dmaplane_vma_close,
+};
+
+/*
+ * dmaplane_mmap — Map DMA buffer pages into userspace.
+ *
+ * This completes the zero-copy data path: the same physical pages
+ * allocated by dmabuf_rdma and (in Phase 4) registered as RDMA MRs
+ * are mapped directly into userspace.  Writes by the application
+ * land in the exact memory the NIC reads from for TX — no copies.
+ *
+ * The vm_pgoff (page offset) encodes the buffer ID.  Userspace
+ * obtains the correct offset via IOCTL_GET_MMAP_INFO, then calls
+ * mmap(NULL, size, prot, MAP_SHARED, fd, offset).
+ *
+ * Returns:
+ *   0       on success.
+ *  -EINVAL  if buffer not found or size exceeds buffer.
+ *  -EAGAIN  if vm_insert_page fails for page-backed buffers.
+ *  -errno   if dma_mmap_coherent fails for coherent buffers.
+ */
+static int dmaplane_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct dmaplane_file_ctx *ctx = filp->private_data;
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_buffer *buf;
+	unsigned int buf_id = vma->vm_pgoff;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	unsigned int i;
+	int ret;
+
+	mutex_lock(&dev->buf_lock);
+
+	buf = dmabuf_rdma_find_buffer(dev, buf_id);
+	if (!buf) {
+		mutex_unlock(&dev->buf_lock);
+		return -EINVAL;
+	}
+
+	if (size > buf->size) {
+		mutex_unlock(&dev->buf_lock);
+		return -EINVAL;
+	}
+
+	/*
+	 * VM_DONTCOPY: no COW copies to forked children.  NIC may be
+	 *   DMA-writing into these pages — a child with a stale mapping
+	 *   would cause data corruption or use-after-free.
+	 * VM_DONTEXPAND: no mremap expansion beyond buffer bounds.
+	 * VM_DONTDUMP: exclude DMA memory from core dumps (may contain
+	 *   sensitive data, and dump would race with DMA).
+	 */
+	vm_flags_set(vma, VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP);
+
+	vma->vm_ops = &dmaplane_vm_ops;
+	vma->vm_private_data = buf;
+
+	switch (buf->alloc_type) {
+	case DMAPLANE_BUF_TYPE_COHERENT:
+		/*
+		 * dma_mmap_coherent maps physically contiguous DMA memory
+		 * into userspace.  It handles the PFN calculation and
+		 * cache attribute setup internally.
+		 *
+		 * Reset vm_pgoff to 0: we used it to encode the buffer ID,
+		 * but dma_mmap_coherent interprets it as a page offset into
+		 * the coherent allocation.  A non-zero pgoff would cause
+		 * ENXIO because the offset exceeds the allocation size.
+		 */
+		vma->vm_pgoff = 0;
+		ret = dma_mmap_coherent(&dev->pdev->dev, vma, buf->vaddr,
+					buf->dma_handle, size);
+		if (ret) {
+			mutex_unlock(&dev->buf_lock);
+			return ret;
+		}
+		break;
+
+	case DMAPLANE_BUF_TYPE_PAGES:
+		/*
+		 * vm_insert_page maps individual pages into the VMA.
+		 * Must be called once per page — the pages are physically
+		 * scattered and cannot be mapped with a single remap_pfn_range.
+		 */
+		for (i = 0; i < buf->nr_pages && i * PAGE_SIZE < size; i++) {
+			ret = vm_insert_page(vma,
+					     vma->vm_start + i * PAGE_SIZE,
+					     buf->pages[i]);
+			if (ret) {
+				mutex_unlock(&dev->buf_lock);
+				return ret;
+			}
+		}
+		break;
+
+	default:
+		mutex_unlock(&dev->buf_lock);
+		return -EINVAL;
+	}
+
+	/*
+	 * Increment mmap_count on success.  This is NOT done via vma_open —
+	 * Linux does NOT call vma_open for the initial mmap, only for
+	 * fork/mremap.  This is a real gotcha: if you only increment in
+	 * vma_open, the initial mmap is untracked and destroy won't be
+	 * blocked by it.
+	 */
+	atomic_inc(&buf->mmap_count);
+
+	pr_debug("buffer %u mmapped: size=%lu type=%d\n",
+		 buf->id, size, buf->alloc_type);
+
+	mutex_unlock(&dev->buf_lock);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 2 ioctl handlers                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dmaplane_ioctl_create_buffer - Allocate a DMA buffer.
+ * @ctx: file context (carries the owning dev pointer).
+ * @arg: userspace pointer to struct dmaplane_buf_params (in/out).
+ *
+ * Copies params from userspace, delegates to dmabuf_rdma_create_buffer,
+ * and copies the result (including the assigned buf_id) back.  If the
+ * copy_to_user fails, the buffer is destroyed to prevent a leaked
+ * buffer that userspace can never reference.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *  -EINVAL  if size or alloc_type is invalid.
+ *  -ENOMEM  if no free slots or allocation fails.
+ */
+static long dmaplane_ioctl_create_buffer(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_buf_params params;
+	int ret;
+
+	if (copy_from_user(&params, (void __user *)arg, sizeof(params)))
+		return -EFAULT;
+
+	ret = dmabuf_rdma_create_buffer(dev, &params);
+	if (ret)
+		return ret;
+
+	if (copy_to_user((void __user *)arg, &params, sizeof(params))) {
+		/*
+		 * Buffer was allocated but handle can't be returned —
+		 * destroy it to prevent a leaked buffer that userspace
+		 * can never reference.
+		 */
+		dmabuf_rdma_destroy_buffer(dev, params.buf_id);
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_destroy_buffer - Free a DMA buffer by handle.
+ * @ctx: file context.
+ * @arg: userspace pointer to bare __u32 buffer handle.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user fails.
+ *  -ENOENT  if buffer not found.
+ *  -EBUSY   if active mmap references exist.
+ */
+static long dmaplane_ioctl_destroy_buffer(struct dmaplane_file_ctx *ctx,
+					   unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	__u32 buf_id;
+
+	if (copy_from_user(&buf_id, (void __user *)arg, sizeof(buf_id)))
+		return -EFAULT;
+
+	return dmabuf_rdma_destroy_buffer(dev, buf_id);
+}
+
+/*
+ * dmaplane_ioctl_get_mmap_info - Get mmap offset and size for a buffer.
+ * @ctx: file context.
+ * @arg: userspace pointer to struct dmaplane_mmap_info (in/out).
+ *
+ * Looks up the buffer by ID, returns the mmap offset (buf_id << PAGE_SHIFT)
+ * and the buffer size.  Userspace uses these to call mmap(2).
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *  -ENOENT  if buffer not found.
+ */
+static long dmaplane_ioctl_get_mmap_info(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_mmap_info info;
+	struct dmaplane_buffer *buf;
+
+	if (copy_from_user(&info, (void __user *)arg, sizeof(info)))
+		return -EFAULT;
+
+	mutex_lock(&dev->buf_lock);
+	buf = dmabuf_rdma_find_buffer(dev, info.buf_id);
+	if (!buf) {
+		mutex_unlock(&dev->buf_lock);
+		return -ENOENT;
+	}
+
+	/*
+	 * mmap offset encoding: buffer ID in the pgoff field.
+	 * Userspace calls mmap(NULL, size, prot, flags, fd, offset)
+	 * where offset = buf_id << PAGE_SHIFT.  The driver extracts
+	 * buf_id = vma->vm_pgoff in dmaplane_mmap.
+	 */
+	info.mmap_offset = (__u64)buf->id << PAGE_SHIFT;
+	info.mmap_size = buf->size;
+
+	mutex_unlock(&dev->buf_lock);
+
+	if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+		return -EFAULT;
+
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_get_buf_stats - Copy buffer statistics to userspace.
+ * @ctx: file context.
+ * @arg: userspace pointer to struct dmaplane_buf_stats (output).
+ *
+ * Reads atomic counters into the UAPI struct.  Racy snapshot —
+ * individually consistent, collectively approximate.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_to_user fails.
+ */
+static long dmaplane_ioctl_get_buf_stats(struct dmaplane_file_ctx *ctx,
+					   unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_buf_stats bstats;
+
+	bstats.buffers_created  = atomic64_read(&dev->stats.buffers_created);
+	bstats.buffers_destroyed = atomic64_read(&dev->stats.buffers_destroyed);
+
+	if (copy_to_user((void __user *)arg, &bstats, sizeof(bstats)))
+		return -EFAULT;
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -589,15 +896,23 @@ static long dmaplane_ioctl_get_stats(struct dmaplane_file_ctx *ctx,
  * @inode: unused (single device).
  * @filp:  file pointer; private_data will be set.
  *
+ * Requires CAP_SYS_ADMIN because DMA buffer allocation and mmap of
+ * kernel pages are privileged operations — they expose physical memory
+ * layout and bypass normal memory protection.
+ *
  * Allocates a dmaplane_file_ctx with kzalloc (GFP_KERNEL — process
  * context, may sleep).  The ctx starts with chan == NULL; the user
  * must issue IOCTL_CREATE_CHANNEL before submit/complete are usable.
  *
- * Returns 0 on success, -ENOMEM on allocation failure.
+ * Returns 0 on success, -EPERM without CAP_SYS_ADMIN, -ENOMEM on
+ * allocation failure.
  */
 static int dmaplane_open(struct inode *inode, struct file *filp)
 {
 	struct dmaplane_file_ctx *ctx;
+
+	if (!capable(CAP_SYS_ADMIN))
+		return -EPERM;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
@@ -656,6 +971,7 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	struct dmaplane_file_ctx *ctx = filp->private_data;
 
 	switch (cmd) {
+	/* Phase 1: Channel operations */
 	case DMAPLANE_IOCTL_CREATE_CHANNEL:
 		return dmaplane_ioctl_create_channel(ctx, arg);
 	case DMAPLANE_IOCTL_SUBMIT:
@@ -664,6 +980,17 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 		return dmaplane_ioctl_complete(ctx, arg);
 	case DMAPLANE_IOCTL_GET_STATS:
 		return dmaplane_ioctl_get_stats(ctx, arg);
+
+	/* Phase 2: Buffer management */
+	case DMAPLANE_IOCTL_CREATE_BUFFER:
+		return dmaplane_ioctl_create_buffer(ctx, arg);
+	case DMAPLANE_IOCTL_DESTROY_BUFFER:
+		return dmaplane_ioctl_destroy_buffer(ctx, arg);
+	case DMAPLANE_IOCTL_GET_MMAP_INFO:
+		return dmaplane_ioctl_get_mmap_info(ctx, arg);
+	case DMAPLANE_IOCTL_GET_BUF_STATS:
+		return dmaplane_ioctl_get_buf_stats(ctx, arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -674,6 +1001,7 @@ static const struct file_operations dmaplane_fops = {
 	.open		= dmaplane_open,
 	.release	= dmaplane_release,
 	.unlocked_ioctl	= dmaplane_ioctl,
+	.mmap		= dmaplane_mmap,
 };
 
 /* ------------------------------------------------------------------ */
@@ -683,17 +1011,21 @@ static const struct file_operations dmaplane_fops = {
 /*
  * dmaplane_init - Module entry point.
  *
- * Standard character device registration sequence:
+ * Init sequence:
  *  1. kzalloc the singleton dmaplane_dev.
- *  2. alloc_chrdev_region for a dynamic major number (kernel assigns
- *     an unused number; avoids the need to reserve a fixed major).
- *  3. cdev_init + cdev_add to register the file_operations.
- *  4. class_create so udev can see the device class.
- *  5. device_create to create the /dev/dmaplane node.
+ *  2. platform_device_alloc + platform_device_add + dma_set_mask —
+ *     creates a DMA-capable device for buffer allocation.
+ *  3. alloc_chrdev_region for a dynamic major number.
+ *  4. cdev_init + cdev_add to register the file_operations.
+ *  5. class_create so udev can see the device class.
+ *  6. device_create to create the /dev/dmaplane node.
+ *
+ * The platform device is created BEFORE the char device because the
+ * DMA API (dma_alloc_coherent, dma_map_sg) requires a device that is
+ * registered with a bus and has a valid DMA mask.  device_create alone
+ * is NOT DMA-capable — it only produces a device node for udev.
  *
  * On any failure, goto-based cleanup tears down in reverse order.
- * Channel slots are zero-initialised by kzalloc and are set up on
- * demand in create_channel — no explicit init here.
  */
 static int __init dmaplane_init(void)
 {
@@ -704,6 +1036,8 @@ static int __init dmaplane_init(void)
 		return -ENOMEM;
 
 	mutex_init(&dma_dev->dev_mutex);
+	mutex_init(&dma_dev->buf_lock);
+	dma_dev->next_buf_id = 1;	/* Skip 0 — reserved as "no buffer" */
 
 	/* Device-level counters — kzalloc zeroes them, but be explicit */
 	atomic_set(&dma_dev->active_channels, 0);
@@ -711,12 +1045,54 @@ static int __init dmaplane_init(void)
 	atomic64_set(&dma_dev->total_closes, 0);
 	atomic64_set(&dma_dev->total_channels_created, 0);
 	atomic64_set(&dma_dev->total_channels_destroyed, 0);
+	atomic64_set(&dma_dev->stats.buffers_created, 0);
+	atomic64_set(&dma_dev->stats.buffers_destroyed, 0);
+
+	/*
+	 * Create platform device for DMA operations.
+	 *
+	 * The character device (/dev/dmaplane) handles the userspace interface
+	 * (open, ioctl, mmap).  But the DMA API requires a device that is
+	 * registered with a bus and has a valid DMA mask.  platform_device
+	 * provides this — it represents a virtual hardware device that the
+	 * DMA subsystem can program IOMMU entries for.
+	 *
+	 * All DMA operations (dma_alloc_coherent, dma_map_sg, dma_mmap_coherent)
+	 * use &dma_dev->pdev->dev as the device parameter.
+	 */
+	dma_dev->pdev = platform_device_alloc("dmaplane_dma", -1);
+	if (!dma_dev->pdev) {
+		pr_err("platform_device_alloc failed\n");
+		ret = -ENOMEM;
+		goto err_free_dev;
+	}
+
+	ret = platform_device_add(dma_dev->pdev);
+	if (ret) {
+		pr_err("platform_device_add failed: %d\n", ret);
+		goto err_put_pdev;
+	}
+
+	/*
+	 * Set DMA mask.  Try 64-bit first (allows DMA to all physical memory),
+	 * fall back to 32-bit (4 GB limit) if the platform doesn't support 64-bit.
+	 * Without a DMA mask, dma_alloc_coherent will fail.
+	 */
+	ret = dma_set_mask_and_coherent(&dma_dev->pdev->dev, DMA_BIT_MASK(64));
+	if (ret) {
+		ret = dma_set_mask_and_coherent(&dma_dev->pdev->dev,
+						DMA_BIT_MASK(32));
+		if (ret) {
+			pr_err("failed to set DMA mask\n");
+			goto err_unreg_pdev;
+		}
+	}
 
 	/* Dynamic major number — kernel assigns unused number */
 	ret = alloc_chrdev_region(&dma_dev->devno, 0, 1, DMAPLANE_NAME);
 	if (ret < 0) {
 		pr_err("alloc_chrdev_region failed: %d\n", ret);
-		goto err_free_dev;
+		goto err_unreg_pdev;
 	}
 
 	/* Character device — register our file_operations */
@@ -754,6 +1130,12 @@ err_cdev_del:
 	cdev_del(&dma_dev->cdev);
 err_unreg_region:
 	unregister_chrdev_region(dma_dev->devno, 1);
+err_unreg_pdev:
+	platform_device_unregister(dma_dev->pdev);
+	goto err_free_dev;	/* skip put — unregister already put */
+err_put_pdev:
+	/* platform_device_put for devices allocated but never added */
+	platform_device_put(dma_dev->pdev);
 err_free_dev:
 	kfree(dma_dev);
 	return ret;
@@ -762,33 +1144,55 @@ err_free_dev:
 /*
  * dmaplane_exit - Module cleanup.
  *
- * Acquires dev_mutex and destroys any channels that are still active
- * (e.g., if a user process was killed without closing the fd and the
- * release path has not yet run).  Then tears down device node, class,
- * cdev, region, and finally frees dmaplane_dev — exact reverse order
- * of dmaplane_init.
+ * Teardown ordering is critical:
+ *  1. Stop any remaining active channels (kthreads must exit first).
+ *  2. Tear down char device (prevents new opens/ioctls from racing
+ *     with buffer cleanup).
+ *  3. Destroy remaining buffers (dma_free_coherent needs the platform
+ *     device to be alive).
+ *  4. Unregister platform device.
+ *  5. Free device context.
  */
 static void __exit dmaplane_exit(void)
 {
 	int i;
 
-	/* Stop any remaining active channels */
+	/* 1. Stop any remaining active channels */
 	mutex_lock(&dma_dev->dev_mutex);
 	for (i = 0; i < DMAPLANE_MAX_CHANNELS; i++)
 		dmaplane_channel_destroy(&dma_dev->channels[i]);
 	mutex_unlock(&dma_dev->dev_mutex);
 
 	/* Lifetime summary — visible in dmesg after rmmod */
-	pr_info("lifetime: %lld opens, %lld closes, %lld channels created, %lld destroyed\n",
+	pr_info("lifetime: %lld opens, %lld closes, %lld channels created, %lld destroyed, %lld buffers created, %lld destroyed\n",
 		atomic64_read(&dma_dev->total_opens),
 		atomic64_read(&dma_dev->total_closes),
 		atomic64_read(&dma_dev->total_channels_created),
-		atomic64_read(&dma_dev->total_channels_destroyed));
+		atomic64_read(&dma_dev->total_channels_destroyed),
+		atomic64_read(&dma_dev->stats.buffers_created),
+		atomic64_read(&dma_dev->stats.buffers_destroyed));
 
+	/* 2. Tear down char device — prevents new ioctls/opens */
 	device_destroy(dma_dev->class, dma_dev->devno);
 	class_destroy(dma_dev->class);
 	cdev_del(&dma_dev->cdev);
 	unregister_chrdev_region(dma_dev->devno, 1);
+
+	/* 3. Free remaining buffers — warn on leaked mmap references */
+	for (i = 0; i < DMAPLANE_MAX_BUFFERS; i++) {
+		if (dma_dev->buffers[i].in_use) {
+			if (atomic_read(&dma_dev->buffers[i].mmap_count) > 0)
+				pr_warn("buffer %u still has %d active mmaps at exit\n",
+					dma_dev->buffers[i].id,
+					atomic_read(&dma_dev->buffers[i].mmap_count));
+			dmabuf_rdma_destroy_buffer(dma_dev, dma_dev->buffers[i].id);
+		}
+	}
+
+	/* 4. Unregister platform device */
+	platform_device_unregister(dma_dev->pdev);
+
+	/* 5. Free device context */
 	kfree(dma_dev);
 
 	pr_info("module unloaded\n");
