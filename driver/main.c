@@ -27,7 +27,13 @@
  *                  dmaplane_exit.
  *     Why mutex: only taken in process/ioctl context where sleeping is
  *                permitted; never on the submit/complete hot path.
- *     Ordering: outermost lock; never held while acquiring ring locks.
+ *     Ordering: outermost lock.
+ *
+ *   channel->lock (struct mutex)
+ *     Protects: channel state (shutdown flag, worker pointer).
+ *     Acquired by: dmaplane_release (shutdown sequence).
+ *     Why mutex: sleeping context OK — only from process context.
+ *     Ordering: dev_mutex → channel->lock → ring spinlocks.
  *
  *   sub_ring.lock / comp_ring.lock (spinlock_t, irqsave)
  *     Protects: ring entries[] array and head/tail index updates for
@@ -205,7 +211,7 @@ static int dmaplane_worker_fn(void *data)
 			}
 
 			atomic_dec(&chan->in_flight);
-			chan->stats.total_completions++;
+			atomic64_inc(&chan->stats.total_completions);
 			batch++;
 
 			/* Yield every 64 entries to avoid hogging CPU */
@@ -229,11 +235,14 @@ done:
  * @id:  channel index in dma_dev->channels[].
  *
  * Called under dev_mutex during IOCTL_CREATE_CHANNEL.  Initialises both
- * rings, the wait queue, counters, and the stats block.  The channel is
- * not yet marked active, so no other thread can observe it.
+ * rings, the wait queue, kref (starts at 1 for the file_ctx holder),
+ * per-channel mutex, and atomic stats.  The channel is not yet marked
+ * active, so no other thread can observe it.
  */
 static void dmaplane_channel_init(struct dmaplane_channel *chan, unsigned int id)
 {
+	kref_init(&chan->refcount);	/* Initial ref for file_ctx */
+	mutex_init(&chan->lock);
 	dmaplane_ring_init(&chan->sub_ring);
 	dmaplane_ring_init(&chan->comp_ring);
 	init_waitqueue_head(&chan->wait_queue);
@@ -242,21 +251,54 @@ static void dmaplane_channel_init(struct dmaplane_channel *chan, unsigned int id
 	chan->shutdown = false;
 	chan->active = false;
 	chan->worker = NULL;
-	memset(&chan->stats, 0, sizeof(chan->stats));
+	atomic64_set(&chan->stats.total_submissions, 0);
+	atomic64_set(&chan->stats.total_completions, 0);
+	atomic_set(&chan->stats.ring_high_watermark, 0);
+	atomic_set(&chan->stats.dropped_count, 0);
 }
 
 /*
- * dmaplane_channel_destroy - Stop a channel's worker and mark inactive.
+ * dmaplane_channel_release - kref release callback.
+ * @ref: pointer to the kref embedded in dmaplane_channel.
+ *
+ * Called when the last reference is dropped (kref hits zero).
+ * Marks the channel slot inactive so it can be reused by
+ * create_channel.  Also decrements the device-level active_channels
+ * counter and increments total_channels_destroyed.
+ *
+ * At this point the worker has exited and the file_ctx has released
+ * its reference — no other code path can access this channel.
+ */
+void dmaplane_channel_release(struct kref *ref)
+{
+	struct dmaplane_channel *chan =
+		container_of(ref, struct dmaplane_channel, refcount);
+
+	chan->active = false;
+	atomic_dec(&dma_dev->active_channels);
+	atomic64_inc(&dma_dev->total_channels_destroyed);
+	pr_debug("channel %u released (kref=0)\n", chan->id);
+}
+
+/*
+ * dmaplane_channel_destroy - Stop a channel's worker and drop file_ctx ref.
  * @chan: channel to destroy.
  *
  * Must be called under dev_mutex (from release or module exit).
  *
  * Teardown sequence:
- *  1. Set chan->shutdown = true to signal the worker.
- *  2. Wake the worker so it can observe the flag and kthread_should_stop().
- *  3. kthread_stop() waits for the worker to return, then puts the
- *     task_struct.  This is a blocking call.
- *  4. Mark chan->active = false so the slot can be reused.
+ *  1. Acquire channel->lock.
+ *  2. Set chan->shutdown = true to signal the worker.
+ *  3. Release channel->lock (so the worker can check shutdown under
+ *     lock if needed in future phases).
+ *  4. Wake the worker so it can observe the flag and kthread_should_stop().
+ *  5. kthread_stop() waits for the worker to exit.  Note: the kthread
+ *     wrapper may skip threadfn entirely if KTHREAD_SHOULD_STOP is set
+ *     before the kthread gets a timeslice (common when channels are
+ *     created and destroyed quickly).
+ *  6. kref_put drops the worker's ref (refcount 2 → 1).
+ *  7. kref_put drops the file_ctx's ref (refcount 1 → 0), triggering
+ *     dmaplane_channel_release which marks the slot inactive.
  *
  * After return, the worker is guaranteed stopped and ring memory is safe
  * to reuse (but not zeroed — stats remain readable until re-init).
@@ -266,7 +308,10 @@ static void dmaplane_channel_destroy(struct dmaplane_channel *chan)
 	if (!chan->active)
 		return;
 
+	mutex_lock(&chan->lock);
 	chan->shutdown = true;
+	mutex_unlock(&chan->lock);
+
 	wake_up_interruptible(&chan->wait_queue);
 
 	if (chan->worker) {
@@ -274,7 +319,16 @@ static void dmaplane_channel_destroy(struct dmaplane_channel *chan)
 		chan->worker = NULL;
 	}
 
-	chan->active = false;
+	/*
+	 * Drop both refs.  kthread_stop guarantees the worker has exited,
+	 * but threadfn may not have run — the kthread wrapper skips
+	 * threadfn if KTHREAD_SHOULD_STOP is already set (happens when
+	 * a channel is created and destroyed before the scheduler gives
+	 * the kthread a timeslice).  We drop the worker's ref here
+	 * unconditionally, then the file_ctx's ref triggers release.
+	 */
+	kref_put(&chan->refcount, dmaplane_channel_release);  /* worker ref */
+	kref_put(&chan->refcount, dmaplane_channel_release);  /* file_ctx ref */
 	pr_debug("channel %u destroyed\n", chan->id);
 }
 
@@ -336,6 +390,9 @@ static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
 	dmaplane_channel_init(chan, i);
 	chan->active = true;
 
+	/* Take a second ref for the worker thread (init gave us 1 for file_ctx) */
+	kref_get(&chan->refcount);
+
 	/*
 	 * kthread_create allocates the task but does NOT start it.
 	 * We store chan->worker first, then wake_up_process makes it
@@ -343,12 +400,20 @@ static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
 	 */
 	worker = kthread_create(dmaplane_worker_fn, chan, "dmaplane/%d", i);
 	if (IS_ERR(worker)) {
+		/*
+		 * No other code path holds a reference — the channel was
+		 * just initialised and never stored in file_ctx.  Reset
+		 * directly; kref_init on next reuse will reinitialise.
+		 */
 		chan->active = false;
 		mutex_unlock(&dev->dev_mutex);
 		return PTR_ERR(worker);
 	}
 	chan->worker = worker;
 	wake_up_process(worker);
+
+	atomic_inc(&dev->active_channels);
+	atomic64_inc(&dev->total_channels_created);
 
 	ctx->chan = chan;
 
@@ -375,10 +440,9 @@ static long dmaplane_ioctl_create_channel(struct dmaplane_file_ctx *ctx,
  * must drain completions to make progress (backpressure mechanism).
  *
  * High watermark tracking: after the entry is written but before the
- * lock is released, we snapshot the occupancy and update the stat.
- * Safe because the lock is held; the stat field is a plain u32 (not
- * atomic), only written here under the lock and only read by GET_STATS
- * which accepts racy snapshots.
+ * lock is released, we snapshot the occupancy and update the atomic
+ * stat if the new value is higher.  Safe because the lock serialises
+ * writers; the atomic_set is relaxed (no ordering needed for stats).
  *
  * Returns:
  *   0       on success.
@@ -414,15 +478,18 @@ static long dmaplane_ioctl_submit(struct dmaplane_file_ctx *ctx,
 	/* smp_store_release: entry store must be visible before head advance */
 	smp_store_release(&ring->head, ring->head + 1);
 
-	/* Track high watermark (safe: we hold the lock) */
+	/* Track high watermark under lock — compare-and-swap if new max */
 	occupancy = dmaplane_ring_count(ring);
-	if (occupancy > chan->stats.ring_high_watermark)
-		chan->stats.ring_high_watermark = occupancy;
+	{
+		unsigned int old_wm = atomic_read(&chan->stats.ring_high_watermark);
+		if (occupancy > old_wm)
+			atomic_set(&chan->stats.ring_high_watermark, occupancy);
+	}
 
 	spin_unlock_irqrestore(&ring->lock, flags);
 
 	atomic_inc(&chan->in_flight);
-	chan->stats.total_submissions++;
+	atomic64_inc(&chan->stats.total_submissions);
 
 	/* Wake the worker so it sees the new entry */
 	wake_up_interruptible(&chan->wait_queue);
@@ -481,10 +548,12 @@ static long dmaplane_ioctl_complete(struct dmaplane_file_ctx *ctx,
  * @ctx: file context (must have an assigned channel).
  * @arg: userspace pointer to struct dmaplane_stats (output).
  *
- * Copies the raw stats struct.  This is a racy snapshot — fields are
- * updated without locks on the hot path.  Values are monotonically
- * increasing and individually consistent, but the set may be momentarily
- * inconsistent.  Acceptable for observability.
+ * Reads atomic counters from dmaplane_stats_kern into a plain
+ * dmaplane_stats UAPI struct, then copies to userspace.  Each atomic
+ * read is individually consistent, but the set may be momentarily
+ * inconsistent (e.g., total_completions could briefly exceed
+ * total_submissions if read between the two increments).
+ * Acceptable for observability.
  *
  * Returns:
  *   0       on success.
@@ -495,11 +564,17 @@ static long dmaplane_ioctl_get_stats(struct dmaplane_file_ctx *ctx,
 				      unsigned long arg)
 {
 	struct dmaplane_channel *chan = ctx->chan;
+	struct dmaplane_stats ustats;
 
 	if (!chan)
 		return -ENODEV;
 
-	if (copy_to_user((void __user *)arg, &chan->stats, sizeof(chan->stats)))
+	ustats.total_submissions  = atomic64_read(&chan->stats.total_submissions);
+	ustats.total_completions  = atomic64_read(&chan->stats.total_completions);
+	ustats.ring_high_watermark = atomic_read(&chan->stats.ring_high_watermark);
+	ustats.dropped_count      = atomic_read(&chan->stats.dropped_count);
+
+	if (copy_to_user((void __user *)arg, &ustats, sizeof(ustats)))
 		return -EFAULT;
 
 	return 0;
@@ -532,6 +607,7 @@ static int dmaplane_open(struct inode *inode, struct file *filp)
 	ctx->chan = NULL;
 	filp->private_data = ctx;
 
+	atomic64_inc(&dma_dev->total_opens);
 	pr_debug("device opened\n");
 	return 0;
 }
@@ -560,6 +636,7 @@ static int dmaplane_release(struct inode *inode, struct file *filp)
 	}
 
 	kfree(ctx);
+	atomic64_inc(&dma_dev->total_closes);
 	pr_debug("device closed\n");
 	return 0;
 }
@@ -628,6 +705,13 @@ static int __init dmaplane_init(void)
 
 	mutex_init(&dma_dev->dev_mutex);
 
+	/* Device-level counters — kzalloc zeroes them, but be explicit */
+	atomic_set(&dma_dev->active_channels, 0);
+	atomic64_set(&dma_dev->total_opens, 0);
+	atomic64_set(&dma_dev->total_closes, 0);
+	atomic64_set(&dma_dev->total_channels_created, 0);
+	atomic64_set(&dma_dev->total_channels_destroyed, 0);
+
 	/* Dynamic major number — kernel assigns unused number */
 	ret = alloc_chrdev_region(&dma_dev->devno, 0, 1, DMAPLANE_NAME);
 	if (ret < 0) {
@@ -693,6 +777,13 @@ static void __exit dmaplane_exit(void)
 	for (i = 0; i < DMAPLANE_MAX_CHANNELS; i++)
 		dmaplane_channel_destroy(&dma_dev->channels[i]);
 	mutex_unlock(&dma_dev->dev_mutex);
+
+	/* Lifetime summary — visible in dmesg after rmmod */
+	pr_info("lifetime: %lld opens, %lld closes, %lld channels created, %lld destroyed\n",
+		atomic64_read(&dma_dev->total_opens),
+		atomic64_read(&dma_dev->total_closes),
+		atomic64_read(&dma_dev->total_channels_created),
+		atomic64_read(&dma_dev->total_channels_destroyed));
 
 	device_destroy(dma_dev->class, dma_dev->devno);
 	class_destroy(dma_dev->class);

@@ -22,6 +22,7 @@
 
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/kref.h>
 #include <linux/kthread.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -77,10 +78,61 @@ struct dmaplane_ring {
 };
 
 /*
+ * Kernel-internal stats with atomic counters.
+ *
+ * Safe for concurrent updates (worker thread) and reads (ioctl).
+ * The UAPI dmaplane_stats struct uses plain __u64 — IOCTL_GET_STATS
+ * converts by reading each atomic into the UAPI struct before
+ * copy_to_user.
+ */
+struct dmaplane_stats_kern {
+	atomic64_t total_submissions;	/* Incremented in submit ioctl path */
+	atomic64_t total_completions;	/* Incremented in worker thread */
+	atomic_t   ring_high_watermark;	/* Max submission ring occupancy;
+					 * atomic_t (32-bit) is sufficient */
+	atomic_t   dropped_count;	/* Entries dropped (Phase 1: always 0;
+					 * worker yields instead of dropping) */
+};
+
+/*
  * Channel: one submission ring, one completion ring, one worker kthread.
  * Each open fd gets at most one channel (assigned via IOCTL_CREATE_CHANNEL).
+ *
+ * Lifetime managed by kref: the channel is freed (slot marked inactive)
+ * only when the last reference drops.  Reference holders:
+ *   - dmaplane_file_ctx: takes ref at channel creation.
+ *   - Worker kthread: takes ref at channel creation.
+ * Both refs are dropped by dmaplane_channel_destroy after kthread_stop
+ * guarantees the worker has exited.  (The worker cannot drop its own
+ * ref because the kthread wrapper may skip threadfn if KTHREAD_SHOULD_STOP
+ * is set before the kthread gets a timeslice.)
+ * kref_put calls dmaplane_channel_release.
  */
 struct dmaplane_channel {
+	/*
+	 * refcount: channel lifetime — freed when last ref drops.
+	 * Two refs taken at creation: one for file_ctx, one for
+	 * the worker kthread.  Both dropped by dmaplane_channel_destroy
+	 * after kthread_stop guarantees the worker has exited.
+	 * kref_put calls dmaplane_channel_release.
+	 */
+	struct kref refcount;
+
+	/*
+	 * lock: per-channel mutex — protects channel state (shutdown flag,
+	 * active flag, worker pointer).  Separate from ring spinlocks
+	 * which protect ring data.  Separate from dev_mutex which
+	 * protects slot allocation.
+	 *
+	 * Why mutex: only acquired from process context (ioctl, release);
+	 * sleeping is permitted.
+	 *
+	 * Ordering: dev_mutex → channel->lock → ring spinlocks
+	 * (if ever nested, though current code avoids holding multiple
+	 * simultaneously).
+	 */
+	struct mutex lock;
+
 	/*
 	 * sub_ring: Submission ring.
 	 * sub_ring.lock protects ring entries between the ioctl submit
@@ -116,32 +168,30 @@ struct dmaplane_channel {
 	atomic_t in_flight;
 
 	/*
-	 * shutdown: set to true by dmaplane_channel_destroy under
-	 * dev_mutex before calling kthread_stop.  The worker checks
+	 * shutdown: set to true by dmaplane_release under channel->lock
+	 * before calling kthread_stop.  The worker checks
 	 * kthread_should_stop() as its primary stop signal; this bool
 	 * is a supplementary flag used to wake the worker out of
 	 * wait_event_interruptible so it can see the stop flag.
-	 * Single-writer (destroy path), so no lock needed on this field.
 	 */
 	bool shutdown;
 
 	/*
 	 * active: true when this channel slot is in use.  Protected by
 	 * dev_mutex — set to true in create_channel and to false in
-	 * channel_destroy, both of which hold the mutex.  Used by the
+	 * dmaplane_channel_release (kref callback).  Used by the
 	 * linear scan in create_channel to find a free slot.
 	 */
 	bool active;
 
 	/*
-	 * stats: per-channel counters.  total_submissions is updated in
-	 * the submit ioctl path; total_completions and dropped_count are
-	 * updated in the worker thread; ring_high_watermark is updated
-	 * under sub_ring.lock.  None of these fields are atomic —
-	 * GET_STATS reads a racy snapshot, which is acceptable for
-	 * observability purposes.
+	 * stats: per-channel counters with atomic types for safe
+	 * concurrent access.  total_submissions is incremented in the
+	 * submit ioctl path; total_completions in the worker thread;
+	 * ring_high_watermark under sub_ring.lock.  IOCTL_GET_STATS
+	 * reads atomics into the UAPI struct.
 	 */
-	struct dmaplane_stats stats;
+	struct dmaplane_stats_kern stats;
 };
 
 /*
@@ -158,8 +208,9 @@ struct dmaplane_dev {
 	 * Why mutex: sleeping context OK — only acquired from process
 	 *            context (ioctl and file release).  Never acquired
 	 *            from interrupt or softirq context.
-	 * Ordering: outermost lock; never held while acquiring ring locks
-	 *           (current code never needs both simultaneously).
+	 * Ordering: outermost lock.  Always acquired before channel->lock
+	 *           (see dmaplane_channel_destroy).  Never held while
+	 *           acquiring ring spinlocks directly.
 	 */
 	struct mutex dev_mutex;
 
@@ -167,6 +218,17 @@ struct dmaplane_dev {
 	struct class *class;		/* Device class for udev */
 	dev_t devno;			/* Major/minor number pair */
 	struct device *device;		/* /dev/dmaplane device node */
+
+	/*
+	 * Device-level statistics — atomic for lock-free updates from
+	 * open/close/create_channel paths.  Readable via pr_info at
+	 * module unload; Phase 7 will export through debugfs.
+	 */
+	atomic_t   active_channels;		/* Currently active channels */
+	atomic64_t total_opens;			/* Lifetime fd opens */
+	atomic64_t total_closes;		/* Lifetime fd closes */
+	atomic64_t total_channels_created;	/* Lifetime channels created */
+	atomic64_t total_channels_destroyed;	/* Lifetime channels destroyed */
 };
 
 /*
@@ -179,6 +241,9 @@ struct dmaplane_file_ctx {
 					 * IOCTL_CREATE_CHANNEL has not been
 					 * called on this fd yet */
 };
+
+/* kref release callback — marks slot inactive, cleans up channel */
+void dmaplane_channel_release(struct kref *ref);
 
 /*
  * Ring buffer helpers.

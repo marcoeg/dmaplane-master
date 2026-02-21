@@ -73,7 +73,7 @@ struct dmaplane_complete_params {
  */
 struct dmaplane_channel_params {
 	__u32 channel_id;	/* out — assigned channel index [0, MAX_CHANNELS) */
-	__u32 _pad;		/* padding — explicit pad for alignment */
+	__u32 _pad;			/* padding — explicit pad for alignment */
 };
 
 /*
@@ -87,10 +87,10 @@ struct dmaplane_stats {
 	__u64 total_completions;	/* Total entries completed by the worker */
 	__u32 ring_high_watermark;	/* Max submission ring occupancy observed */
 	__u32 dropped_count;		/* Entries dropped due to completion ring
-					 * full.  Phase 1 never drops — the worker
-					 * yields until space is available — so
-					 * this reads 0.  Retained as a placeholder
-					 * for future backpressure policies. */
+								* full.  Phase 1 never drops — the worker
+								* yields until space is available — so
+								* this reads 0.  Retained as a placeholder
+								* for future backpressure policies. */
 };
 
 /* Phase 1 ioctl commands: 0x01–0x04 */

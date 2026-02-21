@@ -16,6 +16,20 @@ Read these before implementing anything:
 - **`docs/reference/CODE_OVERVIEW.md`** — Detailed analysis of every source file. Documents structs, ioctls, locking strategy, and design decisions. Updated each phase. Read this to understand the existing codebase.
 - **`docs/reference/NARRATIVE_dmaplane_foundation.md`** — Technical essay describing the project's positioning, use cases, and relationship to production systems (Mooncake, TransferEngine, nvidia-peermem). Read this for context on *why* the code is shaped the way it is.
 
+## Quality Gate — Reference Check
+
+Before implementing, read these files from the original dmaplane project 
+(available in docs/reference/) and verify that this prompt accounts for 
+every pattern and design decision relevant to this phase:
+
+1. docs/reference/CODE_OVERVIEW_original.md — the original project's full 
+   code analysis. Search for keywords relevant to this phase.
+2. The original project's source files for the equivalent functionality 
+   (if available in docs/reference/original_source/).
+
+If this prompt contradicts or omits something from the original that seems 
+important, flag it before implementing.
+
 ## Conventions
 
 ### Source files
@@ -31,6 +45,15 @@ Read these before implementing anything:
 - Lifecycle messages (module load/unload, subsystem init/teardown): `pr_info`
 - Per-operation messages (buffer create/destroy, submit/complete): `pr_debug`
 - Warnings and errors: `pr_warn`, `pr_err`
+
+### Code comments
+- Every `.c` and `.h` file gets a header block: what it does, where it fits, key design decisions
+- Every struct field gets an inline comment
+- Every lock declaration gets a block comment: what it protects, who acquires it, why this lock type, ordering constraints
+- Every ioctl handler gets a block comment: what it does, concurrency model, error returns
+- Non-obvious lines get inline "why" comments (memory barriers, skip-zero-on-wrap, DMA API subtleties)
+- UAPI structs annotate fields `/* in */`, `/* out */`, or `/* in/out */`
+- Standard: a kernel engineer should understand the code without reading any external documentation
 
 ### Locking
 - Every lock must have a comment explaining what it protects and why it exists.
