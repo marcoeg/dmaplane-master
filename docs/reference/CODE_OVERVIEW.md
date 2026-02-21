@@ -41,12 +41,16 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 **Kernel-internal types:**
 - `struct dmaplane_ring`: array of `dmaplane_ring_entry[RING_SIZE]`, `spinlock_t lock`, `unsigned int head` (producer writes, `____cacheline_aligned_in_smp`), `unsigned int tail` (consumer reads, `____cacheline_aligned_in_smp`). Head and tail are monotonically increasing — modulo is applied only when indexing into the array. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`.
-- `struct dmaplane_channel`: `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use), `struct dmaplane_stats stats`.
-- `struct dmaplane_dev`: `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`.
+- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`. Safe for concurrent updates (worker) and reads (ioctl). `IOCTL_GET_STATS` reads atomics into the UAPI `dmaplane_stats` struct before `copy_to_user`. The UAPI struct is unchanged (plain `__u64`/`__u32`).
+- `struct dmaplane_channel`: `struct kref refcount` (channel lifetime), `struct mutex lock` (per-channel state lock), `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use, set to false by kref release callback), `struct dmaplane_stats_kern stats` (atomic counters).
+- `struct dmaplane_dev`: `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
 - `struct dmaplane_file_ctx`: `struct dmaplane_dev *dev`, `struct dmaplane_channel *chan` (NULL until CREATE_CHANNEL).
+- `dmaplane_channel_release()`: kref release callback — marks slot inactive (`active = false`), decrements `active_channels`, increments `total_channels_destroyed`. Called when the last kref drops to zero.
 - Inline helpers: `dmaplane_ring_full()`, `dmaplane_ring_empty()`, `dmaplane_ring_count()`.
 
 **Design notes**: Fixed-size arrays with linear scan are a deliberate simplicity trade-off — 4 channel slots is enough for Phase 1's use cases and avoids IDR complexity. The ring buffer uses unsigned arithmetic for wrap-free full/empty detection.
+
+**kref lifetime model**: Two refs are taken at channel creation: one for the file_ctx, one for the worker kthread. Both are dropped by `dmaplane_channel_destroy` after `kthread_stop` guarantees the worker has exited. The worker does **not** drop its own ref because the kthread wrapper (`kernel/kthread.c`) can skip `threadfn` entirely if `KTHREAD_SHOULD_STOP` is set before the kthread gets a CPU timeslice — common when channels are created and destroyed quickly (e.g., `test_channel_creation`). Dropping both refs in destroy avoids slot leaks.
 
 ---
 
@@ -63,23 +67,26 @@ Character device driver with ioctl dispatch and per-channel worker threads. Sing
 - `class_create` + `device_create` for `/dev/dmaplane` udev node
 - Clean teardown in reverse order on failure (goto-based cleanup: `err_class_destroy`, `err_cdev_del`, `err_unreg_region`, `err_free_dev`)
 
+**Module init** also explicitly initialises device-level atomic counters (`atomic_set` / `atomic64_set`) for clarity, even though `kzalloc` zeroes them.
+
 **Module exit** (`dmaplane_exit`):
 - Acquires `dev_mutex`, stops any remaining active worker kthreads via `dmaplane_channel_destroy`
+- Prints lifetime summary via `pr_info`: total opens, closes, channels created, channels destroyed
 - `device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region` + `kfree`
 
 **File operations:**
-- `dmaplane_open`: Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Does not create a channel — that happens via ioctl.
-- `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`), releases mutex, frees file context. Handles process exit without explicit cleanup.
+- `dmaplane_open`: Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`. Does not create a channel — that happens via ioctl.
+- `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
 - `dmaplane_ioctl`: Dispatches to per-command handlers via switch.
 
 **Ioctl handlers:**
 
 | Command | Handler | Description |
 |---------|---------|-------------|
-| `DMAPLANE_IOCTL_CREATE_CHANNEL` | `dmaplane_ioctl_create_channel` | Returns `-EBUSY` if fd already has a channel. Finds free slot (under `dev_mutex`), inits rings via `dmaplane_channel_init`, creates kthread `"dmaplane/%d"` via `kthread_create`, wakes thread, stores channel in file context, `copy_to_user` channel ID |
-| `DMAPLANE_IOCTL_SUBMIT` | `dmaplane_ioctl_submit` | `copy_from_user`, acquire submission ring spinlock, check full (return `-ENOSPC`), write entry at `head % RING_SIZE`, `smp_store_release` on head, track high watermark, release lock, `atomic_inc(in_flight)`, increment `total_submissions`, `wake_up_interruptible` worker |
+| `DMAPLANE_IOCTL_CREATE_CHANNEL` | `dmaplane_ioctl_create_channel` | Returns `-EBUSY` if fd already has a channel. Finds free slot (under `dev_mutex`), inits channel via `dmaplane_channel_init` (kref_init, mutex_init, rings, atomic stats), takes second kref for worker, creates kthread `"dmaplane/%d"` via `kthread_create`, wakes thread, increments `active_channels` and `total_channels_created`, stores channel in file context, `copy_to_user` channel ID |
+| `DMAPLANE_IOCTL_SUBMIT` | `dmaplane_ioctl_submit` | `copy_from_user`, acquire submission ring spinlock, check full (return `-ENOSPC`), write entry at `head % RING_SIZE`, `smp_store_release` on head, track high watermark via `atomic_set`, release lock, `atomic_inc(in_flight)`, `atomic64_inc(total_submissions)`, `wake_up_interruptible` worker |
 | `DMAPLANE_IOCTL_COMPLETE` | `dmaplane_ioctl_complete` | Acquire completion ring spinlock, check empty (return `-EAGAIN`), read entry at `tail % RING_SIZE`, `smp_store_release` on tail, release lock, `copy_to_user` |
-| `DMAPLANE_IOCTL_GET_STATS` | `dmaplane_ioctl_get_stats` | `copy_to_user` the channel's `dmaplane_stats` struct |
+| `DMAPLANE_IOCTL_GET_STATS` | `dmaplane_ioctl_get_stats` | Reads `dmaplane_stats_kern` atomics into a plain `dmaplane_stats` UAPI struct, then `copy_to_user`. Each atomic read is individually consistent; the set may be momentarily inconsistent |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -88,18 +95,20 @@ Character device driver with ioctl dispatch and per-channel worker threads. Sing
 - Drains submissions one at a time: acquires sub_ring lock, re-checks empty under lock, reads entry at `tail % RING_SIZE`, advances tail via `smp_store_release`, releases lock
 - Processes entry (increments payload by 1)
 - Pushes to completion ring: acquires comp_ring lock, checks full. **If completion ring is full, releases lock and yields via `cond_resched()` in a retry loop** (checking `kthread_should_stop` each iteration). This prevents entry loss under backpressure when userspace drains completions slower than the worker produces them.
-- Decrements `in_flight`, increments `total_completions`
+- Decrements `in_flight`, `atomic64_inc(total_completions)`
 - Calls `cond_resched()` every 64 entries to yield CPU
 
 **Channel lifecycle:**
-- `dmaplane_channel_init`: zeroes rings, `spin_lock_init` both ring locks, `init_waitqueue_head`, clears stats
-- `dmaplane_channel_destroy`: sets `shutdown = true`, `wake_up_interruptible`, `kthread_stop` (blocking wait for thread exit), sets `active = false`
+- `dmaplane_channel_init`: `kref_init` (refcount=1 for file_ctx), `mutex_init` (per-channel lock), zeroes rings, `spin_lock_init` both ring locks, `init_waitqueue_head`, `atomic64_set`/`atomic_set` for all stats counters
+- `dmaplane_channel_destroy`: acquires `channel->lock`, sets `shutdown = true`, releases lock, `wake_up_interruptible`, `kthread_stop` (blocking wait for thread exit), then two `kref_put` calls (worker ref + file_ctx ref). The second `kref_put` triggers `dmaplane_channel_release` which sets `active = false` and updates device-level counters.
+- `dmaplane_channel_release`: kref release callback — sets `active = false`, `atomic_dec(active_channels)`, `atomic64_inc(total_channels_destroyed)`.
 
-**Locking model:**
-- Submission ring spinlock (`sub_ring.lock`): protects ring entries between ioctl submit (producer, advances head) and worker thread (consumer, advances tail). Comment in `dmaplane.h`: "sub_ring.lock protects ring entries between the ioctl submit path (producer, advances head) and the worker thread (consumer, advances tail)."
-- Completion ring spinlock (`comp_ring.lock`): protects ring entries between worker thread (producer, advances head) and ioctl complete (consumer, advances tail). Comment in `dmaplane.h`: "comp_ring.lock protects ring entries between the worker thread (producer, advances head) and the ioctl complete path (consumer, advances tail)."
-- Device mutex (`dev_mutex`): protects channel slot allocation/deallocation. Sleeping context OK — only acquired from ioctl and release (process context). Comment in `dmaplane.h`: "Protects channel slot allocation/deallocation. Sleeping context OK — only acquired from ioctl (process context)."
-- Worker shutdown: `channel->shutdown = true` + `wake_up_interruptible` + `kthread_stop` (blocking wait for thread exit). The completion ring yield loop also checks `kthread_should_stop` to ensure the worker exits even if the ring stays full.
+**Locking model (4 locks):**
+- Device mutex (`dev_mutex`): protects channel slot allocation/deallocation. Sleeping context OK — only acquired from ioctl and release (process context). Outermost lock in the ordering.
+- Per-channel mutex (`channel->lock`): protects channel state transitions (shutdown flag, worker pointer). Separate from ring spinlocks (which protect ring data) and from dev_mutex (which protects slot allocation). Ordering: `dev_mutex` → `channel->lock` → ring spinlocks.
+- Submission ring spinlock (`sub_ring.lock`): protects ring entries between ioctl submit (producer, advances head) and worker thread (consumer, advances tail).
+- Completion ring spinlock (`comp_ring.lock`): protects ring entries between worker thread (producer, advances head) and ioctl complete (consumer, advances tail).
+- Worker shutdown: acquire `channel->lock`, set `channel->shutdown = true`, release lock, `wake_up_interruptible` + `kthread_stop` (blocking wait for thread exit). The completion ring yield loop also checks `kthread_should_stop` to ensure the worker exits even if the ring stays full.
 
 ---
 
@@ -131,6 +140,12 @@ Reports PASS/FAIL per test and a summary. Exit code 0 if all pass, 1 if any fail
 **Completion ring backpressure**: The original design dropped entries when the completion ring was full. Testing under load (4-channel × 250K stress test) revealed that the worker could outpace userspace drain, causing silent completion loss and payload mismatches. The fix: the worker yields (`cond_resched` loop) when the completion ring is full, applying backpressure through the submission ring — if the completion ring is full, the worker blocks, the submission ring fills, and userspace gets `-ENOSPC`, forcing it to drain completions.
 
 **Worker thread as processing stub**: The worker's "processing" (increment payload by 1) is intentionally trivial. The value of Phase 1 is the infrastructure — rings, locking, kthreads, ioctl dispatch, lifecycle management. Future phases replace the stub with real DMA operations, RDMA posts, and GPU transfers, but the ring/worker/ioctl scaffolding remains unchanged.
+
+**kref and the kthread race**: The initial kref design had the worker thread dropping its own ref as its last act in `dmaplane_worker_fn`. This caused a slot leak: when a channel is created and destroyed quickly (e.g., `test_channel_creation`), the kthread may not receive a CPU timeslice before `kthread_stop` is called. The kthread wrapper (`kernel/kthread.c`) checks `KTHREAD_SHOULD_STOP` before calling `threadfn` — if set, `threadfn` is skipped entirely, the worker's `kref_put` never runs, and the refcount stays at 2. The fix: both refs are dropped by `dmaplane_channel_destroy` after `kthread_stop` guarantees the worker has exited (whether `threadfn` ran or not). This is unconditionally safe because `kthread_stop` is a blocking call.
+
+**Atomic stats**: Per-channel stats use `atomic64_t` / `atomic_t` (`dmaplane_stats_kern`) instead of plain integers. This is portable and correct under the C memory model — plain `__u64` reads are atomic on x86-64 but not on 32-bit architectures or under compiler reordering. The UAPI struct (`dmaplane_stats`) remains plain `__u64`/`__u32`; the ioctl handler converts by reading each atomic.
+
+**Device-level observability**: `dmaplane_dev` tracks lifetime counters (opens, closes, channels created/destroyed) and a current active channel count via atomics. Printed at module unload via `pr_info`. Phase 7 will export these through debugfs.
 
 **Error paths**: All error paths use goto-based cleanup with reverse-order resource release. This pattern will be used throughout the project.
 
