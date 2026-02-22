@@ -84,6 +84,8 @@
 #include "dmaplane.h"
 #include "dmabuf_rdma.h"
 #include "dmabuf_export.h"
+#include "rdma_engine.h"
+#include "benchmark.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
@@ -979,6 +981,284 @@ static long dmaplane_ioctl_get_dmabuf_stats(struct dmaplane_file_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 4: RDMA ioctl handlers                                        */
+/*                                                                     */
+/* rdma_sem locking strategy:                                          */
+/*   Read lock (down_read): MR registration/deregistration and all     */
+/*     benchmarks.  Guarantees RDMA context stays alive.  Multiple     */
+/*     readers run concurrently.                                       */
+/*   Write lock (down_write): RDMA setup and teardown.  Exclusive      */
+/*     access — no other RDMA operations can proceed.                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dmaplane_ioctl_setup_rdma — Initialize RDMA subsystem.
+ *
+ * Creates IB device → PD → CQs → QPs → loopback connection.
+ * If copy_to_user fails after successful setup, tears down RDMA to
+ * prevent orphaned resources (userspace never got the status handle).
+ *
+ * Concurrency: acquires rdma_sem write lock (exclusive).
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *  -EBUSY   if RDMA is already initialized.
+ *  -ENODEV  if the IB device is not found.
+ *   Other negative errno from rdma_engine_setup.
+ */
+static long dmaplane_ioctl_setup_rdma(struct dmaplane_file_ctx *ctx,
+				      unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_rdma_setup p;
+	int ret;
+
+	if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+		return -EFAULT;
+
+	/* Null-terminate to prevent buffer overread in find_ib_device */
+	p.ib_dev_name[sizeof(p.ib_dev_name) - 1] = '\0';
+
+	down_write(&dev->rdma_sem);
+	ret = rdma_engine_setup(dev, &p);
+	up_write(&dev->rdma_sem);
+	if (ret)
+		return ret;
+
+	/* If copy fails, undo: userspace never got the status, so the
+	 * RDMA context would be orphaned without teardown. */
+	if (copy_to_user((void __user *)arg, &p, sizeof(p))) {
+		down_write(&dev->rdma_sem);
+		rdma_engine_teardown(dev);
+		up_write(&dev->rdma_sem);
+		return -EFAULT;
+	}
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_teardown_rdma — Tear down RDMA subsystem.
+ *
+ * Deregisters ALL in-use MRs before teardown — their DMA mappings
+ * reference ib_dev which teardown will release.
+ *
+ * Concurrency: acquires rdma_sem write lock (exclusive).
+ *
+ * Returns: 0 always.
+ */
+static long dmaplane_ioctl_teardown_rdma(struct dmaplane_file_ctx *ctx)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	unsigned int j;
+
+	down_write(&dev->rdma_sem);
+
+	/* Deregister all MRs before teardown — their SG table DMA mappings
+	 * reference the ib_dev which teardown will release. */
+	for (j = 0; j < DMAPLANE_MAX_MRS; j++) {
+		if (dev->mrs[j].in_use)
+			rdma_engine_deregister_mr(dev, dev->mrs[j].id);
+	}
+	rdma_engine_teardown(dev);
+
+	up_write(&dev->rdma_sem);
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_register_mr — Register buffer pages as RDMA MR.
+ *
+ * If copy_to_user fails after successful registration, deregisters the
+ * MR to prevent orphaned RDMA resources.
+ *
+ * Concurrency: acquires rdma_sem read lock (concurrent with benchmarks).
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *  -EINVAL  if buffer is coherent (no page array for SG construction).
+ *  -ENOENT  if buffer not found.
+ *   Other negative errno from rdma_engine_register_mr.
+ */
+static long dmaplane_ioctl_register_mr(struct dmaplane_file_ctx *ctx,
+				       unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_mr_params p;
+	int ret;
+
+	if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+		return -EFAULT;
+
+	down_read(&dev->rdma_sem);
+	ret = rdma_engine_register_mr(dev, &p);
+	up_read(&dev->rdma_sem);
+	if (ret)
+		return ret;
+
+	/* If copy fails, undo: userspace never got the mr_id/lkey/rkey,
+	 * so the MR would be orphaned without deregistration. */
+	if (copy_to_user((void __user *)arg, &p, sizeof(p))) {
+		down_read(&dev->rdma_sem);
+		rdma_engine_deregister_mr(dev, p.mr_id);
+		up_read(&dev->rdma_sem);
+		return -EFAULT;
+	}
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_deregister_mr — Deregister an MR by ID.
+ *
+ * Concurrency: acquires rdma_sem read lock.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user fails.
+ *  -ENOENT  if MR not found.
+ */
+static long dmaplane_ioctl_deregister_mr(struct dmaplane_file_ctx *ctx,
+					 unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	__u32 mr_id;
+	int ret;
+
+	if (copy_from_user(&mr_id, (void __user *)arg, sizeof(mr_id)))
+		return -EFAULT;
+
+	down_read(&dev->rdma_sem);
+	ret = rdma_engine_deregister_mr(dev, mr_id);
+	up_read(&dev->rdma_sem);
+	return ret;
+}
+
+/*
+ * dmaplane_ioctl_loopback_test — Run single-message loopback test.
+ *
+ * Concurrency: acquires rdma_sem read lock (concurrent with other benchmarks).
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *   Other negative errno from benchmark_loopback.
+ */
+static long dmaplane_ioctl_loopback_test(struct dmaplane_file_ctx *ctx,
+					 unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_loopback_params p;
+	int ret;
+
+	if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+		return -EFAULT;
+
+	down_read(&dev->rdma_sem);
+	ret = benchmark_loopback(dev, &p);
+	up_read(&dev->rdma_sem);
+	if (ret)
+		return ret;
+
+	if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+		return -EFAULT;
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_pingpong_bench — Run ping-pong latency benchmark.
+ *
+ * Concurrency: acquires rdma_sem read lock.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *   Other negative errno from benchmark_pingpong.
+ */
+static long dmaplane_ioctl_pingpong_bench(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_bench_params p;
+	int ret;
+
+	if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+		return -EFAULT;
+
+	down_read(&dev->rdma_sem);
+	ret = benchmark_pingpong(dev, &p);
+	up_read(&dev->rdma_sem);
+	if (ret)
+		return ret;
+
+	if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+		return -EFAULT;
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_streaming_bench — Run streaming throughput benchmark.
+ *
+ * Concurrency: acquires rdma_sem read lock.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *   Other negative errno from benchmark_streaming.
+ */
+static long dmaplane_ioctl_streaming_bench(struct dmaplane_file_ctx *ctx,
+					   unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_bench_params p;
+	int ret;
+
+	if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+		return -EFAULT;
+
+	down_read(&dev->rdma_sem);
+	ret = benchmark_streaming(dev, &p);
+	up_read(&dev->rdma_sem);
+	if (ret)
+		return ret;
+
+	if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+		return -EFAULT;
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_get_rdma_stats — Copy RDMA statistics to userspace.
+ *
+ * No lock needed — all stats are atomic64_t, individually consistent
+ * without locking.  The snapshot may be momentarily inconsistent across
+ * counters (same caveat as existing stats ioctls).
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_to_user fails.
+ */
+static long dmaplane_ioctl_get_rdma_stats(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_rdma_stats rs;
+
+	rs.mrs_registered    = atomic64_read(&dev->stats.mrs_registered);
+	rs.mrs_deregistered  = atomic64_read(&dev->stats.mrs_deregistered);
+	rs.sends_posted      = atomic64_read(&dev->stats.sends_posted);
+	rs.recvs_posted      = atomic64_read(&dev->stats.recvs_posted);
+	rs.completions_polled = atomic64_read(&dev->stats.completions_polled);
+	rs.completion_errors = atomic64_read(&dev->stats.completion_errors);
+	rs.bytes_sent        = atomic64_read(&dev->stats.bytes_sent);
+	rs.bytes_received    = atomic64_read(&dev->stats.bytes_received);
+
+	if (copy_to_user((void __user *)arg, &rs, sizeof(rs)))
+		return -EFAULT;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1088,6 +1368,24 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	case DMAPLANE_IOCTL_GET_DMABUF_STATS:
 		return dmaplane_ioctl_get_dmabuf_stats(ctx, arg);
 
+	/* Phase 4: RDMA */
+	case DMAPLANE_IOCTL_SETUP_RDMA:
+		return dmaplane_ioctl_setup_rdma(ctx, arg);
+	case DMAPLANE_IOCTL_TEARDOWN_RDMA:
+		return dmaplane_ioctl_teardown_rdma(ctx);
+	case DMAPLANE_IOCTL_REGISTER_MR:
+		return dmaplane_ioctl_register_mr(ctx, arg);
+	case DMAPLANE_IOCTL_DEREGISTER_MR:
+		return dmaplane_ioctl_deregister_mr(ctx, arg);
+	case DMAPLANE_IOCTL_LOOPBACK_TEST:
+		return dmaplane_ioctl_loopback_test(ctx, arg);
+	case DMAPLANE_IOCTL_PINGPONG_BENCH:
+		return dmaplane_ioctl_pingpong_bench(ctx, arg);
+	case DMAPLANE_IOCTL_STREAMING_BENCH:
+		return dmaplane_ioctl_streaming_bench(ctx, arg);
+	case DMAPLANE_IOCTL_GET_RDMA_STATS:
+		return dmaplane_ioctl_get_rdma_stats(ctx, arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -1150,6 +1448,19 @@ static int __init dmaplane_init(void)
 	atomic64_set(&dma_dev->stats.dmabuf_detachments, 0);
 	atomic64_set(&dma_dev->stats.dmabuf_maps, 0);
 	atomic64_set(&dma_dev->stats.dmabuf_unmaps, 0);
+
+	/* Phase 4: RDMA subsystem init */
+	init_rwsem(&dma_dev->rdma_sem);
+	mutex_init(&dma_dev->mr_lock);
+	dma_dev->next_mr_id = 1;	/* Skip 0 — reserved as "no MR" */
+	atomic64_set(&dma_dev->stats.mrs_registered, 0);
+	atomic64_set(&dma_dev->stats.mrs_deregistered, 0);
+	atomic64_set(&dma_dev->stats.sends_posted, 0);
+	atomic64_set(&dma_dev->stats.recvs_posted, 0);
+	atomic64_set(&dma_dev->stats.completions_polled, 0);
+	atomic64_set(&dma_dev->stats.completion_errors, 0);
+	atomic64_set(&dma_dev->stats.bytes_sent, 0);
+	atomic64_set(&dma_dev->stats.bytes_received, 0);
 
 	/*
 	 * Create platform device for DMA operations.
@@ -1289,7 +1600,30 @@ static void __exit dmaplane_exit(void)
 	cdev_del(&dma_dev->cdev);
 	unregister_chrdev_region(dma_dev->devno, 1);
 
-	/* 3. Free remaining buffers — warn on leaked exports/mmaps */
+	/*
+	 * 3. RDMA teardown — after char device is gone (no new ioctls),
+	 * take write lock to synchronize with any in-flight operations
+	 * that started before cdev_del returned.
+	 *
+	 * Deregister MRs ONLY if RDMA is still up.  If userspace already
+	 * called IOCTL_TEARDOWN_RDMA, the PD is gone and attempting to
+	 * deregister MRs would use-after-free on the ib_mr.
+	 */
+	down_write(&dma_dev->rdma_sem);
+	if (dma_dev->rdma.initialized) {
+		for (i = 0; i < DMAPLANE_MAX_MRS; i++) {
+			if (dma_dev->mrs[i].in_use)
+				rdma_engine_deregister_mr(dma_dev,
+							  dma_dev->mrs[i].id);
+		}
+		rdma_engine_teardown(dma_dev);
+	}
+	/* Mark all MR slots as unused regardless (they're invalid now) */
+	for (i = 0; i < DMAPLANE_MAX_MRS; i++)
+		dma_dev->mrs[i].in_use = false;
+	up_write(&dma_dev->rdma_sem);
+
+	/* 4. Free remaining buffers — warn on leaked exports/mmaps */
 	for (i = 0; i < DMAPLANE_MAX_BUFFERS; i++) {
 		if (dma_dev->buffers[i].in_use) {
 			if (dma_dev->buffers[i].dmabuf_exported)
@@ -1303,10 +1637,10 @@ static void __exit dmaplane_exit(void)
 		}
 	}
 
-	/* 4. Unregister platform device */
+	/* 5. Unregister platform device */
 	platform_device_unregister(dma_dev->pdev);
 
-	/* 5. Free device context */
+	/* 6. Free device context */
 	kfree(dma_dev);
 
 	pr_info("module unloaded\n");

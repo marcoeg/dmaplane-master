@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 3 — dma-buf Export & Zero-Copy Sharing
+## Current State: Phase 4 — RDMA Integration
 
 ## Licensing
 
@@ -45,6 +45,14 @@ The userspace-visible API header. This is the primary definition point for all t
 - dma-buf stats (`dmaplane_dmabuf_stats`): 6 `__u64` counters — `dmabufs_exported`, `dmabufs_released`, `attachments_total`, `detachments_total`, `maps_total`, `unmaps_total`
 - Ioctl commands: `DMAPLANE_IOCTL_EXPORT_DMABUF` (`_IOWR`, 0x0A), `DMAPLANE_IOCTL_GET_DMABUF_STATS` (`_IOR`, 0x0B)
 
+**Phase 4 additions:**
+- RDMA setup (`dmaplane_rdma_setup`): `char ib_dev_name[32]` (in), `__u32 port` (in), `__u32 cq_depth` (in, 0=128), `__u32 max_send_wr` (in, 0=64), `__u32 max_recv_wr` (in, 0=64), `__u32 status` (out)
+- MR parameters (`dmaplane_mr_params`): `__u32 mr_id` (out), `__u32 buf_id` (in), `__u32 access_flags` (in), `__u32 lkey` (out), `__u32 rkey` (out), `__u64 addr` (out)
+- Loopback parameters (`dmaplane_loopback_params`): `__u32 mr_id` (in), `__u32 size` (in), `__u32 status` (out), `__u64 latency_ns` (out)
+- Benchmark parameters (`dmaplane_bench_params`): `__u32 mr_id` (in), `__u32 msg_size` (in), `__u32 iterations` (in), `__u32 queue_depth` (in), `__u64 total_ns` (out), `__u64 avg_latency_ns` (out), `__u64 p99_latency_ns` (out), `__u64 throughput_mbps` (out), `__u64 mr_reg_ns` (out)
+- RDMA stats (`dmaplane_rdma_stats`): 8 `__u64` counters — `mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`
+- Ioctl commands: `DMAPLANE_IOCTL_SETUP_RDMA` (`_IOWR`, 0x10), `DMAPLANE_IOCTL_TEARDOWN_RDMA` (`_IO`, 0x11), `DMAPLANE_IOCTL_REGISTER_MR` (`_IOWR`, 0x20), `DMAPLANE_IOCTL_DEREGISTER_MR` (`_IOW`, 0x21, bare `__u32`), `DMAPLANE_IOCTL_LOOPBACK_TEST` (`_IOWR`, 0x30), `DMAPLANE_IOCTL_PINGPONG_BENCH` (`_IOWR`, 0x31), `DMAPLANE_IOCTL_STREAMING_BENCH` (`_IOWR`, 0x32), `DMAPLANE_IOCTL_GET_RDMA_STATS` (`_IOR`, 0x33)
+
 All userspace consumers (`tests/`, `examples/misc/`) include this header via `-I../include` or `-I../../include`.
 
 ### `driver/dmaplane.h`
@@ -53,10 +61,13 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 **Kernel-internal types:**
 - `struct dmaplane_ring`: array of `dmaplane_ring_entry[RING_SIZE]`, `spinlock_t lock`, `unsigned int head` (producer writes, `____cacheline_aligned_in_smp`), `unsigned int tail` (consumer reads, `____cacheline_aligned_in_smp`). Head and tail are monotonically increasing — modulo is applied only when indexing into the array. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`.
-- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`. All dma-buf counters are device-level (survive individual export/release cycles). Safe for concurrent updates and reads.
+- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`, plus Phase 4 RDMA counters: `atomic64_t mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`. All counters are device-level (survive individual resource cycles). Safe for concurrent updates and reads.
 - `struct dmaplane_channel`: `struct kref refcount` (channel lifetime), `struct mutex lock` (per-channel state lock), `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use, set to false by kref release callback), `struct dmaplane_stats_kern stats` (atomic counters).
 - `struct dmaplane_buffer` (Phase 2+3): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped). Phase 3 additions: `bool dmabuf_exported` (prevents double export and blocks DESTROY_BUFFER while a dma-buf wraps this buffer, set/cleared under `buf_lock`), `struct dma_buf *dmabuf` (back-pointer, NULL when not exported).
-- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
+- `struct poll_cq_wait` (Phase 4): managed CQ completion wait — `struct ib_cqe cqe` (callback entry, `.done = poll_cq_done`), `struct ib_wc wc` (stashed work completion), `struct completion done` (signaled by callback). Used with `IB_POLL_DIRECT` CQs.
+- `struct dmaplane_mr_entry` (Phase 4): per-MR tracking — `__u32 id`, `__u32 buf_id`, `struct ib_mr *mr` (NULL for local-only, non-NULL for fast-reg), `__u32 lkey`, `__u32 rkey`, `__u64 sge_addr` (kernel VA for rxe, IOMMU addr for real HW), `struct sg_table *sgt`, `int sgt_nents`, `bool in_use`, `ktime_t reg_time`. Two paths: local-only uses `pd->local_dma_lkey` (rkey=0), fast-reg uses `ib_alloc_mr` + `IB_WR_REG_MR` for remote access.
+- `struct dmaplane_rdma_ctx` (Phase 4): RDMA connection context — `struct ib_device *ib_dev`, `struct ib_pd *pd`, `struct ib_cq *cq_a`/`*cq_b` (loopback CQs), `struct ib_qp *qp_a`/`*qp_b` (loopback QPs), `__u8 port`, `__u16 lid`, `int gid_index`, `union ib_gid gid`, `bool initialized`. The loopback pair (QP-A sends, QP-B receives) benchmarks the full DMA data path without a remote peer.
+- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Phase 4 additions: `struct dmaplane_rdma_ctx rdma`, `struct rw_semaphore rdma_sem` (read for MR/benchmark ops, write for setup/teardown), `struct dmaplane_mr_entry mrs[DMAPLANE_MAX_MRS]` (64 slots), `struct mutex mr_lock` (protects MR array), `__u32 next_mr_id`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
 - `struct dmaplane_file_ctx`: `struct dmaplane_dev *dev`, `struct dmaplane_channel *chan` (NULL until CREATE_CHANNEL).
 - `dmaplane_channel_release()`: kref release callback — marks slot inactive (`active = false`), decrements `active_channels`, increments `total_channels_destroyed`. Called when the last kref drops to zero.
 - Inline helpers: `dmaplane_ring_full()`, `dmaplane_ring_empty()`, `dmaplane_ring_count()`.
@@ -76,7 +87,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **Module init** (`dmaplane_init`):
 - `kzalloc` the device context
 - `platform_device_alloc("dmaplane_dma")` + `platform_device_add` + `dma_set_mask_and_coherent` (64-bit, fallback 32-bit) — creates a DMA-capable device. `device_create` alone is NOT DMA-capable; the DMA API requires a bus-registered device with a DMA mask.
-- `mutex_init` for `buf_lock`, `next_buf_id = 1`
+- `mutex_init` for `buf_lock`, `next_buf_id = 1`. Phase 4: `init_rwsem(&rdma_sem)`, `mutex_init(&mr_lock)`, `next_mr_id = 1`, 8 RDMA `atomic64_set` calls
 - `alloc_chrdev_region` for dynamic major number
 - `cdev_init` + `cdev_add`
 - `class_create` + `device_create` for `/dev/dmaplane` udev node
@@ -86,14 +97,15 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 1. Acquires `dev_mutex`, stops any remaining active worker kthreads via `dmaplane_channel_destroy`
 2. Prints lifetime summary via `pr_info`: total opens, closes, channels created, channels destroyed, buffers created, buffers destroyed
 3. Tears down char device (`device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region`) — prevents new ioctls/opens from racing with cleanup
-4. Destroys remaining buffers — warns on leaked mmap references (`mmap_count > 0`) and leaked dma-buf exports (`dmabuf_exported`). Must happen AFTER char device teardown (prevents racing creates) but BEFORE platform device unregister (`dma_free_coherent` needs the platform device alive)
-5. `platform_device_unregister`
-6. `kfree`
+4. RDMA teardown (Phase 4): `down_write(&rdma_sem)`. If `rdma.initialized`: deregister all in-use MRs, then `rdma_engine_teardown`. Mark all MR slots `in_use = false`. `up_write`. The write lock synchronizes with any in-flight operations that started before `cdev_del` returned. MRs must be deregistered before teardown because their DMA mappings reference `ib_dev`.
+5. Destroys remaining buffers — warns on leaked mmap references (`mmap_count > 0`) and leaked dma-buf exports (`dmabuf_exported`). Must happen AFTER RDMA teardown (MR DMA mappings freed) and AFTER char device teardown, but BEFORE platform device unregister (`dma_free_coherent` needs the platform device alive)
+6. `platform_device_unregister`
+7. `kfree`
 
 **File operations:**
 - `dmaplane_open`: Checks `capable(CAP_SYS_ADMIN)` — DMA buffer allocation and mmap of kernel pages are privileged operations. Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`.
 - `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
-- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B).
+- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33).
 - `dmaplane_mmap`: Maps DMA buffer pages into userspace. Extracts `buf_id = vma->vm_pgoff`, finds buffer under `buf_lock`. Sets `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Coherent: `dma_mmap_coherent` (resets `vm_pgoff = 0` first — `dma_mmap_coherent` interprets pgoff as offset into the allocation). Pages: `vm_insert_page` loop. Increments `mmap_count` on success (NOT via `vma_open` — Linux does not call `vma_open` for the initial mmap). VMA ops: `dmaplane_vma_open` (increment on fork/mremap), `dmaplane_vma_close` (decrement on munmap/exit).
 
 **Ioctl handlers:**
@@ -110,6 +122,14 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | `DMAPLANE_IOCTL_GET_BUF_STATS` | `dmaplane_ioctl_get_buf_stats` | Reads `buffers_created` and `buffers_destroyed` atomics into `dmaplane_buf_stats` UAPI struct |
 | `DMAPLANE_IOCTL_EXPORT_DMABUF` | `dmaplane_ioctl_export_dmabuf` | `copy_from_user`, delegates to `dmaplane_dmabuf_export` (holds `buf_lock` for entire operation), `copy_to_user`. **No copy_to_user undo** — fd already installed in process fd table by `dma_buf_fd` |
 | `DMAPLANE_IOCTL_GET_DMABUF_STATS` | `dmaplane_ioctl_get_dmabuf_stats` | Reads 6 device-level dma-buf atomic counters into `dmaplane_dmabuf_stats` UAPI struct |
+| `DMAPLANE_IOCTL_SETUP_RDMA` | `dmaplane_ioctl_setup_rdma` | `copy_from_user`, null-terminate `ib_dev_name`, `down_write(&rdma_sem)`, call `rdma_engine_setup`, `up_write`, `copy_to_user`. **Undo on copy_to_user failure**: `down_write`, `rdma_engine_teardown`, `up_write` |
+| `DMAPLANE_IOCTL_TEARDOWN_RDMA` | `dmaplane_ioctl_teardown_rdma` | `down_write(&rdma_sem)`, deregister ALL in-use MRs first (loop `mrs[]`), then `rdma_engine_teardown`, `up_write` |
+| `DMAPLANE_IOCTL_REGISTER_MR` | `dmaplane_ioctl_register_mr` | `copy_from_user`, `down_read(&rdma_sem)`, call `rdma_engine_register_mr`, `up_read`, `copy_to_user`. **Undo on copy_to_user failure**: `down_read`, `rdma_engine_deregister_mr`, `up_read` |
+| `DMAPLANE_IOCTL_DEREGISTER_MR` | `dmaplane_ioctl_deregister_mr` | `copy_from_user` bare `__u32`, `down_read(&rdma_sem)`, call `rdma_engine_deregister_mr`, `up_read` |
+| `DMAPLANE_IOCTL_LOOPBACK_TEST` | `dmaplane_ioctl_loopback_test` | `copy_from_user`, `down_read(&rdma_sem)`, call `benchmark_loopback`, `up_read`, `copy_to_user` |
+| `DMAPLANE_IOCTL_PINGPONG_BENCH` | `dmaplane_ioctl_pingpong_bench` | Same pattern with `benchmark_pingpong` |
+| `DMAPLANE_IOCTL_STREAMING_BENCH` | `dmaplane_ioctl_streaming_bench` | Same pattern with `benchmark_streaming` |
+| `DMAPLANE_IOCTL_GET_RDMA_STATS` | `dmaplane_ioctl_get_rdma_stats` | Read 8 RDMA atomic counters, `copy_to_user`. No lock — all stats are `atomic64_t` |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -126,12 +146,14 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 - `dmaplane_channel_destroy`: acquires `channel->lock`, sets `shutdown = true`, releases lock, `wake_up_interruptible`, `kthread_stop` (blocking wait for thread exit), then two `kref_put` calls (worker ref + file_ctx ref). The second `kref_put` triggers `dmaplane_channel_release` which sets `active = false` and updates device-level counters.
 - `dmaplane_channel_release`: kref release callback — sets `active = false`, `atomic_dec(active_channels)`, `atomic64_inc(total_channels_destroyed)`.
 
-**Locking model (5 locks):**
+**Locking model (7 locks):**
 - Device mutex (`dev_mutex`): protects channel slot allocation/deallocation. Sleeping context OK — only acquired from ioctl and release (process context). Outermost lock in the ordering. Independent of `buf_lock` (never nested).
-- Buffer mutex (`buf_lock`): protects `buffers[]` array — slot allocation, lookup, deallocation, and mmap. Sleeping context OK. Independent of `dev_mutex` (never nested). In Phase 4+, ordering will be: `rdma_sem` (read) → `buf_lock`.
+- Buffer mutex (`buf_lock`): protects `buffers[]` array — slot allocation, lookup, deallocation, and mmap. Sleeping context OK. Independent of `dev_mutex` (never nested). Ordering: `rdma_sem` (read) → `buf_lock` → `mr_lock`.
 - Per-channel mutex (`channel->lock`): protects channel state transitions (shutdown flag, worker pointer). Separate from ring spinlocks (which protect ring data) and from dev_mutex (which protects slot allocation). Ordering: `dev_mutex` → `channel->lock` → ring spinlocks.
 - Submission ring spinlock (`sub_ring.lock`): protects ring entries between ioctl submit (producer, advances head) and worker thread (consumer, advances tail).
 - Completion ring spinlock (`comp_ring.lock`): protects ring entries between worker thread (producer, advances head) and ioctl complete (consumer, advances tail).
+- RDMA semaphore (`rdma_sem`, Phase 4): read-write semaphore protecting the RDMA context. Read lock: MR registration/deregistration, all benchmarks (concurrent). Write lock: RDMA setup and teardown (exclusive). Ordering: `rdma_sem` (read) → `buf_lock` → `mr_lock`.
+- MR mutex (`mr_lock`, Phase 4): protects `mrs[]` array — slot allocation, lookup, deallocation. Ordering: always acquired after `rdma_sem` (read) and after `buf_lock` if both needed.
 - Worker shutdown: acquire `channel->lock`, set `channel->shutdown = true`, release lock, `wake_up_interruptible` + `kthread_stop` (blocking wait for thread exit). The completion ring yield loop also checks `kthread_should_stop` to ensure the worker exits even if the ring stays full.
 
 ---
@@ -159,7 +181,9 @@ Buffer allocation and lookup. Two allocation paths:
 
 **`dmabuf_rdma_find_buffer`**: Linear scan. Caller must hold `buf_lock`.
 
-All three are `EXPORT_SYMBOL_GPL` for use by future modules (Phase 4 rdma_engine).
+**`dmabuf_rdma_find_mr`** (Phase 4): Linear scan of `mrs[]` array by MR ID. Caller must hold `mr_lock`. Returns pointer into `dev->mrs[]`, or NULL.
+
+All four are `EXPORT_SYMBOL_GPL` for use by rdma_engine.c and benchmark.c.
 
 ### `driver/dmabuf_export.h`
 
@@ -185,6 +209,45 @@ dma-buf exporter for page-backed buffers. Implements the `dma_buf_ops` vtable wi
 **`dmaplane_dmabuf_selftest`**: kernel-space test callable via `test_dmabuf=1` module parameter. Exercises attach/map/unmap/detach 100 times using the platform device as the importing device. Verifies SG table has entries after each map.
 
 `MODULE_IMPORT_NS(DMA_BUF)` is required in `main.c` — the dma-buf framework exports its symbols under this namespace since kernel 5.x.
+
+### `driver/rdma_engine.h`
+
+Header declaring the RDMA engine API: `poll_cq_done` (managed CQ callback), `rdma_engine_setup`/`teardown`, `rdma_engine_register_mr`/`deregister_mr`, `rdma_engine_post_send`/`post_recv`, `rdma_engine_poll_cq`. Locking contract: callers must hold `rdma_sem` (read for MR/benchmark ops, write for setup/teardown).
+
+### `driver/rdma_engine.c`
+
+Kernel-level InfiniBand Verbs client. Communicates with `ib_core` and `rdma_rxe` (Soft-RoCE).
+
+**Internal helpers:**
+- `find_ib_device`: `ib_device_get_by_name(name, RDMA_DRIVER_UNKNOWN)`
+- `scan_gid_table`: scans up to 16 GID entries, prefers last link-local `ROCE_UDP_ENCAP` GID. GID[0] on Ubuntu with stable-privacy addressing is an EUI-64 ghost that causes silent traffic failure. Falls back to index 0 with warning.
+- `qp_to_init`/`qp_to_rtr`/`qp_to_rts`: QP state machine transitions. Each requires exact attribute masks — wrong combinations silently fail.
+- `connect_loopback_qps`: extracts local DMAC via `rdma_read_gid_attr_ndev_rcu` under RCU read lock. Connects QP-A ↔ QP-B through full RESET → INIT → RTR → RTS sequence.
+- `register_mr_build_sgt`: `sg_alloc_table` + `sg_set_page` loop + `ib_dma_map_sg(DMA_BIDIRECTIONAL)`. One SG entry per page.
+- `register_mr_fastreg`: `ib_alloc_mr(IB_MR_TYPE_MEM_REG)` + `ib_map_mr_sg` + post `IB_WR_REG_MR` on QP-A. Only called when access_flags include remote permissions.
+
+**Public API (all `EXPORT_SYMBOL_GPL`):**
+- `poll_cq_done`: managed CQ callback — `container_of(wc->wr_cqe)`, stash WC, `complete()`. Exists to satisfy `ib_cqe` contract; rarely invoked with `IB_POLL_DIRECT`.
+- `rdma_engine_setup`: creates IB device → PD → 2× CQ (`IB_POLL_DIRECT`) → 2× RC QP (`IB_SIGNAL_ALL_WR`) → loopback connection. Goto-based reverse-order cleanup on failure.
+- `rdma_engine_teardown`: moves QPs to `IB_QPS_ERR` (flushes outstanding WRs), destroys in strict reverse order: QP-B → QP-A → CQ-B → CQ-A → PD → `ib_device_put`. Race-free because CQs use `IB_POLL_DIRECT` (no background callbacks).
+- `rdma_engine_register_mr`: snapshots buffer pages under `buf_lock` into `pages_copy` (kvmalloc + memcpy), releases lock. Builds SG table, optionally allocates fast-reg MR. Finds free slot under `mr_lock`. Two paths: local-only (`pd->local_dma_lkey`, rkey=0, `sge_addr = kernel VA`) or fast-reg (`mr->lkey/rkey/iova`).
+- `rdma_engine_deregister_mr`: under `mr_lock`, `ib_dma_unmap_sg` (defensive NULL check on `ib_dev`), `sg_free_table`, `kfree(sgt)`, `ib_dereg_mr` if fast-reg, mark `in_use = false`.
+- `rdma_engine_post_send`/`post_recv`: build SGE from MR entry, init completion, post via `ib_post_send`/`ib_post_recv`.
+- `rdma_engine_poll_cq`: busy-poll with wall-clock deadline, `ib_poll_cq` + `usleep_range(50, 200)` + `cond_resched`. Returns 1 (success), 0 (timeout), negative (error).
+
+### `driver/benchmark.h`
+
+Header declaring three benchmark functions: `benchmark_loopback`, `benchmark_pingpong`, `benchmark_streaming`. All require `rdma_sem` read lock.
+
+### `driver/benchmark.c`
+
+Three RDMA benchmarks over the loopback QP pair. All snapshot MR and buffer fields by value under locks, then release locks before I/O.
+
+- `benchmark_loopback`: single send (QP-A) → recv (QP-B). Writes 0xDEADBEEF pattern, polls both CQs, reports `latency_ns`.
+- `benchmark_pingpong`: N iterations of send+recv. Collects per-iteration latency, sorts via `sort()`, computes avg, P99, throughput (MB/s = bytes * 1000 / ns).
+- `benchmark_streaming`: pipelines sends up to `queue_depth` outstanding. Pre-posts `min(2*qdepth, iterations)` receives, replenishes during the send/poll loop. Eagerly drains recv CQ-B to prevent overflow. Flushes both CQs before and after for clean state.
+
+All three are `EXPORT_SYMBOL_GPL`.
 
 ---
 
@@ -233,6 +296,22 @@ Userspace test suite for Phase 3 dma-buf export. Opens `/dev/dmaplane`, exercise
 7. **Stats verification** — export/close cycle, verify `dmabufs_exported` and `dmabufs_released` counters
 8. **Multiple buffers exported** — 4 buffers simultaneously, close in reverse order
 9. **Large buffer export** — 16 MB buffer, mmap via dma-buf fd, full write/read cycle
+
+### `tests/test_phase4_rdma.c`
+
+Userspace test suite for Phase 4 RDMA integration. Auto-detects the rxe device by scanning `/sys/class/infiniband/`. Prints setup instructions if no rxe device found. Saves benchmark results for a summary table.
+
+**Test cases:**
+1. **RDMA setup** — setup with auto-detected rxe device, verify `status == 0`
+2. **Double setup (must fail)** — second `SETUP_RDMA` returns `-EBUSY`
+3. **MR registration** — create page-backed buffer, register with `IB_ACCESS_LOCAL_WRITE`, verify `mr_id`/`lkey` non-zero
+4. **MR registration of coherent (must fail)** — coherent has no page array, returns `-EINVAL`
+5. **Loopback test** — single send/recv, verify `status == 0`, print latency
+6. **Ping-pong benchmark** — 1000 iterations, 4KB messages, print avg/P99/throughput
+7. **Streaming benchmark** — 1000 iterations, 4KB messages, queue depth 8, print throughput
+8. **MR deregistration** — deregister MR, verify. Non-existent returns `-ENOENT`
+9. **RDMA stats** — verify `sends_posted`, `completions_polled` > 0, `completion_errors == 0`
+10. **Teardown + re-initialization** — teardown, loopback-after-teardown fails, re-setup succeeds
 
 ---
 
@@ -295,3 +374,23 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 **No copy_to_user undo for EXPORT_DMABUF**: Unlike `CREATE_BUFFER`, the export ioctl does not undo on `copy_to_user` failure. The fd is already installed in the process's fd table by `dma_buf_fd` before `copy_to_user`. The fd will be cleaned up on process exit.
 
 **dma-buf stats are device-level**: All 6 dma-buf counters (exported, released, attachments, detachments, maps, unmaps) live on `dmaplane_stats_kern`, not on the per-export context. This ensures counters survive individual export/release cycles — matching the pattern used for `buffers_created`/`buffers_destroyed`.
+
+**IB_POLL_DIRECT for CQs**: CQs are created with `IB_POLL_DIRECT` — explicit polling via `ib_poll_cq`, no softirq or workqueue callbacks. This gives deterministic, race-free teardown without explicit CQ draining. Trade-off: callers must busy-poll, acceptable for a benchmark module.
+
+**rdma_sem protects the RDMA context**: Read lock (concurrent): MR registration/deregistration, all benchmarks. Write lock (exclusive): RDMA setup and teardown. This allows parallel benchmarks while preventing teardown from racing with in-flight operations. Ordering: `rdma_sem` (read) → `buf_lock` → `mr_lock`.
+
+**pages_copy snapshot in MR registration**: After releasing `buf_lock`, the buffer could be destroyed, which frees the page array. `kvmalloc_array` + `memcpy` creates a local copy of page pointers. The struct page frames are stable kernel objects — `__free_page` marks them for reuse but the frame remains valid as a kernel data structure. This decouples MR registration from buffer lifetime.
+
+**GID selection is the #1 silent failure mode with Soft-RoCE**: GID[0] on Ubuntu with stable-privacy addressing is an EUI-64 ghost address. QPs transition cleanly but traffic goes nowhere. `scan_gid_table` prefers the last link-local `ROCE_UDP_ENCAP` GID (empirically the real interface address). Falls back to index 0 with a warning.
+
+**DMAC for loopback**: With raw verbs (no rdma_cm), the destination MAC must be populated manually in the address handle. For loopback, it's the local interface MAC extracted via `rdma_read_gid_attr_ndev_rcu` inside an RCU read section.
+
+**Two MR paths: local_dma_lkey vs fast-reg**: Local-only access (`IB_ACCESS_LOCAL_WRITE`) uses `pd->local_dma_lkey` — a per-PD shortcut with `rkey=0` (no remote access). For remote access (`REMOTE_WRITE`, `REMOTE_READ`), a real rkey is needed from `ib_alloc_mr` + `IB_WR_REG_MR`. The `sge_addr` is set to the kernel VA for rxe compatibility (rxe interprets `sge.addr` via `local_dma_lkey` as kernel VA; real hardware uses IOMMU mapping).
+
+**TEARDOWN_RDMA deregisters all MRs first**: MR SG table DMA mappings reference `ib_dev`. If teardown releases `ib_dev` while MRs are still mapped, `ib_dma_unmap_sg` would use-after-free. The teardown ioctl handler loops `mrs[]` under write lock and deregisters before calling `rdma_engine_teardown`.
+
+**copy_to_user undo for SETUP_RDMA and REGISTER_MR**: If the kernel creates RDMA resources but can't tell userspace the handles (copy_to_user fails), tears them down immediately to prevent orphaned resources that userspace can never reference.
+
+**ERR transition before QP destroy**: Transitioning QPs to `IB_QPS_ERR` before destruction causes the RDMA subsystem to flush all outstanding WRs, generating error completions. Without this, destroying a QP with outstanding WRs leaves the provider holding references to our CQE/SGE memory.
+
+**Buffer lookup in rdma_engine.c**: `rdma_engine_register_mr` does its own inline linear scan of `edev->buffers[]` under `buf_lock` rather than calling `dmabuf_rdma_find_buffer`. This is intentional: it needs to snapshot additional fields (`pages`, `nr_pages`, `vaddr`, `size`) atomically under the same lock hold, and the find function is static in main.c.

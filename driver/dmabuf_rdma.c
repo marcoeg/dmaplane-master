@@ -269,3 +269,23 @@ struct dmaplane_buffer *dmabuf_rdma_find_buffer(struct dmaplane_dev *dev,
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(dmabuf_rdma_find_buffer);
+
+/*
+ * dmabuf_rdma_find_mr - Linear scan for an MR by ID.
+ *
+ * Caller MUST hold mr_lock for the lifetime of the returned pointer.
+ * The MR could be deregistered by another thread between find and use
+ * if the lock is not held.
+ */
+struct dmaplane_mr_entry *dmabuf_rdma_find_mr(struct dmaplane_dev *dev,
+					      __u32 mr_id)
+{
+	unsigned int i;
+
+	for (i = 0; i < DMAPLANE_MAX_MRS; i++) {
+		if (dev->mrs[i].in_use && dev->mrs[i].id == mr_id)
+			return &dev->mrs[i];
+	}
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(dmabuf_rdma_find_mr);

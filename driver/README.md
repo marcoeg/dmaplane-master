@@ -72,6 +72,14 @@ Character device kernel module at `/dev/dmaplane`. Ioctl-driven, with per-channe
 | `DMAPLANE_IOCTL_GET_BUF_STATS` | `_IOR` | `dmaplane_buf_stats` | Return buffer allocation statistics |
 | `DMAPLANE_IOCTL_EXPORT_DMABUF` | `_IOWR` | `dmaplane_export_dmabuf_arg` | Export a page-backed buffer as a dma-buf fd |
 | `DMAPLANE_IOCTL_GET_DMABUF_STATS` | `_IOR` | `dmaplane_dmabuf_stats` | Return dma-buf export statistics |
+| `DMAPLANE_IOCTL_SETUP_RDMA` | `_IOWR` | `dmaplane_rdma_setup` | Initialize RDMA: IB device → PD → CQs → QPs |
+| `DMAPLANE_IOCTL_TEARDOWN_RDMA` | `_IO` | — | Tear down RDMA subsystem |
+| `DMAPLANE_IOCTL_REGISTER_MR` | `_IOWR` | `dmaplane_mr_params` | Register buffer pages as RDMA MR |
+| `DMAPLANE_IOCTL_DEREGISTER_MR` | `_IOW` | `__u32` | Deregister an MR by ID |
+| `DMAPLANE_IOCTL_LOOPBACK_TEST` | `_IOWR` | `dmaplane_loopback_params` | Single send/recv loopback test |
+| `DMAPLANE_IOCTL_PINGPONG_BENCH` | `_IOWR` | `dmaplane_bench_params` | Ping-pong latency benchmark |
+| `DMAPLANE_IOCTL_STREAMING_BENCH` | `_IOWR` | `dmaplane_bench_params` | Streaming throughput benchmark |
+| `DMAPLANE_IOCTL_GET_RDMA_STATS` | `_IOR` | `dmaplane_rdma_stats` | Return RDMA statistics |
 
 ## Concurrency Model
 
@@ -82,8 +90,10 @@ Character device kernel module at `/dev/dmaplane`. Ioctl-driven, with per-channe
 | `channel->lock` | mutex | Channel state (shutdown flag, worker pointer) | dmaplane_release |
 | `dev_mutex` | mutex | Channel slot allocation array | ioctl create_channel, release |
 | `buf_lock` | mutex | Buffer array (slots, lookup, mmap) | buffer ioctls, dmaplane_mmap |
+| `rdma_sem` | rw_semaphore | RDMA context (PD, CQs, QPs) | read: MR/benchmark ops; write: setup/teardown |
+| `mr_lock` | mutex | MR array (slots, lookup) | register/deregister MR, benchmarks |
 
-**Lock ordering:** `dev_mutex` and `buf_lock` are independent (never nested). `dev_mutex` → `channel->lock` → ring spinlocks.
+**Lock ordering:** `dev_mutex` and `buf_lock` are independent (never nested). `rdma_sem` (read) → `buf_lock` → `mr_lock`. `dev_mutex` → `channel->lock` → ring spinlocks.
 
 **Ring buffer design:** Monotonically increasing head/tail with modulo indexing. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`. Head and tail on separate cache lines (`____cacheline_aligned_in_smp`) to avoid false sharing.
 

@@ -32,10 +32,14 @@
 #include <linux/wait.h>
 #include <linux/atomic.h>
 #include <linux/cache.h>
+#include <linux/rwsem.h>
+#include <linux/scatterlist.h>
+#include <rdma/ib_verbs.h>
 
 /* ── Phase 2: Buffer constants ──────────────────────────── */
 
 #define DMAPLANE_MAX_BUFFERS	64
+#define DMAPLANE_MAX_MRS	64
 #define DMAPLANE_MAX_BUF_SIZE	(1ULL << 30)	/* 1 GB hard limit */
 
 /*
@@ -113,6 +117,16 @@ struct dmaplane_stats_kern {
 	atomic64_t dmabuf_detachments;	/* Lifetime detach calls */
 	atomic64_t dmabuf_maps;		/* Lifetime map_dma_buf calls */
 	atomic64_t dmabuf_unmaps;	/* Lifetime unmap_dma_buf calls */
+
+	/* Phase 4: RDMA counters */
+	atomic64_t mrs_registered;	/* Lifetime MRs registered */
+	atomic64_t mrs_deregistered;	/* Lifetime MRs deregistered */
+	atomic64_t sends_posted;	/* Lifetime send WRs posted */
+	atomic64_t recvs_posted;	/* Lifetime recv WRs posted */
+	atomic64_t completions_polled;	/* Lifetime CQ completions polled */
+	atomic64_t completion_errors;	/* Lifetime CQ completion errors */
+	atomic64_t bytes_sent;		/* Lifetime bytes sent */
+	atomic64_t bytes_received;	/* Lifetime bytes received */
 };
 
 /*
@@ -277,6 +291,78 @@ struct dmaplane_buffer {
 	struct dma_buf *dmabuf;
 };
 
+/* ── Phase 4: RDMA types ───────────────────────────────── */
+
+/*
+ * Managed CQ completion wait structure.
+ * Used with ib_alloc_cq(IB_POLL_DIRECT).  The managed CQ layer
+ * requires every wr_cqe->done to point to a valid function.  With
+ * IB_POLL_DIRECT we poll explicitly via ib_poll_cq(), so this
+ * callback is rarely invoked — but it must exist to satisfy the
+ * ib_cqe contract and as a safety net.
+ */
+struct poll_cq_wait {
+	struct ib_cqe cqe;		/* Callback entry: .done = poll_cq_done */
+	struct ib_wc wc;		/* Stashed work completion */
+	struct completion done;		/* Signaled by poll_cq_done callback */
+};
+
+/*
+ * Per-MR tracking.
+ *
+ * Two registration paths, selected by access_flags:
+ *
+ *   Local-only (IB_ACCESS_LOCAL_WRITE): mr is NULL, uses pd->local_dma_lkey
+ *   (rkey=0, no remote access).  sge_addr is the kernel VA for rxe.
+ *
+ *   Fast-reg (remote access flags): mr is a real ib_mr allocated via
+ *   ib_alloc_mr + IB_WR_REG_MR.  lkey/rkey/sge_addr come from the MR.
+ *   Required for RDMA WRITE/READ operations.
+ */
+struct dmaplane_mr_entry {
+	__u32 id;		/* MR unique ID (monotonically increasing, never 0) */
+	__u32 buf_id;		/* Associated buffer ID */
+	struct ib_mr *mr;	/* Fast-reg MR — NULL for local-only access
+				 * (pd->local_dma_lkey suffices).  Non-NULL when
+				 * access_flags include REMOTE_WRITE or REMOTE_READ. */
+	__u32 lkey;		/* Local key (from mr->lkey or pd->local_dma_lkey) */
+	__u32 rkey;		/* Remote key (from mr->rkey or 0 for local-only) */
+	__u64 sge_addr;		/* Address for SGE — kernel VA for rxe (interprets
+				 * via local_dma_lkey), IOMMU addr for real HW */
+	struct sg_table *sgt;	/* DMA-mapped scatterlist for all pages */
+	int sgt_nents;		/* Mapped nents from ib_dma_map_sg */
+	bool in_use;		/* Slot is occupied.  Protected by mr_lock. */
+	ktime_t reg_time;	/* Time to register (nanoseconds) */
+};
+
+/*
+ * RDMA connection context.
+ *
+ * State machine:
+ *   initialized = loopback pair is live (PD, CQ-A/B, QP-A/B created
+ *                 and connected).  Set by rdma_engine_setup().
+ *
+ * The loopback pair (QP-A sends, QP-B receives) lets the module
+ * benchmark the full DMA data path without a remote peer.
+ */
+struct dmaplane_rdma_ctx {
+	struct ib_device *ib_dev;	/* IB device reference (from ib_device_get_by_name) */
+	struct ib_pd *pd;		/* Protection Domain — root of resource hierarchy */
+
+	/* Loopback pair: QP-A sends, QP-B receives */
+	struct ib_cq *cq_a;		/* Completion queue for QP-A */
+	struct ib_cq *cq_b;		/* Completion queue for QP-B */
+	struct ib_qp *qp_a;		/* QP-A (sender in loopback) */
+	struct ib_qp *qp_b;		/* QP-B (receiver in loopback) */
+
+	__u8 port;			/* IB port number */
+	__u16 lid;			/* Local Identifier from ib_query_port */
+	int gid_index;			/* GID table index (for RoCEv2 selection) */
+	union ib_gid gid;		/* Global Identifier (IPv6 format) */
+
+	bool initialized;		/* Loopback pair is live */
+};
+
 /*
  * Device context: one per module instance (singleton).
  * Owns all channels, buffers, and the character device registration.
@@ -345,6 +431,45 @@ struct dmaplane_dev {
 	atomic64_t total_closes;		/* Lifetime fd closes */
 	atomic64_t total_channels_created;	/* Lifetime channels created */
 	atomic64_t total_channels_destroyed;	/* Lifetime channels destroyed */
+
+	/* ── Phase 4: RDMA subsystem ── */
+
+	/*
+	 * RDMA context — loopback QP pair for self-contained benchmarking.
+	 * Protected by rdma_sem (see below).
+	 */
+	struct dmaplane_rdma_ctx rdma;
+
+	/*
+	 * rdma_sem: read-write semaphore protecting the RDMA context.
+	 *
+	 * Read lock (down_read): MR registration/deregistration, all benchmarks.
+	 *   Guarantees RDMA context stays alive.  Multiple readers run concurrently.
+	 * Write lock (down_write): RDMA setup and teardown.  Exclusive access.
+	 *
+	 * Ordering: rdma_sem (read) → buf_lock → mr_lock.  Never hold rdma_sem
+	 *   write while holding buf_lock or mr_lock.
+	 */
+	struct rw_semaphore rdma_sem;
+
+	/* Memory Regions — global, not per-channel.  Fixed-size array with
+	 * linear scan.  Same simplicity rationale as buffers[]. */
+	struct dmaplane_mr_entry mrs[DMAPLANE_MAX_MRS];
+
+	/*
+	 * mr_lock: Protects the mrs[] array — slot allocation, lookup,
+	 * and deallocation.
+	 *
+	 * Acquired by: IOCTL_REGISTER_MR, IOCTL_DEREGISTER_MR, benchmarks
+	 *   (for MR snapshot by value).
+	 * Why mutex: sleeping context OK — all acquirers are in process context.
+	 * Ordering: always acquired after rdma_sem (read) and after buf_lock
+	 *   if both needed.
+	 */
+	struct mutex mr_lock;
+
+	__u32 next_mr_id;	/* Monotonically increasing.  Wraps to 1
+				 * (skips 0) to avoid handle 0 ambiguity. */
 };
 
 /*

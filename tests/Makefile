@@ -1,7 +1,7 @@
 CC := gcc
 CFLAGS := -Wall -Wextra -O2 -I../include
 
-TESTS := test_phase1_driver test_phase2_dma test_phase3_dmabuf
+TESTS := test_phase1_driver test_phase2_dma test_phase3_dmabuf test_phase4_rdma
 
 all: $(TESTS)
 
@@ -12,6 +12,9 @@ test_phase2_dma: test_phase2_dma.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 test_phase3_dmabuf: test_phase3_dmabuf.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+test_phase4_rdma: test_phase4_rdma.c
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:

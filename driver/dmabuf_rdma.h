@@ -50,4 +50,16 @@ int dmabuf_rdma_destroy_buffer(struct dmaplane_dev *dev, unsigned int buf_id);
 struct dmaplane_buffer *dmabuf_rdma_find_buffer(struct dmaplane_dev *dev,
 						unsigned int buf_id);
 
+/*
+ * dmabuf_rdma_find_mr() — Look up an MR by ID.
+ *
+ * Returns pointer into dev->mrs[].  Caller MUST hold mr_lock for
+ * the lifetime of the returned pointer — the MR could be deregistered
+ * by another thread between find and use.
+ *
+ * Return: pointer to MR entry, or NULL if not found.
+ */
+struct dmaplane_mr_entry *dmabuf_rdma_find_mr(struct dmaplane_dev *dev,
+					      __u32 mr_id);
+
 #endif /* _DMABUF_RDMA_H */

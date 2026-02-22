@@ -215,4 +215,116 @@ struct dmaplane_dmabuf_stats {
 #define DMAPLANE_IOCTL_GET_DMABUF_STATS \
 	_IOR(DMAPLANE_IOC_MAGIC, 0x0B, struct dmaplane_dmabuf_stats)
 
+/* ── Phase 4: RDMA integration ───────────────────────────── */
+
+/*
+ * RDMA setup parameters: passed to IOCTL_SETUP_RDMA.
+ * Creates the full RDMA resource hierarchy: IB device → PD → CQs → QPs.
+ * Zero values for cq_depth, max_send_wr, max_recv_wr use defaults.
+ */
+struct dmaplane_rdma_setup {
+	char ib_dev_name[32];	/* in  — IB device name (e.g., "rxe_eth0") */
+	__u32 port;		/* in  — IB port number (usually 1; 0 = default) */
+	__u32 cq_depth;		/* in  — CQ depth (0 = default 128) */
+	__u32 max_send_wr;	/* in  — max send WRs (0 = default 64) */
+	__u32 max_recv_wr;	/* in  — max recv WRs (0 = default 64) */
+	__u32 status;		/* out — 0 on success */
+};
+
+/*
+ * MR registration parameters: passed to IOCTL_REGISTER_MR.
+ * Registers buffer pages as an RDMA memory region.  For local-only
+ * access (IB_ACCESS_LOCAL_WRITE), uses pd->local_dma_lkey (rkey=0).
+ * For remote access (REMOTE_WRITE, REMOTE_READ), allocates a fast-reg
+ * MR with a real rkey.
+ */
+struct dmaplane_mr_params {
+	__u32 mr_id;		/* out — assigned MR ID */
+	__u32 buf_id;		/* in  — buffer to register */
+	__u32 access_flags;	/* in  — IB_ACCESS_* flags */
+	__u32 lkey;		/* out — local key */
+	__u32 rkey;		/* out — remote key (0 for local-only) */
+	__u32 _pad;		/* padding — explicit pad for alignment */
+	__u64 addr;		/* out — MR base address */
+};
+
+/*
+ * Loopback test parameters: passed to IOCTL_LOOPBACK_TEST.
+ * Single send from QP-A, recv on QP-B.  Validates the RDMA data path
+ * works end-to-end; not a throughput measurement.
+ */
+struct dmaplane_loopback_params {
+	__u32 mr_id;		/* in  — MR to use */
+	__u32 size;		/* in  — message size in bytes */
+	__u32 status;		/* out — 0 on success */
+	__u32 pad;		/* padding — explicit pad for alignment */
+	__u64 latency_ns;	/* out — round-trip latency in nanoseconds */
+};
+
+/*
+ * Benchmark parameters: passed to IOCTL_PINGPONG_BENCH and
+ * IOCTL_STREAMING_BENCH.  queue_depth is only used by streaming
+ * (ignored by ping-pong).
+ */
+struct dmaplane_bench_params {
+	__u32 mr_id;		/* in  — MR to use */
+	__u32 msg_size;		/* in  — message size per operation */
+	__u32 iterations;	/* in  — number of iterations */
+	__u32 queue_depth;	/* in  — outstanding WRs (streaming only; 0 = 16) */
+	__u64 total_ns;		/* out — total elapsed time */
+	__u64 avg_latency_ns;	/* out — average latency per operation */
+	__u64 p99_latency_ns;	/* out — 99th percentile latency */
+	__u64 throughput_mbps;	/* out — throughput in MB/s */
+	__u64 mr_reg_ns;	/* out — MR registration time */
+};
+
+/*
+ * RDMA statistics: returned by IOCTL_GET_RDMA_STATS.
+ * Lifetime counters — individually consistent, collectively approximate.
+ */
+struct dmaplane_rdma_stats {
+	__u64 mrs_registered;		/* out — lifetime MRs registered */
+	__u64 mrs_deregistered;		/* out — lifetime MRs deregistered */
+	__u64 sends_posted;		/* out — lifetime send WRs posted */
+	__u64 recvs_posted;		/* out — lifetime recv WRs posted */
+	__u64 completions_polled;	/* out — lifetime CQ completions polled */
+	__u64 completion_errors;	/* out — lifetime CQ completion errors */
+	__u64 bytes_sent;		/* out — lifetime bytes sent */
+	__u64 bytes_received;		/* out — lifetime bytes received */
+};
+
+/* Phase 4 ioctl commands: RDMA 0x10–0x11, MR 0x20–0x21, benchmarks 0x30–0x33 */
+
+/* Initialize RDMA subsystem: IB device → PD → CQs → QPs → loopback. */
+#define DMAPLANE_IOCTL_SETUP_RDMA \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x10, struct dmaplane_rdma_setup)
+
+/* Tear down RDMA subsystem; deregisters all MRs first. */
+#define DMAPLANE_IOCTL_TEARDOWN_RDMA \
+	_IO(DMAPLANE_IOC_MAGIC, 0x11)
+
+/* Register a page-backed buffer as an RDMA MR; returns lkey/rkey. */
+#define DMAPLANE_IOCTL_REGISTER_MR \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x20, struct dmaplane_mr_params)
+
+/* Deregister an MR by ID (bare __u32, not a struct). */
+#define DMAPLANE_IOCTL_DEREGISTER_MR \
+	_IOW(DMAPLANE_IOC_MAGIC, 0x21, __u32)
+
+/* Run single-message loopback test (QP-A → QP-B). */
+#define DMAPLANE_IOCTL_LOOPBACK_TEST \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x30, struct dmaplane_loopback_params)
+
+/* Run ping-pong latency benchmark (N iterations). */
+#define DMAPLANE_IOCTL_PINGPONG_BENCH \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x31, struct dmaplane_bench_params)
+
+/* Run streaming throughput benchmark (pipelined sends). */
+#define DMAPLANE_IOCTL_STREAMING_BENCH \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x32, struct dmaplane_bench_params)
+
+/* Get RDMA statistics (racy snapshot). */
+#define DMAPLANE_IOCTL_GET_RDMA_STATS \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x33, struct dmaplane_rdma_stats)
+
 #endif /* _DMAPLANE_UAPI_H */
