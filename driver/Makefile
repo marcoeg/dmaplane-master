@@ -1,5 +1,5 @@
 obj-m := dmaplane.o
-dmaplane-objs := main.o dmabuf_rdma.o
+dmaplane-objs := main.o dmabuf_rdma.o dmabuf_export.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 

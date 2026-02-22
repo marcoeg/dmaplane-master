@@ -6,7 +6,7 @@ Blog posts and technical notes documenting each phase of the dmaplane project.
 |---|-------|--------|
 | 1 | Driver Foundations & Concurrency | Complete |
 | 2 | DMA Memory: Two Allocation Paths and the Zero-Copy Chain | Complete |
-| 3 | The NUMA Tax Nobody Sees | Planned |
+| 3 | dma-buf Export and Zero-Copy Sharing | Complete |
 | 4 | Kernel-Space RDMA from First Principles | Planned |
 | 5 | Zero-Copy Sharing with dma-buf | Planned |
 | 6 | Backpressure: Why CQ Overflow Corrupts Data | Planned |
@@ -18,6 +18,8 @@ Blog posts and technical notes documenting each phase of the dmaplane project.
 
 - `phase01_technical_notes.md` — Phase 1 technical walkthrough
 - `phase02_technical_notes.md` — Phase 2 technical walkthrough
+- `phase03_technical_notes.md` — Phase 3 technical walkthrough
 - `blog_01_driver_foundations.md` — Phase 1 blog post
 - `blog_02_dma_memory.md` — Phase 2 blog post
+- `blog_03_dmabuf_zero_copy.md` — Phase 3 blog post
 - `reference/` — Engineering plan, code overview, narrative (input documents)

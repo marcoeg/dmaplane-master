@@ -211,6 +211,16 @@ int dmabuf_rdma_destroy_buffer(struct dmaplane_dev *dev, unsigned int buf_id)
 		return -EBUSY;
 	}
 
+	/* Refuse if buffer is exported as dma-buf — importers may still
+	 * hold references.  The release callback clears this flag when
+	 * the last dma-buf reference drops. */
+	if (buf->dmabuf_exported) {
+		pr_debug("buffer %u: cannot destroy — dma-buf exported\n",
+			 buf->id);
+		mutex_unlock(&dev->buf_lock);
+		return -EBUSY;
+	}
+
 	/* Reverse-order cleanup based on allocation type */
 	switch (buf->alloc_type) {
 	case DMAPLANE_BUF_TYPE_PAGES:

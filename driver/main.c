@@ -83,14 +83,27 @@
 
 #include "dmaplane.h"
 #include "dmabuf_rdma.h"
+#include "dmabuf_export.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
 MODULE_DESCRIPTION("dmaplane — host-side data path for AI-scale systems");
 MODULE_VERSION("0.1.0");
+/*
+ * Import the DMA_BUF symbol namespace.  Since kernel 5.x, the dma-buf
+ * framework exports its symbols (dma_buf_export, dma_buf_fd, dma_buf_put,
+ * etc.) under this namespace.  Without this declaration, the module fails
+ * to load with "Unknown symbol" errors for all dma-buf API calls.
+ */
+MODULE_IMPORT_NS(DMA_BUF);
 
 /* Singleton device context — allocated in dmaplane_init, freed in dmaplane_exit */
 static struct dmaplane_dev *dma_dev;
+
+/* Module parameter: run dma-buf kernel self-test at load time */
+static int test_dmabuf;
+module_param(test_dmabuf, int, 0444);
+MODULE_PARM_DESC(test_dmabuf, "Run dma-buf export self-test at module load (0=off, 1=on)");
 
 /* ------------------------------------------------------------------ */
 /* Ring buffer operations                                              */
@@ -888,6 +901,84 @@ static long dmaplane_ioctl_get_buf_stats(struct dmaplane_file_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 3 ioctl handlers                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dmaplane_ioctl_export_dmabuf - Export a buffer as a dma-buf.
+ * @ctx: file context.
+ * @arg: userspace pointer to struct dmaplane_export_dmabuf_arg (in/out).
+ *
+ * Delegates to dmaplane_dmabuf_export which holds buf_lock for the
+ * entire operation.  The fd is installed in the process's fd table by
+ * dma_buf_fd before copy_to_user.  If copy_to_user fails, the fd
+ * exists but userspace doesn't know the number — it will be cleaned
+ * up on process exit.  Do NOT try to uninstall the fd.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ *  -EINVAL  if buffer not found or not page-backed.
+ *  -EBUSY   if buffer already exported.
+ *  -ENOMEM  if allocation fails.
+ */
+static long dmaplane_ioctl_export_dmabuf(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_export_dmabuf_arg ea;
+	int ret;
+
+	if (copy_from_user(&ea, (void __user *)arg, sizeof(ea)))
+		return -EFAULT;
+
+	ret = dmaplane_dmabuf_export(dev, &ea);
+	if (ret)
+		return ret;
+
+	/*
+	 * No undo on copy_to_user failure — the fd is already installed
+	 * in the process's fd table by dma_buf_fd.  The fd will be
+	 * cleaned up when the process closes it or exits.
+	 */
+	if (copy_to_user((void __user *)arg, &ea, sizeof(ea)))
+		return -EFAULT;
+
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_get_dmabuf_stats - Copy dma-buf statistics to userspace.
+ * @ctx: file context.
+ * @arg: userspace pointer to struct dmaplane_dmabuf_stats (output).
+ *
+ * Reads device-level atomic counters.  These survive individual
+ * export/release cycles — they are lifetime totals.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_to_user fails.
+ */
+static long dmaplane_ioctl_get_dmabuf_stats(struct dmaplane_file_ctx *ctx,
+					     unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_dmabuf_stats ds;
+
+	ds.dmabufs_exported  = atomic64_read(&dev->stats.dmabufs_exported);
+	ds.dmabufs_released  = atomic64_read(&dev->stats.dmabufs_released);
+	ds.attachments_total = atomic64_read(&dev->stats.dmabuf_attachments);
+	ds.detachments_total = atomic64_read(&dev->stats.dmabuf_detachments);
+	ds.maps_total        = atomic64_read(&dev->stats.dmabuf_maps);
+	ds.unmaps_total      = atomic64_read(&dev->stats.dmabuf_unmaps);
+
+	if (copy_to_user((void __user *)arg, &ds, sizeof(ds)))
+		return -EFAULT;
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -991,6 +1082,12 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	case DMAPLANE_IOCTL_GET_BUF_STATS:
 		return dmaplane_ioctl_get_buf_stats(ctx, arg);
 
+	/* Phase 3: dma-buf export */
+	case DMAPLANE_IOCTL_EXPORT_DMABUF:
+		return dmaplane_ioctl_export_dmabuf(ctx, arg);
+	case DMAPLANE_IOCTL_GET_DMABUF_STATS:
+		return dmaplane_ioctl_get_dmabuf_stats(ctx, arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -1047,6 +1144,12 @@ static int __init dmaplane_init(void)
 	atomic64_set(&dma_dev->total_channels_destroyed, 0);
 	atomic64_set(&dma_dev->stats.buffers_created, 0);
 	atomic64_set(&dma_dev->stats.buffers_destroyed, 0);
+	atomic64_set(&dma_dev->stats.dmabufs_exported, 0);
+	atomic64_set(&dma_dev->stats.dmabufs_released, 0);
+	atomic64_set(&dma_dev->stats.dmabuf_attachments, 0);
+	atomic64_set(&dma_dev->stats.dmabuf_detachments, 0);
+	atomic64_set(&dma_dev->stats.dmabuf_maps, 0);
+	atomic64_set(&dma_dev->stats.dmabuf_unmaps, 0);
 
 	/*
 	 * Create platform device for DMA operations.
@@ -1122,6 +1225,14 @@ static int __init dmaplane_init(void)
 	}
 
 	pr_info("module loaded (major %d)\n", MAJOR(dma_dev->devno));
+
+	/* Run dma-buf self-test if requested via module parameter */
+	if (test_dmabuf) {
+		ret = dmaplane_dmabuf_selftest(dma_dev);
+		if (ret)
+			pr_warn("dmabuf selftest failed: %d\n", ret);
+	}
+
 	return 0;
 
 err_class_destroy:
@@ -1178,9 +1289,12 @@ static void __exit dmaplane_exit(void)
 	cdev_del(&dma_dev->cdev);
 	unregister_chrdev_region(dma_dev->devno, 1);
 
-	/* 3. Free remaining buffers — warn on leaked mmap references */
+	/* 3. Free remaining buffers — warn on leaked exports/mmaps */
 	for (i = 0; i < DMAPLANE_MAX_BUFFERS; i++) {
 		if (dma_dev->buffers[i].in_use) {
+			if (dma_dev->buffers[i].dmabuf_exported)
+				pr_warn("buffer %u still has active dma-buf export at exit\n",
+					dma_dev->buffers[i].id);
 			if (atomic_read(&dma_dev->buffers[i].mmap_count) > 0)
 				pr_warn("buffer %u still has %d active mmaps at exit\n",
 					dma_dev->buffers[i].id,

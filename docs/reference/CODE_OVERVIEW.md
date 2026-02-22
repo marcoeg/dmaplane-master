@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 2 — DMA Memory Allocation
+## Current State: Phase 3 — dma-buf Export & Zero-Copy Sharing
 
 ## Licensing
 
@@ -40,6 +40,11 @@ The userspace-visible API header. This is the primary definition point for all t
 - Buffer stats (`dmaplane_buf_stats`): `__u64 buffers_created`, `__u64 buffers_destroyed`
 - Ioctl commands: `DMAPLANE_IOCTL_CREATE_BUFFER` (`_IOWR`, 0x05), `DMAPLANE_IOCTL_DESTROY_BUFFER` (`_IOW`, 0x06, bare `__u32`), `DMAPLANE_IOCTL_GET_MMAP_INFO` (`_IOWR`, 0x08), `DMAPLANE_IOCTL_GET_BUF_STATS` (`_IOR`, 0x09)
 
+**Phase 3 additions:**
+- Export parameters (`dmaplane_export_dmabuf_arg`): `__u32 buf_id` (in), `__s32 fd` (out)
+- dma-buf stats (`dmaplane_dmabuf_stats`): 6 `__u64` counters — `dmabufs_exported`, `dmabufs_released`, `attachments_total`, `detachments_total`, `maps_total`, `unmaps_total`
+- Ioctl commands: `DMAPLANE_IOCTL_EXPORT_DMABUF` (`_IOWR`, 0x0A), `DMAPLANE_IOCTL_GET_DMABUF_STATS` (`_IOR`, 0x0B)
+
 All userspace consumers (`tests/`, `examples/misc/`) include this header via `-I../include` or `-I../../include`.
 
 ### `driver/dmaplane.h`
@@ -48,9 +53,9 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 **Kernel-internal types:**
 - `struct dmaplane_ring`: array of `dmaplane_ring_entry[RING_SIZE]`, `spinlock_t lock`, `unsigned int head` (producer writes, `____cacheline_aligned_in_smp`), `unsigned int tail` (consumer reads, `____cacheline_aligned_in_smp`). Head and tail are monotonically increasing — modulo is applied only when indexing into the array. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`.
-- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`. Safe for concurrent updates (worker) and reads (ioctl). `IOCTL_GET_STATS` reads atomics into the UAPI `dmaplane_stats` struct before `copy_to_user`. The UAPI struct is unchanged (plain `__u64`/`__u32`).
+- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`. All dma-buf counters are device-level (survive individual export/release cycles). Safe for concurrent updates and reads.
 - `struct dmaplane_channel`: `struct kref refcount` (channel lifetime), `struct mutex lock` (per-channel state lock), `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use, set to false by kref release callback), `struct dmaplane_stats_kern stats` (atomic counters).
-- `struct dmaplane_buffer` (Phase 2): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped).
+- `struct dmaplane_buffer` (Phase 2+3): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped). Phase 3 additions: `bool dmabuf_exported` (prevents double export and blocks DESTROY_BUFFER while a dma-buf wraps this buffer, set/cleared under `buf_lock`), `struct dma_buf *dmabuf` (back-pointer, NULL when not exported).
 - `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
 - `struct dmaplane_file_ctx`: `struct dmaplane_dev *dev`, `struct dmaplane_channel *chan` (NULL until CREATE_CHANNEL).
 - `dmaplane_channel_release()`: kref release callback — marks slot inactive (`active = false`), decrements `active_channels`, increments `total_channels_destroyed`. Called when the last kref drops to zero.
@@ -81,14 +86,14 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 1. Acquires `dev_mutex`, stops any remaining active worker kthreads via `dmaplane_channel_destroy`
 2. Prints lifetime summary via `pr_info`: total opens, closes, channels created, channels destroyed, buffers created, buffers destroyed
 3. Tears down char device (`device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region`) — prevents new ioctls/opens from racing with cleanup
-4. Destroys remaining buffers — warns on leaked mmap references (`mmap_count > 0`). Must happen AFTER char device teardown (prevents racing creates) but BEFORE platform device unregister (`dma_free_coherent` needs the platform device alive)
+4. Destroys remaining buffers — warns on leaked mmap references (`mmap_count > 0`) and leaked dma-buf exports (`dmabuf_exported`). Must happen AFTER char device teardown (prevents racing creates) but BEFORE platform device unregister (`dma_free_coherent` needs the platform device alive)
 5. `platform_device_unregister`
 6. `kfree`
 
 **File operations:**
 - `dmaplane_open`: Checks `capable(CAP_SYS_ADMIN)` — DMA buffer allocation and mmap of kernel pages are privileged operations. Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`.
 - `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
-- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09).
+- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B).
 - `dmaplane_mmap`: Maps DMA buffer pages into userspace. Extracts `buf_id = vma->vm_pgoff`, finds buffer under `buf_lock`. Sets `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Coherent: `dma_mmap_coherent` (resets `vm_pgoff = 0` first — `dma_mmap_coherent` interprets pgoff as offset into the allocation). Pages: `vm_insert_page` loop. Increments `mmap_count` on success (NOT via `vma_open` — Linux does not call `vma_open` for the initial mmap). VMA ops: `dmaplane_vma_open` (increment on fork/mremap), `dmaplane_vma_close` (decrement on munmap/exit).
 
 **Ioctl handlers:**
@@ -100,9 +105,11 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | `DMAPLANE_IOCTL_COMPLETE` | `dmaplane_ioctl_complete` | Acquire completion ring spinlock, check empty (return `-EAGAIN`), read entry at `tail % RING_SIZE`, `smp_store_release` on tail, release lock, `copy_to_user` |
 | `DMAPLANE_IOCTL_GET_STATS` | `dmaplane_ioctl_get_stats` | Reads `dmaplane_stats_kern` atomics into a plain `dmaplane_stats` UAPI struct, then `copy_to_user`. Each atomic read is individually consistent; the set may be momentarily inconsistent |
 | `DMAPLANE_IOCTL_CREATE_BUFFER` | `dmaplane_ioctl_create_buffer` | `copy_from_user`, delegates to `dmabuf_rdma_create_buffer`, `copy_to_user` result. **copy_to_user undo**: if `copy_to_user` fails after buffer creation, destroys the buffer to prevent an orphaned allocation that userspace can never reference |
-| `DMAPLANE_IOCTL_DESTROY_BUFFER` | `dmaplane_ioctl_destroy_buffer` | `copy_from_user` bare `__u32` handle, delegates to `dmabuf_rdma_destroy_buffer`. Returns `-EBUSY` if `mmap_count > 0` |
+| `DMAPLANE_IOCTL_DESTROY_BUFFER` | `dmaplane_ioctl_destroy_buffer` | `copy_from_user` bare `__u32` handle, delegates to `dmabuf_rdma_destroy_buffer`. Returns `-EBUSY` if `mmap_count > 0` or `dmabuf_exported` |
 | `DMAPLANE_IOCTL_GET_MMAP_INFO` | `dmaplane_ioctl_get_mmap_info` | Looks up buffer under `buf_lock`, returns `mmap_offset = buf_id << PAGE_SHIFT` and `mmap_size = buf->size`. Userspace uses these to call `mmap(2)` |
 | `DMAPLANE_IOCTL_GET_BUF_STATS` | `dmaplane_ioctl_get_buf_stats` | Reads `buffers_created` and `buffers_destroyed` atomics into `dmaplane_buf_stats` UAPI struct |
+| `DMAPLANE_IOCTL_EXPORT_DMABUF` | `dmaplane_ioctl_export_dmabuf` | `copy_from_user`, delegates to `dmaplane_dmabuf_export` (holds `buf_lock` for entire operation), `copy_to_user`. **No copy_to_user undo** — fd already installed in process fd table by `dma_buf_fd` |
+| `DMAPLANE_IOCTL_GET_DMABUF_STATS` | `dmaplane_ioctl_get_dmabuf_stats` | Reads 6 device-level dma-buf atomic counters into `dmaplane_dmabuf_stats` UAPI struct |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -146,13 +153,38 @@ Buffer allocation and lookup. Two allocation paths:
 - All three error paths (no slots, allocation failure, vmap failure) properly unwind with reverse-order cleanup.
 
 **`dmabuf_rdma_destroy_buffer`**:
-- Acquires `buf_lock`, finds buffer. Refuses with `-EBUSY` if `mmap_count > 0`.
+- Acquires `buf_lock`, finds buffer. Refuses with `-EBUSY` if `mmap_count > 0` or `dmabuf_exported` (Phase 3 guard — buffer cannot be destroyed while a dma-buf wraps it).
 - Pages: `vunmap` → `__free_page` loop → `kvfree(pages)`.
 - Coherent: `dma_free_coherent(&dev->pdev->dev, ...)`.
 
 **`dmabuf_rdma_find_buffer`**: Linear scan. Caller must hold `buf_lock`.
 
 All three are `EXPORT_SYMBOL_GPL` for use by future modules (Phase 4 rdma_engine).
+
+### `driver/dmabuf_export.h`
+
+Header declaring the dma-buf export function and kernel self-test with locking contracts: `dmaplane_dmabuf_export` acquires `buf_lock` for the entire operation (mutex, sleeping OK); `dmaplane_dmabuf_selftest` creates a buffer, exports, exercises attach/map/unmap/detach via the kernel dma-buf API.
+
+### `driver/dmabuf_export.c`
+
+dma-buf exporter for page-backed buffers. Implements the `dma_buf_ops` vtable with 9 callbacks:
+
+**Export context** (`dmaplane_dmabuf_ctx`): borrows `pages`, `nr_pages`, `size`, `vaddr` from the backing buffer. Tracks `attach_count` (atomic). All stats counters are device-level on `dmaplane_stats_kern`, not per-export.
+
+**`dma_buf_ops` callbacks:**
+- `attach`/`detach`: increment/decrement `attach_count`, update device-level stats. Accept all devices unconditionally (no IOMMU group filtering).
+- `map_dma_buf`: the expensive callback — builds a per-device SG table via `sg_alloc_table` + `sg_set_page` loop + `dma_map_sgtable`. Each importer may sit behind a different IOMMU, so the SG table must contain DMA addresses valid for that device's context. This is why SG tables are built per-attachment, not at export time.
+- `unmap_dma_buf`: `dma_unmap_sgtable` + `sg_free_table` + `kfree`.
+- `vmap`/`vunmap`: vmap reuses the buffer's existing kernel VA via `iosys_map_set_vaddr`. vunmap is a no-op — the buffer owns the mapping.
+- `release`: acquires `buf_lock` (runs in process context from `fput`, mutex_lock is legal), clears `dmabuf_exported` and `dmabuf` pointer, frees context. No deadlock with destroy: destroy checks `dmabuf_exported` and returns `-EBUSY` without waiting.
+- `mmap`: `vm_insert_page` loop with `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Allows userspace to mmap the dma-buf fd directly.
+- `begin_cpu_access`/`end_cpu_access`: stubs on x86 (hardware cache coherency). ARM/RISC-V would need `dma_sync_sg_for_cpu`/`dma_sync_sg_for_device`.
+
+**`dmaplane_dmabuf_export`**: acquires `buf_lock` for the entire operation (prevents double-export race). Validates `BUF_TYPE_PAGES` (coherent → `-EINVAL`), checks `!dmabuf_exported` (→ `-EBUSY`), allocates context, calls `dma_buf_export` + `dma_buf_fd(O_CLOEXEC)`. `exp_info.flags = O_RDWR` is required — without it, mmap of the dma-buf fd with `PROT_WRITE` fails with `EACCES`.
+
+**`dmaplane_dmabuf_selftest`**: kernel-space test callable via `test_dmabuf=1` module parameter. Exercises attach/map/unmap/detach 100 times using the platform device as the importing device. Verifies SG table has entries after each map.
+
+`MODULE_IMPORT_NS(DMA_BUF)` is required in `main.c` — the dma-buf framework exports its symbols under this namespace since kernel 5.x.
 
 ---
 
@@ -186,6 +218,21 @@ Userspace test suite for Phase 2 DMA buffer management. Opens `/dev/dmaplane`, e
 6. **Handle uniqueness** — 10 create/destroy cycles, verify handles are monotonically increasing and never 0
 7. **Large buffer** — 16 MB page-backed buffer, mmap, write incrementing pattern, verify
 8. **Invalid parameters** — size 0 → `EINVAL`, bad alloc_type → `EINVAL`, destroy non-existent → `ENOENT`, mmap_info non-existent → `ENOENT`
+
+### `tests/test_phase3_dmabuf.c`
+
+Userspace test suite for Phase 3 dma-buf export. Opens `/dev/dmaplane`, exercises buffer export, fd lifecycle, mmap through dma-buf fd, and the destroy guard. Includes helpers: `create_buffer`, `destroy_buffer`, `export_dmabuf`, `get_dmabuf_stats`.
+
+**Test cases:**
+1. **Export page-backed buffer** — create, export, verify fd >= 0, close fd, destroy
+2. **Export coherent (must fail)** — coherent buffers have no page array, export returns `-EINVAL`
+3. **Double export (must fail)** — one dma-buf per buffer, second export returns `-EBUSY`
+4. **Destroy while exported** — must fail with `-EBUSY`, close dma-buf fd, then destroy succeeds
+5. **mmap via dma-buf fd** — export, mmap the dma-buf fd (not `/dev/dmaplane`), write `0xBEEFCAFE` pattern, verify
+6. **Export + close fd + destroy** — verify release callback clears `dmabuf_exported` flag
+7. **Stats verification** — export/close cycle, verify `dmabufs_exported` and `dmabufs_released` counters
+8. **Multiple buffers exported** — 4 buffers simultaneously, close in reverse order
+9. **Large buffer export** — 16 MB buffer, mmap via dma-buf fd, full write/read cycle
 
 ---
 
@@ -234,3 +281,17 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 **copy_to_user undo pattern**: `IOCTL_CREATE_BUFFER` creates the buffer first, then copies the result to userspace. If `copy_to_user` fails, the buffer exists in the kernel but userspace has no handle to reference or destroy it — an orphaned allocation. The undo pattern destroys the buffer on `copy_to_user` failure.
 
 **buf_lock vs dev_mutex separation**: These protect different resources (buffers vs channels) and are never nested. This allows concurrent buffer and channel operations — important for Phase 4+ where RDMA operations touch both.
+
+**dma-buf as the cross-device sharing primitive**: Phase 3 wraps page-backed buffers as `struct dma_buf` objects. Only page-backed buffers can be exported — coherent allocations have no `struct page` array, and `virt_to_page` on `dma_alloc_coherent` memory is unreliable across architectures. The `dmabuf_exported` flag on `dmaplane_buffer` prevents both double export and destruction while the dma-buf exists — same defense-in-depth pattern as `mmap_count`.
+
+**SG tables are per-device, built in map_dma_buf**: Each importer may sit behind a different IOMMU. The SG table must contain DMA addresses valid for that device's IOMMU context. Building at export time would assume a single IOMMU — wrong for cross-device sharing. The map callback is the expensive path: `sg_alloc_table` + `sg_set_page` loop + `dma_map_sgtable`.
+
+**dma-buf release callback and buf_lock**: The `release` callback fires from `fput` (process context) when the last dma-buf reference drops. It acquires `buf_lock` to clear `dmabuf_exported` atomically. No deadlock with `dmabuf_rdma_destroy_buffer`: destroy checks `dmabuf_exported` and returns `-EBUSY` without waiting for the lock.
+
+**O_RDWR on dma_buf_export**: The `exp_info.flags` must include `O_RDWR`. Without it, the dma-buf file is not writable, and userspace `mmap` with `PROT_WRITE` fails with `EACCES`. `O_CLOEXEC` is passed separately to `dma_buf_fd`.
+
+**MODULE_IMPORT_NS(DMA_BUF)**: Since kernel 5.x, the dma-buf framework exports its symbols under the `DMA_BUF` namespace. Modules using `dma_buf_export`, `dma_buf_fd`, etc. must declare this import or fail to load with unresolved symbol errors.
+
+**No copy_to_user undo for EXPORT_DMABUF**: Unlike `CREATE_BUFFER`, the export ioctl does not undo on `copy_to_user` failure. The fd is already installed in the process's fd table by `dma_buf_fd` before `copy_to_user`. The fd will be cleaned up on process exit.
+
+**dma-buf stats are device-level**: All 6 dma-buf counters (exported, released, attachments, detachments, maps, unmaps) live on `dmaplane_stats_kern`, not on the per-export context. This ensures counters survive individual export/release cycles — matching the pattern used for `buffers_created`/`buffers_destroyed`.

@@ -22,6 +22,7 @@
 
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/dma-buf.h>
 #include <linux/dma-mapping.h>
 #include <linux/kref.h>
 #include <linux/kthread.h>
@@ -103,6 +104,15 @@ struct dmaplane_stats_kern {
 	/* Phase 2: buffer lifecycle counters */
 	atomic64_t buffers_created;	/* Lifetime buffers created */
 	atomic64_t buffers_destroyed;	/* Lifetime buffers destroyed */
+
+	/* Phase 3: dma-buf export counters — device-level so they
+	 * survive individual export/release cycles */
+	atomic64_t dmabufs_exported;	/* Lifetime dma-bufs created */
+	atomic64_t dmabufs_released;	/* Lifetime dma-bufs released */
+	atomic64_t dmabuf_attachments;	/* Lifetime attach calls */
+	atomic64_t dmabuf_detachments;	/* Lifetime detach calls */
+	atomic64_t dmabuf_maps;		/* Lifetime map_dma_buf calls */
+	atomic64_t dmabuf_unmaps;	/* Lifetime unmap_dma_buf calls */
 };
 
 /*
@@ -255,6 +265,16 @@ struct dmaplane_buffer {
 	 * Incremented in dmaplane_mmap(), decremented in vma_close callback.
 	 * Atomic because mmap and munmap can race from different threads. */
 	atomic_t mmap_count;
+
+	/* Phase 3: dma-buf export state.
+	 * dmabuf_exported: true while a dma-buf wraps this buffer.  Prevents
+	 *   double export (one dma-buf per buffer) and blocks DESTROY_BUFFER.
+	 *   Set under buf_lock in the export path, cleared under buf_lock in
+	 *   the release callback.
+	 * dmabuf: back-pointer to the dma-buf object.  NULL when not exported.
+	 *   Used for cleanup and diagnostics. */
+	bool dmabuf_exported;
+	struct dma_buf *dmabuf;
 };
 
 /*

@@ -70,6 +70,8 @@ Character device kernel module at `/dev/dmaplane`. Ioctl-driven, with per-channe
 | `DMAPLANE_IOCTL_DESTROY_BUFFER` | `_IOW` | `__u32` | Destroy a buffer by handle |
 | `DMAPLANE_IOCTL_GET_MMAP_INFO` | `_IOWR` | `dmaplane_mmap_info` | Get mmap offset and size for a buffer |
 | `DMAPLANE_IOCTL_GET_BUF_STATS` | `_IOR` | `dmaplane_buf_stats` | Return buffer allocation statistics |
+| `DMAPLANE_IOCTL_EXPORT_DMABUF` | `_IOWR` | `dmaplane_export_dmabuf_arg` | Export a page-backed buffer as a dma-buf fd |
+| `DMAPLANE_IOCTL_GET_DMABUF_STATS` | `_IOR` | `dmaplane_dmabuf_stats` | Return dma-buf export statistics |
 
 ## Concurrency Model
 

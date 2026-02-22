@@ -179,4 +179,40 @@ struct dmaplane_buf_stats {
 #define DMAPLANE_IOCTL_GET_BUF_STATS \
 	_IOR(DMAPLANE_IOC_MAGIC, 0x09, struct dmaplane_buf_stats)
 
+/* ── Phase 3: dma-buf export ─────────────────────────────── */
+
+/*
+ * dma-buf export parameters: passed to IOCTL_EXPORT_DMABUF.
+ * Wraps an existing page-backed buffer as a dma-buf and returns
+ * a file descriptor.  Coherent buffers cannot be exported (no
+ * page array for SG table construction).
+ */
+struct dmaplane_export_dmabuf_arg {
+	__u32 buf_id;		/* in  — buffer handle to export */
+	__s32 fd;		/* out — dma-buf file descriptor */
+};
+
+/*
+ * dma-buf statistics: returned by IOCTL_GET_DMABUF_STATS.
+ * Lifetime counters — survive individual export/release cycles.
+ */
+struct dmaplane_dmabuf_stats {
+	__u64 dmabufs_exported;		/* out — lifetime dma-bufs created */
+	__u64 dmabufs_released;		/* out — lifetime dma-bufs released */
+	__u64 attachments_total;	/* out — lifetime attach calls */
+	__u64 detachments_total;	/* out — lifetime detach calls */
+	__u64 maps_total;		/* out — lifetime map_dma_buf calls */
+	__u64 unmaps_total;		/* out — lifetime unmap_dma_buf calls */
+};
+
+/* Phase 3 ioctl commands: 0x0A–0x0B */
+
+/* Export a page-backed buffer as a dma-buf; returns fd. */
+#define DMAPLANE_IOCTL_EXPORT_DMABUF \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x0A, struct dmaplane_export_dmabuf_arg)
+
+/* Get dma-buf export statistics. */
+#define DMAPLANE_IOCTL_GET_DMABUF_STATS \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x0B, struct dmaplane_dmabuf_stats)
+
 #endif /* _DMAPLANE_UAPI_H */
