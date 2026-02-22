@@ -8,13 +8,13 @@ Phase 3 established the sharing primitive: dma-buf wraps a buffer's pages, hands
 
 **The kernel module must own the RDMA resources because it owns the pages.** Userspace RDMA libraries (`libibverbs`, `ibv_reg_mr`) work by pinning userspace pages and registering them with the NIC. But dmaplane's pages are kernel-allocated (`alloc_pages` in Phase 2), kernel-mapped (`vmap`), and kernel-managed (the buffer lifecycle, the dma-buf export). Userspace `ibv_reg_mr` cannot register kernel pages — it has no handle to them. The kernel must call `ib_dma_map_sg` itself to program the IOMMU, and `pd->local_dma_lkey` to authorize the NIC's DMA engine. This is the same position that `nvidia-peermem` is in: it owns GPU BAR pages and must register them from kernel space because no userspace API can reach them.
 
-This post covers the full RDMA implementation: the resource hierarchy and why each layer depends on the previous, GID selection on Ubuntu with stable-privacy addressing, the `IB_POLL_DIRECT` completion model and why it prevents teardown races, two paths for Memory Region registration, the loopback QP pair and its state machine, benchmarks over Soft-RoCE, and the teardown discipline that prevents use-after-free.
+This post covers the full RDMA implementation: the resource hierarchy and why each layer depends on the previous, GID selection on Ubuntu with stable-privacy addressing, the `IB_POLL_DIRECT` completion model and why it prevents teardown races, two paths for Memory Region registration, the loopback queue pair (QP) and its state machine, benchmarks over Soft-RoCE, and the teardown discipline that prevents use-after-free.
 
 ---
 
 ## The Resource Hierarchy: IB Device to Memory Region
 
-**Every RDMA operation depends on a chain of five resources, each created from the previous: IB device, Protection Domain, Completion Queue, Queue Pair, and Memory Region.** Destroying any resource while a downstream resource still references it is a use-after-free. Creating them out of order is impossible — the API enforces the dependency.
+**Every RDMA operation depends on a chain of five resources, each created from the previous: IB device, Protection Domain (PD), Completion Queue (CQ), Queue Pair (QP), and Memory Region (MR).** Destroying any resource while a downstream resource still references it is a use-after-free. Creating them out of order is impossible — the API enforces the dependency.
 
 ```
 IB device (ib_device_get_by_name)
@@ -200,16 +200,17 @@ The streaming benchmark computes per-completion inter-arrival times for P99, rat
 
 ### Results on Soft-RoCE (rxe)
 
-Expected results from `test_phase4_rdma` on a laptop with Soft-RoCE:
+Actual results from `test_phase4_rdma` on a workstation with Soft-RoCE (`rxe_enp0s31f6`):
 
-| Benchmark | Message Size | Iterations | Queue Depth | Metric | Expected Range |
-|-----------|-------------|------------|-------------|--------|----------------|
-| Loopback | 64 B | 1 | -- | Latency | 100--500 us |
-| Ping-pong | 4 KB | 1000 | -- | Avg latency | 50--200 us |
-| Ping-pong | 4 KB | 1000 | -- | P99 latency | 100--500 us |
-| Streaming | 4 KB | 1000 | 8 | Throughput | 20--200 MB/s |
+| Benchmark | Message Size | Iterations | Queue Depth | Metric | Result |
+|-----------|-------------|------------|-------------|--------|--------|
+| Loopback | 64 B | 1 | -- | Latency | 205 us |
+| Ping-pong | 4 KB | 1000 | -- | Avg latency | 200 us |
+| Ping-pong | 4 KB | 1000 | -- | P99 latency | 211 us |
+| Ping-pong | 4 KB | 1000 | -- | Throughput | 20 MB/s |
+| Streaming | 4 KB | 1000 | 8 | Throughput | 163 MB/s |
 
-These numbers are software-emulated RDMA — rxe processes everything in the kernel networking stack. On real InfiniBand hardware (ConnectX-6), loopback latency is under 2 microseconds, and streaming throughput exceeds 20 GB/s. The value of the rxe numbers is not absolute performance but relative consistency: zero completion errors across all iterations, monotonically increasing stats counters, and clean teardown.
+These numbers are software-emulated RDMA — rxe processes everything in the kernel networking stack. On real InfiniBand hardware (ConnectX-6), loopback latency is under 2 microseconds, and streaming throughput exceeds 20 GB/s. The value of the rxe numbers is not absolute performance but relative consistency: zero completion errors across 2001 sends, 2001 receives, and 4002 completions polled, with clean teardown. The 8x throughput improvement from ping-pong (20 MB/s) to streaming (163 MB/s) demonstrates the pipeline amortization from queue depth.
 
 ---
 
