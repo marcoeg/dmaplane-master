@@ -126,4 +126,59 @@ int rdma_engine_remote_recv(struct dmaplane_dev *edev,
  */
 void rdma_engine_teardown_peer(struct dmaplane_dev *edev);
 
+/* ── Phase 9: RDMA WRITE with Immediate ── */
+
+/*
+ * rdma_engine_write_imm() — Post RDMA WRITE WITH IMMEDIATE.
+ *
+ * Builds an ib_rdma_wr with IB_WR_RDMA_WRITE_WITH_IMM opcode.
+ * Writes 'length' bytes from local MR (at local_offset) to remote_addr
+ * (rkey), delivering imm_data through the receiver's CQ completion.
+ *
+ * QP: use_peer_qp=0 → qp_a (loopback), =1 → qp_peer.
+ * Polls the corresponding send CQ for completion.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_write_imm(struct dmaplane_dev *edev,
+			   uint32_t local_mr_id,
+			   uint64_t local_offset,
+			   uint64_t remote_addr,
+			   uint32_t remote_rkey,
+			   uint32_t length,
+			   uint32_t imm_data,
+			   int use_peer_qp,
+			   uint64_t *elapsed_ns);
+
+/*
+ * rdma_engine_writeimm_post_recv() — Post recv WR for WRITEIMM.
+ *
+ * Each WRITE_WITH_IMM consumes one recv WR.  This posts a recv on
+ * the receiving QP (qp_b for loopback, qp_peer for cross-machine).
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_writeimm_post_recv(struct dmaplane_dev *edev,
+				    uint32_t mr_id,
+				    uint32_t size,
+				    int use_peer_qp);
+
+/*
+ * rdma_engine_writeimm_poll_recv() — Poll recv CQ for WRITEIMM completion.
+ *
+ * Returns imm_data (host byte order) and byte_len from the completion.
+ * Returns 0 on both success (status_out=0) and timeout (status_out=1).
+ * Returns -EIO on WC error.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_writeimm_poll_recv(struct dmaplane_dev *edev,
+				    int use_peer_qp,
+				    uint32_t timeout_ms,
+				    uint32_t *status_out,
+				    uint32_t *wc_flags_out,
+				    uint32_t *imm_data_out,
+				    uint32_t *byte_len_out,
+				    uint64_t *elapsed_ns);
+
 #endif /* _RDMA_ENGINE_H */

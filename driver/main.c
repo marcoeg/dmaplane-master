@@ -1929,6 +1929,86 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 		up_write(&dma_dev->rdma_sem);
 		return 0;
 
+	/* ── Phase 9: RDMA WRITE with Immediate ── */
+
+	/*
+	 * RDMA_WRITE_IMM — Post IB_WR_RDMA_WRITE_WITH_IMM.
+	 *
+	 * Writes data from a local MR to a remote MR address and delivers a
+	 * 32-bit immediate through the receiver's CQ.  The primary verb for
+	 * KVCache chunked transfer — imm_data encodes (layer, chunk).
+	 */
+	case DMAPLANE_IOCTL_RDMA_WRITE_IMM: {
+		struct dmaplane_write_imm_params wp;
+
+		if (copy_from_user(&wp, (void __user *)arg, sizeof(wp)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_write_imm(dma_dev,
+					     wp.local_mr_id,
+					     wp.local_offset,
+					     wp.remote_addr,
+					     wp.remote_rkey,
+					     wp.length,
+					     wp.imm_data,
+					     wp.use_peer_qp,
+					     &wp.elapsed_ns);
+		up_read(&dma_dev->rdma_sem);
+		wp.status = ret ? 1 : 0;
+		if (copy_to_user((void __user *)arg, &wp, sizeof(wp)))
+			return -EFAULT;
+		return ret < 0 ? ret : 0;
+	}
+
+	/*
+	 * RDMA_POST_RECV — Post a recv WR to absorb one WRITEIMM.
+	 *
+	 * Must be called before the sender's write_imm — otherwise the
+	 * receiving QP hits RNR (Receiver Not Ready).
+	 */
+	case DMAPLANE_IOCTL_RDMA_POST_RECV: {
+		struct dmaplane_post_recv_params rp;
+
+		if (copy_from_user(&rp, (void __user *)arg, sizeof(rp)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_writeimm_post_recv(dma_dev,
+						      rp.mr_id,
+						      rp.size,
+						      rp.use_peer_qp);
+		up_read(&dma_dev->rdma_sem);
+		rp.status = ret ? 1 : 0;
+		if (copy_to_user((void __user *)arg, &rp, sizeof(rp)))
+			return -EFAULT;
+		return ret < 0 ? ret : 0;
+	}
+
+	/*
+	 * RDMA_POLL_RECV — Poll recv CQ for a WRITEIMM completion.
+	 *
+	 * Returns the 32-bit immediate and payload size.  The ioctl returns 0
+	 * even on timeout; the caller checks status (0=success, nonzero=timeout).
+	 */
+	case DMAPLANE_IOCTL_RDMA_POLL_RECV: {
+		struct dmaplane_poll_recv_params pp;
+
+		if (copy_from_user(&pp, (void __user *)arg, sizeof(pp)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_writeimm_poll_recv(dma_dev,
+						      pp.use_peer_qp,
+						      pp.timeout_ms,
+						      &pp.status,
+						      &pp.wc_flags,
+						      &pp.imm_data,
+						      &pp.byte_len,
+						      &pp.elapsed_ns);
+		up_read(&dma_dev->rdma_sem);
+		if (copy_to_user((void __user *)arg, &pp, sizeof(pp)))
+			return -EFAULT;
+		return ret < 0 ? ret : 0;
+	}
+
 	default:
 		return -ENOTTY;
 	}

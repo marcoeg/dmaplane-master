@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 8 — GPU Memory Integration
+## Current State: Phase 9A — WRITEIMM KVCache Pipeline
 
 ## Licensing
 
@@ -547,3 +547,83 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 **Test:** `tests/test_phase8_gpu.c` — 7 tests, links `-lcuda -lcudart -lm`, conditional build in Makefile (skips if CUDA not available): (1) Pin/Unpin lifecycle at 3 sizes (64KB, 1MB, 16MB), verify handle/pages/bar1_consumed, (2) H2G data integrity — 0xDEADBEEF pattern, verify via `cudaMemcpy D→H` readback, (3) G2H data integrity — `cudaMemset 0xAB`, `GPU_DMA_TO_HOST`, verify host buffer, (4) BAR throughput — `GPU_BENCH` at 5 sizes, compare with `cudaMemcpy` side-by-side, (5) Callback safety — `cudaFree` while pinned, verify DMA returns `-ENODEV`, unpin succeeds cleanly, (6) Alignment validation — non-64KB-aligned VA/size/zero rejected, (7) GPU RDMA loopback — `cudaMemset 0xCD`, pin, register GPU MR + host MR, `GPU_LOOPBACK`, verify host buffer matches (skips if no rxe). Cleanup order: deregister MRs → teardown RDMA → unpin GPU → cudaFree → free host buffer.
 
 **Examples:** `examples/gpu_rdma/gpu_sender.c` (~290 lines, Machine A: cudaMalloc + sinf gradient, GPU_PIN, GPU_REGISTER_MR, RDMA_INIT_PEER, TCP exchange, RDMA_CONNECT_PEER, RDMA_REMOTE_SEND), `examples/gpu_rdma/gpu_receiver.c` (~280 lines, Machine B: CREATE_BUFFER, REGISTER_MR, RDMA_INIT_PEER, TCP exchange, RDMA_CONNECT_PEER, RDMA_REMOTE_RECV, mmap + verify gradient). No GPU needed on receiver. `examples/misc/trace_explorer.c` also demonstrates GPU tracepoint capture.
+
+### Phase 9A Appendix: RDMA WRITE with Immediate — Kernel Verbs + KVCache Reference Implementation
+
+**Scope**: Adds `IB_WR_RDMA_WRITE_WITH_IMM` to the kernel module (3 new ioctls, 3 new kernel functions, 1 tracepoint), renumbers ioctl space (flow 0x60→0x40, GPU 0x80→0x60, WRITEIMM at 0x80), introduces KVCache chunk protocol header, and provides a full reference implementation (`examples/kvcache/`) with C loopback sender/receiver, Python wrapper, HuggingFace KVCache helpers, and end-to-end disaggregated inference test.
+
+**Modified files**: `include/dmaplane_uapi.h` (~90 lines), `driver/rdma_engine.h` (~55 lines), `driver/rdma_engine.c` (~220 lines), `driver/main.c` (~75 lines), `driver/dmaplane_trace.h` (~20 lines). **New files**: `include/kvcache_proto.h` (34 lines), `examples/kvcache/` (14 files, ~3800 lines).
+
+#### Ioctl Renumbering
+
+| Ioctl Group | Old Range | New Range | Reason |
+|-------------|-----------|-----------|--------|
+| Flow control | 0x60–0x63 | 0x40–0x43 | Freed 0x60 for GPU |
+| GPU P2P | 0x80–0x87 | 0x60–0x67 | Freed 0x80 for WRITEIMM |
+| WRITEIMM (new) | — | 0x80–0x82 | New Phase 9 verbs |
+| Peer RDMA | 0x90–0x94 | 0x90–0x94 | Unchanged |
+
+Post-renumbering map: Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11/0x20–0x21/0x30–0x33, Phase 6: 0x40–0x43, Phase 5: 0x50–0x51, Phase 8 GPU: 0x60–0x67, Phase 7: 0x70, Phase 9 WRITEIMM: 0x80–0x82, Phase 8 peer: 0x90–0x94.
+
+#### New UAPI Structs
+
+**`struct dmaplane_write_imm_params`** (48 bytes, `=IIQQIIIIQ`): `local_mr_id` (in), `length` (in), `local_offset` (in), `remote_addr` (in), `remote_rkey` (in), `imm_data` (in — 32-bit immediate), `use_peer_qp` (in — 0=loopback, 1=peer), `status` (out), `elapsed_ns` (out).
+
+**`struct dmaplane_post_recv_params`** (16 bytes, `=IIII`): `mr_id` (in), `size` (in), `use_peer_qp` (in — 0=QP-B, 1=qp_peer), `status` (out).
+
+**`struct dmaplane_poll_recv_params`** (32 bytes, `=IIIIIIQ`): `use_peer_qp` (in), `timeout_ms` (in), `status` (out — 0=success, nonzero=timeout), `wc_flags` (out), `imm_data` (out — host byte order), `byte_len` (out), `elapsed_ns` (out). The ioctl returns 0 even on timeout; caller checks status field.
+
+#### New Kernel Functions
+
+| Function | Lines | Signature |
+|----------|------:|-----------|
+| `rdma_engine_write_imm` | ~95 | `(edev, local_mr_id, local_offset, remote_addr, remote_rkey, length, imm_data, use_peer_qp, *elapsed_ns)` |
+| `rdma_engine_writeimm_post_recv` | ~57 | `(edev, mr_id, size, use_peer_qp)` |
+| `rdma_engine_writeimm_poll_recv` | ~67 | `(edev, use_peer_qp, timeout_ms, *status, *wc_flags, *imm_data, *byte_len, *elapsed_ns)` |
+
+Key implementation details: `write_imm` uses `struct ib_rdma_wr` (not `ib_send_wr`) for remote_addr/rkey fields. Byte order: `cpu_to_be32(imm_data)` on send, `be32_to_cpu(wc.ex.imm_data)` on recv. All snapshot MR under `mr_lock`, all require `rdma_sem` read lock.
+
+#### QP/CQ Routing
+
+| Operation | use_peer_qp=0 | use_peer_qp=1 |
+|-----------|---------------|----------------|
+| write_imm send | qp_a / cq_a | qp_peer / cq_peer |
+| post_recv | qp_b | qp_peer |
+| poll_recv | cq_b | cq_peer |
+
+#### New Tracepoint
+
+`dmaplane_rdma_write_imm`: fields `imm_data` (u32, hex), `length` (u32), `latency_ns` (u64). Fired after successful send CQ poll.
+
+#### KVCache Protocol (`include/kvcache_proto.h`)
+
+`KVCACHE_IMM_ENCODE(layer, chunk)` — upper 16 bits = layer, lower 16 = chunk. `KVCACHE_IMM_LAYER(imm)`, `KVCACHE_IMM_CHUNK(imm)` — decode. `KVCACHE_SENTINEL = 0xFFFFFFFF` — end-of-transfer marker.
+
+#### IB Access Constants and Short Aliases
+
+`DMAPLANE_IB_ACCESS_LOCAL_WRITE` (1), `DMAPLANE_IB_ACCESS_REMOTE_WRITE` (2), `DMAPLANE_IB_ACCESS_REMOTE_READ` (4). 15 short aliases inside `#ifndef __KERNEL__` (`IOCTL_CREATE_BUFFER` → `DMAPLANE_IOCTL_CREATE_BUFFER`, `BUF_TYPE_PAGES` → `DMAPLANE_BUF_TYPE_PAGES`, etc.).
+
+#### `examples/kvcache/` File Inventory
+
+| File | Lines | Description |
+|------|------:|-------------|
+| `kvcache_common.h` | 585 | Ioctl wrappers, timing, credit tracker, recv helpers, latency stats, bitmap |
+| `kvcache_sender.c` | 662 | Loopback WRITEIMM sender with credit window, GPU path, verify |
+| `kvcache_receiver.c` | 357 | Loopback self-test + peer mode stub |
+| `dmaplane_py.py` | 481 | Python struct/fcntl wrapper for all ioctls |
+| `test_dmaplane_py.py` | 293 | Python wrapper tests (struct sizes, ioctl round-trips) |
+| `kvcache_inference.py` | 195 | extract/consolidate/reconstruct KVCache helpers |
+| `test_kvcache_local.py` | 472 | End-to-end: TinyLlama prefill → WRITEIMM → decode → verify |
+| `kvcache_bench.sh` | 84 | Benchmark sweep → CSV |
+| `ec2_setup.sh` | 153 | Automated EC2 setup |
+| `Makefile` | 38 | C build with CUDA detection |
+
+#### Test Results
+
+- Phase 8 GPU regression: **7/7 PASSED** (ioctl renumbering transparent)
+- WRITEIMM loopback 128 chunks (32×4×1MB): 1201.8 MB/s, 112 credit stalls, data integrity **PASS**
+- WRITEIMM GPU source 128 chunks: 10.3 MB/s (~100ms/chunk BAR reads), data integrity **PASS**
+- WRITEIMM credit-window=2, 8 layers: 1045.2 MB/s, 30 stalls, data integrity **PASS**
+- Python struct validation: 11/11 sizes **OK**, all ioctl numbers match
+- Python ioctl round-trips: **7/7 PASSED** (WRITEIMM loopback with imm_data verification)
+- End-to-end disaggregated inference (test_kvcache_local.py): **6/6 PASSED** — KVCache extract+consolidate, as_strided reconstruction, decode token-match, WRITEIMM GPU→host loopback with real KVCache (18.9 MB/s, 135 KB TinyLlama KVCache), GPU alignment+pin, multi-prompt buffer reuse

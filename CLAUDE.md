@@ -6,7 +6,7 @@ dmaplane is a Linux kernel module for learning the host-side data path between A
 
 ## Current Phase
 
-Phase 8 — GPU Memory Integration — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the next phase spec.
+Phase 9A — WRITEIMM KVCache Pipeline — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the full phase spec.
 
 ## Key References
 
@@ -61,7 +61,7 @@ important, flag it before implementing.
 
 ### Ioctl numbering
 - Magic: `0xE4`
-- Groups: buffer management `0x01`–`0x09`, RDMA `0x10`–`0x19`, MR `0x20`–`0x29`, benchmarks `0x30`–`0x39`, stats `0x40`–`0x49`, NUMA `0x50`–`0x59`, flow control `0x60`–`0x63`, histogram `0x70`, GPU P2P `0x80`–`0x87`, peer RDMA `0x90`–`0x94`
+- Groups: buffer management `0x01`–`0x09`, RDMA `0x10`–`0x19`, MR `0x20`–`0x29`, benchmarks `0x30`–`0x39`, flow control `0x40`–`0x43`, NUMA `0x50`–`0x59`, GPU P2P `0x60`–`0x67`, histogram `0x70`, WRITEIMM `0x80`–`0x82`, peer RDMA `0x90`–`0x94`
 - Phase 1 uses `0x01`–`0x04` (create channel, submit, complete, get stats)
 
 ### Build system
@@ -102,6 +102,7 @@ dmaplane-master/
 │   ├── misc/                  # Standalone demos (Phase 2+)
 │   ├── streamer/              # Weight-streaming TUI (Phase 6)
 │   ├── gpu_rdma/              # GPU VRAM over RDMA (Phase 8)
+│   ├── kvcache/               # KVCache WRITEIMM pipeline (Phase 9)
 │   ├── netshare/              # Two-machine RDMA (Phase 4+)
 │   └── inference/             # Disaggregated inference (Phase 9)
 ├── docs/                      # Blog posts (one per phase, output)
@@ -120,7 +121,8 @@ dmaplane-master/
 | 5 | **COMPLETE** | NUMA, topology & optimization |
 | 6 | **COMPLETE** | Backpressure & flow control |
 | 7 | **COMPLETE** | Instrumentation & microarchitectural awareness |
-| 8 | **CURRENT** | GPU memory integration |
-| 9 | Planned | Disaggregated inference demo |
+| 8 | **COMPLETE** | GPU memory integration |
+| 9A | **CURRENT** | WRITEIMM kernel verbs + KVCache pipeline |
+| 9B-D | Planned | Cross-machine KVCache, EC2 deployment |
 
 Update the "Status" column and "Current Phase" section as phases are completed.

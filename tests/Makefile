@@ -3,6 +3,19 @@ CFLAGS := -Wall -Wextra -O2 -I../include
 
 TESTS := test_phase1_driver test_phase2_dma test_phase3_dmabuf test_phase4_rdma test_phase5_numa test_phase6_backpressure test_phase7_instrumentation
 
+# Phase 8: GPU test — conditional on CUDA availability.
+# Check for cuda_runtime.h (nvcc may not be installed even when CUDA libs are).
+CUDA_FOUND :=
+ifneq ($(wildcard /usr/local/cuda/include/cuda_runtime.h),)
+CUDA_FOUND := 1
+endif
+ifneq ($(wildcard /usr/include/cuda_runtime.h),)
+CUDA_FOUND := 1
+endif
+ifdef CUDA_FOUND
+TESTS += test_phase8_gpu
+endif
+
 all: $(TESTS)
 
 test_phase1_driver: test_phase1_driver.c
@@ -26,18 +39,15 @@ test_phase6_backpressure: test_phase6_backpressure.c
 test_phase7_instrumentation: test_phase7_instrumentation.c
 	$(CC) $(CFLAGS) -o $@ $<
 
-# Phase 8: GPU test — conditional on CUDA availability.
-# Skip with a warning if nvcc/cuda headers are not found.
-CUDA_AVAILABLE := $(shell command -v nvcc >/dev/null 2>&1 && echo yes)
-ifeq ($(CUDA_AVAILABLE),yes)
-TESTS += test_phase8_gpu
-
+ifdef CUDA_FOUND
 test_phase8_gpu: test_phase8_gpu.c
 	$(CC) $(CFLAGS) -o $@ $< -lcuda -lcudart -lm
 else
 test_phase8_gpu:
-	@echo "SKIP: test_phase8_gpu — CUDA not available (nvcc not found)"
+	@echo "SKIP: test_phase8_gpu — CUDA not available"
 endif
 
 clean:
 	rm -f $(TESTS) test_phase8_gpu
+
+.PHONY: all clean

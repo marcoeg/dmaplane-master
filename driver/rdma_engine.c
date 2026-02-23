@@ -1441,3 +1441,264 @@ int rdma_engine_remote_recv(struct dmaplane_dev *edev,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rdma_engine_remote_recv);
+
+/* ── Phase 9: RDMA WRITE with Immediate ──────────────────────────────── */
+
+/*
+ * rdma_engine_write_imm — Post RDMA WRITE WITH IMMEDIATE.
+ *
+ * Builds an ib_rdma_wr (not plain ib_send_wr) because RDMA WRITE needs
+ * remote_addr and rkey.  Posts IB_WR_RDMA_WRITE_WITH_IMM on the selected
+ * QP, then polls the corresponding send CQ for completion.
+ *
+ * The 32-bit imm_data is converted to network byte order (cpu_to_be32)
+ * as required by the IB spec.  The receiver converts back (be32_to_cpu).
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_write_imm(struct dmaplane_dev *edev,
+			   uint32_t local_mr_id,
+			   uint64_t local_offset,
+			   uint64_t remote_addr,
+			   uint32_t remote_rkey,
+			   uint32_t length,
+			   uint32_t imm_data,
+			   int use_peer_qp,
+			   uint64_t *elapsed_ns)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct dmaplane_mr_entry mr_copy;
+	struct ib_rdma_wr rdma_wr = {};
+	struct ib_sge sge = {};
+	const struct ib_send_wr *bad_wr;
+	struct ib_qp *qp;
+	struct ib_cq *cq;
+	struct ib_wc wc;
+	ktime_t start;
+	int ret, rc;
+
+	if (!ctx->initialized)
+		return -EINVAL;
+
+	if (use_peer_qp) {
+		if (!ctx->peer_connected)
+			return -ENOTCONN;
+		qp = ctx->qp_peer;
+		cq = ctx->cq_peer;
+	} else {
+		qp = ctx->qp_a;
+		cq = ctx->cq_a;
+	}
+
+	/* Snapshot MR under lock */
+	mutex_lock(&edev->mr_lock);
+	{
+		struct dmaplane_mr_entry *mr;
+
+		mr = dmabuf_rdma_find_mr(edev, local_mr_id);
+		if (!mr) {
+			mutex_unlock(&edev->mr_lock);
+			return -ENOENT;
+		}
+		mr_copy = *mr;
+	}
+	mutex_unlock(&edev->mr_lock);
+
+	start = ktime_get();
+
+	/* Build SGE with offset into local MR */
+	sge.addr = mr_copy.sge_addr + local_offset;
+	sge.length = length;
+	sge.lkey = mr_copy.lkey;
+
+	/* Build RDMA WRITE WITH IMMEDIATE work request */
+	rdma_wr.wr.opcode = IB_WR_RDMA_WRITE_WITH_IMM;
+	rdma_wr.wr.send_flags = IB_SEND_SIGNALED;
+	rdma_wr.wr.ex.imm_data = cpu_to_be32(imm_data);
+	rdma_wr.wr.sg_list = &sge;
+	rdma_wr.wr.num_sge = 1;
+	rdma_wr.remote_addr = remote_addr;
+	rdma_wr.rkey = remote_rkey;
+
+	ret = ib_post_send(qp, &rdma_wr.wr, &bad_wr);
+	if (ret) {
+		pr_err("write_imm: ib_post_send failed: %d\n", ret);
+		return ret;
+	}
+	atomic64_inc(&edev->stats.sends_posted);
+
+	/* Poll send CQ — 10s timeout */
+	rc = rdma_engine_poll_cq(cq, &wc, 10000);
+	if (rc <= 0) {
+		pr_err("write_imm send CQ %s\n",
+		       rc == 0 ? "timed out" : "poll failed");
+		return rc == 0 ? -ETIMEDOUT : rc;
+	}
+	if (wc.status != IB_WC_SUCCESS) {
+		pr_err("write_imm completion error: %d\n", wc.status);
+		atomic64_inc(&edev->stats.completion_errors);
+		return -EIO;
+	}
+
+	atomic64_inc(&edev->stats.completions_polled);
+	atomic64_add(length, &edev->stats.bytes_sent);
+
+	if (elapsed_ns) {
+		*elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), start));
+		trace_dmaplane_rdma_write_imm(imm_data, length, *elapsed_ns);
+	}
+
+	pr_debug("write_imm OK — imm=0x%08x len=%u\n", imm_data, length);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_write_imm);
+
+/*
+ * rdma_engine_writeimm_post_recv — Post a recv WR for WRITEIMM consumption.
+ *
+ * Each RDMA WRITE WITH IMMEDIATE consumes one recv WR on the receiving QP.
+ * Posts a recv on qp_b (loopback) or qp_peer (cross-machine).
+ *
+ * Unlike the low-level rdma_engine_post_recv() which takes raw (qp, mr, wait),
+ * this handles MR lookup and QP selection from the UAPI use_peer_qp flag.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_writeimm_post_recv(struct dmaplane_dev *edev,
+				    uint32_t mr_id,
+				    uint32_t size,
+				    int use_peer_qp)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct dmaplane_mr_entry mr_copy;
+	struct ib_recv_wr wr = {};
+	struct ib_sge sge = {};
+	const struct ib_recv_wr *bad_wr;
+	struct ib_qp *qp;
+	int ret;
+
+	if (!ctx->initialized)
+		return -EINVAL;
+
+	if (use_peer_qp) {
+		if (!ctx->peer_connected)
+			return -ENOTCONN;
+		qp = ctx->qp_peer;
+	} else {
+		qp = ctx->qp_b;
+	}
+
+	/* Snapshot MR under lock */
+	mutex_lock(&edev->mr_lock);
+	{
+		struct dmaplane_mr_entry *mr;
+
+		mr = dmabuf_rdma_find_mr(edev, mr_id);
+		if (!mr) {
+			mutex_unlock(&edev->mr_lock);
+			return -ENOENT;
+		}
+		mr_copy = *mr;
+	}
+	mutex_unlock(&edev->mr_lock);
+
+	sge.addr = mr_copy.sge_addr;
+	sge.length = size;
+	sge.lkey = mr_copy.lkey;
+
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+
+	ret = ib_post_recv(qp, &wr, &bad_wr);
+	if (ret) {
+		pr_err("writeimm_post_recv: ib_post_recv failed: %d\n", ret);
+		return ret;
+	}
+
+	atomic64_inc(&edev->stats.recvs_posted);
+	pr_debug("writeimm_post_recv OK mr=%u size=%u peer=%d\n",
+		 mr_id, size, use_peer_qp);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_writeimm_post_recv);
+
+/*
+ * rdma_engine_writeimm_poll_recv — Poll recv CQ for WRITEIMM completion.
+ *
+ * RDMA WRITE WITH IMMEDIATE delivers the 32-bit immediate value through
+ * the receiver's CQ completion entry (wc.ex.imm_data).  This polls the
+ * recv CQ and extracts imm_data in host byte order (be32_to_cpu).
+ *
+ * Return semantics: the ioctl returns 0 even on timeout; the caller
+ * distinguishes success from timeout via status_out (0=success, 1=timeout).
+ * Only catastrophic WC errors return negative (-EIO).
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_writeimm_poll_recv(struct dmaplane_dev *edev,
+				    int use_peer_qp,
+				    uint32_t timeout_ms,
+				    uint32_t *status_out,
+				    uint32_t *wc_flags_out,
+				    uint32_t *imm_data_out,
+				    uint32_t *byte_len_out,
+				    uint64_t *elapsed_ns)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct ib_cq *cq;
+	struct ib_wc wc;
+	ktime_t start;
+	int rc;
+
+	if (!ctx->initialized)
+		return -EINVAL;
+
+	if (use_peer_qp) {
+		if (!ctx->peer_connected)
+			return -ENOTCONN;
+		cq = ctx->cq_peer;
+	} else {
+		cq = ctx->cq_b;
+	}
+
+	start = ktime_get();
+
+	rc = rdma_engine_poll_cq(cq, &wc, timeout_ms);
+	*elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), start));
+
+	if (rc == 0) {
+		/* Timeout — not an error, caller checks status */
+		*status_out = 1;
+		*wc_flags_out = 0;
+		*imm_data_out = 0;
+		*byte_len_out = 0;
+		return 0;
+	}
+	if (rc < 0) {
+		pr_err("writeimm_poll_recv: poll failed: %d\n", rc);
+		*status_out = (__u32)(-rc);
+		return rc;
+	}
+
+	/* Got a completion */
+	if (wc.status != IB_WC_SUCCESS) {
+		pr_err("writeimm_poll_recv: WC error status=%d\n", wc.status);
+		*status_out = wc.status;
+		atomic64_inc(&edev->stats.completion_errors);
+		return -EIO;
+	}
+
+	*status_out = 0;
+	*wc_flags_out = wc.wc_flags;
+	*imm_data_out = (wc.wc_flags & IB_WC_WITH_IMM) ?
+			be32_to_cpu(wc.ex.imm_data) : 0;
+	*byte_len_out = wc.byte_len;
+
+	atomic64_inc(&edev->stats.completions_polled);
+	atomic64_add(wc.byte_len, &edev->stats.bytes_received);
+
+	pr_debug("writeimm_poll_recv OK — imm=0x%08x len=%u\n",
+		 *imm_data_out, *byte_len_out);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_writeimm_poll_recv);

@@ -219,6 +219,27 @@ TRACE_EVENT(dmaplane_gpu_dma,
 		__entry->mbps)
 );
 
+/*
+ * dmaplane_rdma_write_imm — fires on each RDMA WRITE WITH IMMEDIATE.
+ * Records the 32-bit immediate, payload size, and send completion latency.
+ */
+TRACE_EVENT(dmaplane_rdma_write_imm,
+	TP_PROTO(__u32 imm_data, __u32 length, __u64 latency_ns),
+	TP_ARGS(imm_data, length, latency_ns),
+	TP_STRUCT__entry(
+		__field(__u32, imm_data)
+		__field(__u32, length)
+		__field(__u64, latency_ns)
+	),
+	TP_fast_assign(
+		__entry->imm_data = imm_data;
+		__entry->length = length;
+		__entry->latency_ns = latency_ns;
+	),
+	TP_printk("imm=0x%08x len=%u lat_ns=%llu",
+		__entry->imm_data, __entry->length, __entry->latency_ns)
+);
+
 #endif /* _DMAPLANE_TRACE_H */
 
 /* This part must be outside the header guard */

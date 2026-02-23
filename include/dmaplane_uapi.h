@@ -492,23 +492,23 @@ struct dmaplane_flow_stats {
 	__u64 total_sustained_ops;	/* out — cumulative sustained ops */
 };
 
-/* Phase 6 ioctl commands: flow control 0x60–0x63 */
+/* Phase 6 ioctl commands: flow control 0x40–0x43 */
 
 /* Configure credit-based flow control parameters. */
 #define DMAPLANE_IOCTL_CONFIGURE_FLOW \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x60, struct dmaplane_flow_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x40, struct dmaplane_flow_params)
 
 /* Run sustained streaming benchmark for a wall-clock duration. */
 #define DMAPLANE_IOCTL_SUSTAINED_STREAM \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x61, struct dmaplane_sustained_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x41, struct dmaplane_sustained_params)
 
 /* Run queue depth sweep: throughput/latency across queue depths. */
 #define DMAPLANE_IOCTL_QDEPTH_SWEEP \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x62, struct dmaplane_sweep_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x42, struct dmaplane_sweep_params)
 
 /* Get flow control statistics (racy snapshot). */
 #define DMAPLANE_IOCTL_GET_FLOW_STATS \
-	_IOR(DMAPLANE_IOC_MAGIC, 0x63, struct dmaplane_flow_stats)
+	_IOR(DMAPLANE_IOC_MAGIC, 0x43, struct dmaplane_flow_stats)
 
 /* ── Phase 7: Instrumentation ─────────────────────────────── */
 
@@ -663,39 +663,39 @@ struct dmaplane_gpu_stats {
 	__u64 gpu_mrs_registered;	/* out — lifetime GPU MRs registered */
 };
 
-/* Phase 8 ioctl commands: GPU 0x80–0x87 */
+/* Phase 8 ioctl commands: GPU 0x60–0x67 */
 
 /* Pin GPU VRAM; returns handle, page count, BAR1 consumed. */
 #define DMAPLANE_IOCTL_GPU_PIN \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x80, struct dmaplane_gpu_pin_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x60, struct dmaplane_gpu_pin_params)
 
 /* Unpin a GPU buffer by handle. */
 #define DMAPLANE_IOCTL_GPU_UNPIN \
-	_IOW(DMAPLANE_IOC_MAGIC, 0x81, struct dmaplane_gpu_unpin_params)
+	_IOW(DMAPLANE_IOC_MAGIC, 0x61, struct dmaplane_gpu_unpin_params)
 
 /* GPU VRAM → host DRAM transfer (memcpy_fromio). */
 #define DMAPLANE_IOCTL_GPU_DMA_TO_HOST \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x82, struct dmaplane_gpu_dma_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x62, struct dmaplane_gpu_dma_params)
 
 /* Host DRAM → GPU VRAM transfer (memcpy_toio). */
 #define DMAPLANE_IOCTL_GPU_DMA_FROM_HOST \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x83, struct dmaplane_gpu_dma_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x63, struct dmaplane_gpu_dma_params)
 
 /* Run bidirectional GPU BAR throughput benchmark. */
 #define DMAPLANE_IOCTL_GPU_BENCH \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x84, struct dmaplane_gpu_bench_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x64, struct dmaplane_gpu_bench_params)
 
 /* Register GPU BAR pages as an RDMA memory region. */
 #define DMAPLANE_IOCTL_GPU_REGISTER_MR \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x85, struct dmaplane_gpu_mr_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x65, struct dmaplane_gpu_mr_params)
 
 /* RDMA loopback: GPU MR → host MR via QP-A/QP-B. */
 #define DMAPLANE_IOCTL_GPU_LOOPBACK \
-	_IOWR(DMAPLANE_IOC_MAGIC, 0x86, struct dmaplane_gpu_loopback_params)
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x66, struct dmaplane_gpu_loopback_params)
 
 /* Get GPU statistics (racy snapshot). */
 #define DMAPLANE_IOCTL_GET_GPU_STATS \
-	_IOR(DMAPLANE_IOC_MAGIC, 0x87, struct dmaplane_gpu_stats)
+	_IOR(DMAPLANE_IOC_MAGIC, 0x67, struct dmaplane_gpu_stats)
 
 /* ── Phase 8: Peer RDMA (cross-machine) ──────────────────── */
 
@@ -757,5 +757,116 @@ struct dmaplane_rdma_remote_xfer_params {
 /* Destroy peer QP and CQ. */
 #define DMAPLANE_IOCTL_RDMA_DESTROY_PEER \
 	_IO(DMAPLANE_IOC_MAGIC, 0x94)
+
+/* ── Phase 9: RDMA WRITE with Immediate ──────────────────── */
+
+/*
+ * IB access flag constants — mirrors kernel IB_ACCESS_* values.
+ * Defined here so userspace can set access_flags without depending
+ * on rdma/ib_verbs.h.
+ */
+#define DMAPLANE_IB_ACCESS_LOCAL_WRITE	1
+#define DMAPLANE_IB_ACCESS_REMOTE_WRITE	(1 << 1)
+#define DMAPLANE_IB_ACCESS_REMOTE_READ	(1 << 2)
+
+/*
+ * RDMA WRITE with immediate data parameters.
+ *
+ * Posts IB_WR_RDMA_WRITE_WITH_IMM on the specified QP: writes 'length'
+ * bytes from local MR at local_offset to remote_addr (rkey), and delivers
+ * imm_data through the receiver's CQ completion.
+ *
+ * The receiver MUST have a recv WR posted — WRITE_WITH_IMM consumes one
+ * recv WR to deliver the immediate value.  Without a matching recv, the
+ * remote QP hits RNR (Receiver Not Ready) and retries until timeout.
+ *
+ * use_peer_qp: 0 = loopback QP-A→QP-B, 1 = cross-machine peer QP.
+ */
+struct dmaplane_write_imm_params {
+	__u32 local_mr_id;	/* in  — source MR */
+	__u32 length;		/* in  — bytes to write */
+	__u64 local_offset;	/* in  — offset within source MR */
+	__u64 remote_addr;	/* in  — destination address in remote MR */
+	__u32 remote_rkey;	/* in  — remote MR's rkey */
+	__u32 imm_data;		/* in  — 32-bit immediate value */
+	__u32 use_peer_qp;	/* in  — 0=loopback, 1=peer */
+	__u32 status;		/* out — WC status (0=success) */
+	__u64 elapsed_ns;	/* out — completion time */
+};
+/* Size: 48 bytes.  Python format: =IIQQIIIIQ */
+
+/*
+ * Post a receive WR.  Each posted recv can absorb one WRITE_WITH_IMM
+ * completion (the immediate data is delivered via the recv CQ entry).
+ * Must be called BEFORE the corresponding write_imm is sent.
+ *
+ * use_peer_qp: 0 = post on QP-B (loopback recv), 1 = post on qp_peer.
+ */
+struct dmaplane_post_recv_params {
+	__u32 mr_id;		/* in  — MR to receive into */
+	__u32 size;		/* in  — max recv size */
+	__u32 use_peer_qp;	/* in  — 0=loopback QP-B, 1=peer */
+	__u32 status;		/* out — 0=success */
+};
+/* Size: 16 bytes.  Python format: =IIII */
+
+/*
+ * Poll recv CQ for a WRITEIMM completion.  Blocks up to timeout_ms
+ * milliseconds.  On success, returns the 32-bit immediate data and
+ * byte length from the work completion.
+ *
+ * The ioctl returns 0 even on timeout; the caller distinguishes
+ * success from timeout via the status field (0=success, nonzero=timeout).
+ * Only catastrophic WC errors return negative from the ioctl.
+ *
+ * use_peer_qp: 0 = poll loopback CQ-B, 1 = poll peer CQ.
+ */
+struct dmaplane_poll_recv_params {
+	__u32 use_peer_qp;	/* in  — 0=loopback cq_b, 1=peer cq_peer */
+	__u32 timeout_ms;	/* in  — max wait time */
+	__u32 status;		/* out — WC status (0=success) */
+	__u32 wc_flags;		/* out — IB_WC_WITH_IMM etc */
+	__u32 imm_data;		/* out — immediate data from sender */
+	__u32 byte_len;		/* out — RDMA payload size */
+	__u64 elapsed_ns;	/* out — poll elapsed time */
+};
+/* Size: 32 bytes.  Python format: =IIIIIIQ */
+
+/* Phase 9 ioctl commands: WRITEIMM 0x80–0x82 */
+
+/* Post RDMA WRITE WITH IMMEDIATE (data + 32-bit immediate). */
+#define DMAPLANE_IOCTL_RDMA_WRITE_IMM \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x80, struct dmaplane_write_imm_params)
+
+/* Post a recv WR to absorb one WRITEIMM completion. */
+#define DMAPLANE_IOCTL_RDMA_POST_RECV \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x81, struct dmaplane_post_recv_params)
+
+/* Poll recv CQ for WRITEIMM completion; returns imm_data + byte_len. */
+#define DMAPLANE_IOCTL_RDMA_POLL_RECV \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x82, struct dmaplane_poll_recv_params)
+
+/* ── Shorthand aliases for userspace convenience ─────────── */
+
+#ifndef __KERNEL__
+/* Buffer type constants */
+#define BUF_TYPE_COHERENT	DMAPLANE_BUF_TYPE_COHERENT
+#define BUF_TYPE_PAGES		DMAPLANE_BUF_TYPE_PAGES
+
+/* Ioctl short names — used by kvcache_common.h and dmaplane_py.py */
+#define IOCTL_CREATE_BUFFER	DMAPLANE_IOCTL_CREATE_BUFFER
+#define IOCTL_DESTROY_BUFFER	DMAPLANE_IOCTL_DESTROY_BUFFER
+#define IOCTL_GET_MMAP_INFO	DMAPLANE_IOCTL_GET_MMAP_INFO
+#define IOCTL_SETUP_RDMA	DMAPLANE_IOCTL_SETUP_RDMA
+#define IOCTL_TEARDOWN_RDMA	DMAPLANE_IOCTL_TEARDOWN_RDMA
+#define IOCTL_REGISTER_MR	DMAPLANE_IOCTL_REGISTER_MR
+#define IOCTL_DEREGISTER_MR	DMAPLANE_IOCTL_DEREGISTER_MR
+#define IOCTL_GPU_PIN		DMAPLANE_IOCTL_GPU_PIN
+#define IOCTL_GPU_UNPIN		DMAPLANE_IOCTL_GPU_UNPIN
+#define IOCTL_GPU_REGISTER_MR	DMAPLANE_IOCTL_GPU_REGISTER_MR
+#define IOCTL_RDMA_WRITE_IMM	DMAPLANE_IOCTL_RDMA_WRITE_IMM
+#define IOCTL_RDMA_POST_RECV	DMAPLANE_IOCTL_RDMA_POST_RECV
+#define IOCTL_RDMA_POLL_RECV	DMAPLANE_IOCTL_RDMA_POLL_RECV
+#endif /* !__KERNEL__ */
 
 #endif /* _DMAPLANE_UAPI_H */
