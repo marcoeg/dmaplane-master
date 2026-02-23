@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 4 — RDMA Integration
+## Current State: Phase 5 — NUMA, Topology & Optimization
 
 ## Licensing
 
@@ -35,9 +35,9 @@ The userspace-visible API header. This is the primary definition point for all t
 
 **Phase 2 additions:**
 - Buffer type constants: `DMAPLANE_BUF_TYPE_COHERENT` (0), `DMAPLANE_BUF_TYPE_PAGES` (1)
-- Buffer creation parameters (`dmaplane_buf_params`): `__u32 buf_id` (out), `__u32 alloc_type` (in), `__u64 size` (in)
+- Buffer creation parameters (`dmaplane_buf_params`): `__u32 buf_id` (out), `__u32 alloc_type` (in), `__u64 size` (in), `__s32 numa_node` (in, `-1` = DMAPLANE_NUMA_ANY), `__s32 actual_numa_node` (out)
 - mmap info (`dmaplane_mmap_info`): `__u32 buf_id` (in), `__u64 mmap_offset` (out), `__u64 mmap_size` (out)
-- Buffer stats (`dmaplane_buf_stats`): `__u64 buffers_created`, `__u64 buffers_destroyed`
+- Buffer stats (`dmaplane_buf_stats`): `__u64 buffers_created`, `__u64 buffers_destroyed`, `__u64 numa_local_allocs`, `__u64 numa_remote_allocs`, `__u64 numa_anon_allocs`
 - Ioctl commands: `DMAPLANE_IOCTL_CREATE_BUFFER` (`_IOWR`, 0x05), `DMAPLANE_IOCTL_DESTROY_BUFFER` (`_IOW`, 0x06, bare `__u32`), `DMAPLANE_IOCTL_GET_MMAP_INFO` (`_IOWR`, 0x08), `DMAPLANE_IOCTL_GET_BUF_STATS` (`_IOR`, 0x09)
 
 **Phase 3 additions:**
@@ -53,6 +53,13 @@ The userspace-visible API header. This is the primary definition point for all t
 - RDMA stats (`dmaplane_rdma_stats`): 8 `__u64` counters — `mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`
 - Ioctl commands: `DMAPLANE_IOCTL_SETUP_RDMA` (`_IOWR`, 0x10), `DMAPLANE_IOCTL_TEARDOWN_RDMA` (`_IO`, 0x11), `DMAPLANE_IOCTL_REGISTER_MR` (`_IOWR`, 0x20), `DMAPLANE_IOCTL_DEREGISTER_MR` (`_IOW`, 0x21, bare `__u32`), `DMAPLANE_IOCTL_LOOPBACK_TEST` (`_IOWR`, 0x30), `DMAPLANE_IOCTL_PINGPONG_BENCH` (`_IOWR`, 0x31), `DMAPLANE_IOCTL_STREAMING_BENCH` (`_IOWR`, 0x32), `DMAPLANE_IOCTL_GET_RDMA_STATS` (`_IOR`, 0x33)
 
+**Phase 5 additions:**
+- NUMA constant: `DMAPLANE_NUMA_ANY` (-1) — allocate on current CPU's local node
+- `DMAPLANE_MAX_NUMA_NODES` (8) — max nodes in topology/benchmark arrays
+- NUMA topology (`dmaplane_numa_topo`): `__u32 nr_nodes` (out), `__u32 nr_cpus` (out), per-node CPU counts, online flags, memory sizes (total/free KB), `__u32 distances[8][8]` (ACPI SLIT matrix)
+- NUMA benchmark (`dmaplane_numa_bench_params`): `__u64 buffer_size` (in), `__u32 iterations` (in), `__u64 bw_mbps[8][8]` (out), `__u64 lat_ns[8][8]` (out), `__u32 nr_nodes` (out), `__u32 status` (out)
+- Ioctl commands: `DMAPLANE_IOCTL_QUERY_NUMA_TOPO` (`_IOR`, 0x50), `DMAPLANE_IOCTL_NUMA_BENCH` (`_IOWR`, 0x51)
+
 All userspace consumers (`tests/`, `examples/misc/`) include this header via `-I../include` or `-I../../include`.
 
 ### `driver/dmaplane.h`
@@ -61,9 +68,9 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 **Kernel-internal types:**
 - `struct dmaplane_ring`: array of `dmaplane_ring_entry[RING_SIZE]`, `spinlock_t lock`, `unsigned int head` (producer writes, `____cacheline_aligned_in_smp`), `unsigned int tail` (consumer reads, `____cacheline_aligned_in_smp`). Head and tail are monotonically increasing — modulo is applied only when indexing into the array. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`.
-- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`, plus Phase 4 RDMA counters: `atomic64_t mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`. All counters are device-level (survive individual resource cycles). Safe for concurrent updates and reads.
+- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`, plus Phase 4 RDMA counters: `atomic64_t mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`, plus Phase 5 NUMA counters: `atomic64_t numa_local_allocs`, `numa_remote_allocs`, `numa_anon_allocs`. All counters are device-level (survive individual resource cycles). Safe for concurrent updates and reads.
 - `struct dmaplane_channel`: `struct kref refcount` (channel lifetime), `struct mutex lock` (per-channel state lock), `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use, set to false by kref release callback), `struct dmaplane_stats_kern stats` (atomic counters).
-- `struct dmaplane_buffer` (Phase 2+3): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped). Phase 3 additions: `bool dmabuf_exported` (prevents double export and blocks DESTROY_BUFFER while a dma-buf wraps this buffer, set/cleared under `buf_lock`), `struct dma_buf *dmabuf` (back-pointer, NULL when not exported).
+- `struct dmaplane_buffer` (Phase 2+3): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped). Phase 3 additions: `bool dmabuf_exported` (prevents double export and blocks DESTROY_BUFFER while a dma-buf wraps this buffer, set/cleared under `buf_lock`), `struct dma_buf *dmabuf` (back-pointer, NULL when not exported). Phase 5 additions: `int numa_node` (requested NUMA node, -1 = DMAPLANE_NUMA_ANY), `int actual_numa_node` (actual node where majority of pages landed, determined post-hoc via `page_to_nid`).
 - `struct poll_cq_wait` (Phase 4): managed CQ completion wait — `struct ib_cqe cqe` (callback entry, `.done = poll_cq_done`), `struct ib_wc wc` (stashed work completion), `struct completion done` (signaled by callback). Used with `IB_POLL_DIRECT` CQs.
 - `struct dmaplane_mr_entry` (Phase 4): per-MR tracking — `__u32 id`, `__u32 buf_id`, `struct ib_mr *mr` (NULL for local-only, non-NULL for fast-reg), `__u32 lkey`, `__u32 rkey`, `__u64 sge_addr` (kernel VA for rxe, IOMMU addr for real HW), `struct sg_table *sgt`, `int sgt_nents`, `bool in_use`, `ktime_t reg_time`. Two paths: local-only uses `pd->local_dma_lkey` (rkey=0), fast-reg uses `ib_alloc_mr` + `IB_WR_REG_MR` for remote access.
 - `struct dmaplane_rdma_ctx` (Phase 4): RDMA connection context — `struct ib_device *ib_dev`, `struct ib_pd *pd`, `struct ib_cq *cq_a`/`*cq_b` (loopback CQs), `struct ib_qp *qp_a`/`*qp_b` (loopback QPs), `__u8 port`, `__u16 lid`, `int gid_index`, `union ib_gid gid`, `bool initialized`. The loopback pair (QP-A sends, QP-B receives) benchmarks the full DMA data path without a remote peer.
@@ -169,12 +176,14 @@ Header declaring three buffer management functions with locking contracts: `dmab
 Buffer allocation and lookup. Two allocation paths:
 
 **`dmabuf_rdma_create_buffer`**:
-- Validates size (> 0, <= 1 GB) and alloc_type. Acquires `buf_lock`, linear scan for free slot.
-- Zeroes the slot via `memset` to clear stale pointers from a previous occupant.
-- Assigns `next_buf_id++` (wraps to 1, skipping 0 — sentinel for "no buffer").
-- **Coherent path** (`BUF_TYPE_COHERENT`): `dma_alloc_coherent(&dev->pdev->dev, ...)` + `memset` zero. Returns physically contiguous, cache-coherent memory with a single DMA address.
-- **Page-backed path** (`BUF_TYPE_PAGES`): `kvcalloc` page array, `alloc_page(GFP_KERNEL | __GFP_ZERO)` loop with unwind on failure (frees all previously allocated pages), `vmap()` for contiguous kernel VA. `__GFP_ZERO` prevents leaking kernel data to userspace via mmap.
-- All three error paths (no slots, allocation failure, vmap failure) properly unwind with reverse-order cleanup.
+- Validates size (> 0, <= 1 GB), alloc_type, and NUMA node (Phase 5). NUMA validation happens before `buf_lock` — rejects invalid/offline nodes with `-EINVAL`. `DMAPLANE_NUMA_ANY` (-1) is always valid.
+- Acquires `buf_lock`, linear scan for free slot. Zeroes the slot via `memset` to clear stale pointers from a previous occupant.
+- Assigns `next_buf_id++` (wraps to 1, skipping 0 — sentinel for "no buffer"). Stores `buf->numa_node = target_node`.
+- **Coherent path** (`BUF_TYPE_COHERENT`): `dma_alloc_coherent(&dev->pdev->dev, ...)` + `memset` zero. Cannot be NUMA-steered — `dma_alloc_coherent` has no node parameter. Reports actual placement post-hoc via `page_to_nid(virt_to_page(buf->vaddr))`.
+- **Page-backed path** (`BUF_TYPE_PAGES`): `kvcalloc` page array, `alloc_pages_node(alloc_node, GFP_KERNEL | __GFP_ZERO, 0)` loop where `alloc_node = NUMA_NO_NODE` for `NUMA_ANY` or the target node ID. Post-hoc verification via `page_to_nid()` on each page tracks local/remote counts. After the page loop, majority vote determines `actual_numa_node`. Warns via `pr_warn` if any pages are misplaced. `vmap()` for contiguous kernel VA.
+- Sets `params->actual_numa_node = buf->actual_numa_node` before returning to userspace.
+- Increments one of `numa_local_allocs`, `numa_remote_allocs`, or `numa_anon_allocs` per buffer.
+- All error paths (no slots, allocation failure, vmap failure) properly unwind with reverse-order cleanup.
 
 **`dmabuf_rdma_destroy_buffer`**:
 - Acquires `buf_lock`, finds buffer. Refuses with `-EBUSY` if `mmap_count > 0` or `dmabuf_exported` (Phase 3 guard — buffer cannot be destroyed while a dma-buf wraps it).
@@ -314,6 +323,20 @@ Userspace test suite for Phase 4 RDMA integration. Auto-detects the rxe device b
 8. **MR deregistration** — deregister MR, verify. Non-existent returns `-ENOENT`
 9. **RDMA stats** — verify `sends_posted`, `completions_polled` > 0, `completion_errors == 0`
 10. **Teardown + re-initialization** — teardown, loopback-after-teardown fails, re-setup succeeds
+
+### `tests/test_phase5_numa.c`
+
+Userspace test suite for Phase 5 NUMA topology and optimization. Opens `/dev/dmaplane`, exercises NUMA-aware buffer allocation, topology query, cross-node bandwidth benchmark, and regression with `DMAPLANE_NUMA_ANY`. Includes helpers: `create_buffer` (with `numa_node` and `actual_node` parameters), `destroy_buffer`.
+
+**Test cases:**
+1. **Topology query** — call `QUERY_NUMA_TOPO`, verify `nr_nodes >= 1`, `nr_cpus >= 1`, at least one `node_online[i] == 1`, `distance[0][0] == 10`. Print full topology: nodes, CPUs per node, memory, distance matrix.
+2. **Allocate on node 0** — page-backed buffer with `numa_node = 0`, verify `actual_numa_node == 0`
+3. **Allocate with NUMA_ANY** — page-backed buffer with `numa_node = -1`, verify `actual_numa_node >= 0`
+4. **Invalid node (must fail)** — request node 99, verify `-EINVAL`
+5. **Coherent NUMA reporting** — coherent buffer with `numa_node = 0`, verify `actual_numa_node >= 0` (informational — coherent cannot be steered)
+6. **NUMA stats** — call `GET_BUF_STATS`, verify `numa_local_allocs + numa_remote_allocs + numa_anon_allocs > 0`
+7. **Cross-node bandwidth benchmark** — `NUMA_BENCH` with 1 MB, 100 iterations. Print NxN bandwidth matrix. On single-node, print 1x1 result. On multi-node, compute and print penalty ratios.
+8. **Regression with NUMA_ANY** — create buffer, mmap, write/read `0xDEAD0000|i` pattern, munmap, destroy. Verifies NUMA fields didn't break existing functionality.
 
 ---
 
