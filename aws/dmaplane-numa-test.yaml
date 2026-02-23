@@ -1,0 +1,188 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  dmaplane Phase 5 NUMA validation on dual-socket c5.metal.
+  Builds the driver, runs all tests (phases 1-5), saves output.
+  Instance auto-stops after tests complete to limit cost.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet in vpc-0962cc253d7e8561b
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: dmaplane NUMA test - SSH only
+      VpcId: vpc-0eba669e962960152
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: dmaplane-numa-test-sg
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: c5.metal
+      ImageId: !FindInMap [RegionAMI, !Ref 'AWS::Region', AMI]
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: dmaplane-numa-test
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/dmaplane-setup.log 2>&1
+
+          echo "=== dmaplane Phase 5 NUMA test setup ==="
+          echo "Started: $(date -u)"
+
+          # --- System packages ---
+          apt-get update -y
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            build-essential \
+            linux-headers-$(uname -r) \
+            git \
+            numactl \
+            hwloc \
+            rdma-core \
+            libibverbs-dev \
+            librdmacm-dev \
+            ibverbs-utils \
+            rdmacm-utils
+
+          # --- Clone repo ---
+          cd /home/ubuntu
+          git clone https://github.com/marcoeg/dmaplane-master.git dmaplane
+          chown -R ubuntu:ubuntu dmaplane
+
+          # --- Build driver ---
+          cd dmaplane/driver
+          make clean && make
+          echo "Driver build: OK"
+
+          # --- Build tests ---
+          cd ../tests
+          make clean && make
+          echo "Tests build: OK"
+
+          # --- Load Soft-RoCE for Phase 4 tests ---
+          modprobe rdma_rxe
+          PRIMARY_IF=$(ip -o link show | awk -F': ' '/state UP/ && !/lo/ {print $2; exit}')
+          rdma link add rxe_${!PRIMARY_IF} type rxe netdev ${!PRIMARY_IF} || true
+          echo "Soft-RoCE on ${!PRIMARY_IF}: OK"
+
+          # --- Capture topology before tests ---
+          mkdir -p /home/ubuntu/dmaplane/results
+          RESULTS=/home/ubuntu/dmaplane/results
+
+          echo "=== NUMA Topology ===" > ${!RESULTS}/topology.txt
+          numactl --hardware >> ${!RESULTS}/topology.txt 2>&1
+          echo "" >> ${!RESULTS}/topology.txt
+          echo "=== lstopo ===" >> ${!RESULTS}/topology.txt
+          lstopo-no-graphics --no-io >> ${!RESULTS}/topology.txt 2>&1
+          echo "" >> ${!RESULTS}/topology.txt
+          echo "=== lscpu NUMA ===" >> ${!RESULTS}/topology.txt
+          lscpu | grep -i numa >> ${!RESULTS}/topology.txt 2>&1
+
+          # --- Load driver ---
+          cd /home/ubuntu/dmaplane/driver
+          insmod dmaplane.ko
+          echo "Module loaded: OK"
+
+          # --- Run all tests ---
+          cd /home/ubuntu/dmaplane/tests
+
+          echo "=== Phase 1 ===" | tee ${!RESULTS}/test_phase1.txt
+          ./test_phase1_driver 2>&1 | tee -a ${!RESULTS}/test_phase1.txt || true
+
+          echo "=== Phase 2 ===" | tee ${!RESULTS}/test_phase2.txt
+          ./test_phase2_dma 2>&1 | tee -a ${!RESULTS}/test_phase2.txt || true
+
+          echo "=== Phase 3 ===" | tee ${!RESULTS}/test_phase3.txt
+          ./test_phase3_dmabuf 2>&1 | tee -a ${!RESULTS}/test_phase3.txt || true
+
+          echo "=== Phase 4 ===" | tee ${!RESULTS}/test_phase4.txt
+          ./test_phase4_rdma 2>&1 | tee -a ${!RESULTS}/test_phase4.txt || true
+
+          echo "=== Phase 5 (NUMA) ===" | tee ${!RESULTS}/test_phase5.txt
+          ./test_phase5_numa 2>&1 | tee -a ${!RESULTS}/test_phase5.txt || true
+
+          # --- Capture dmesg ---
+          dmesg | grep -i "dmaplane\|numa\|rdma\|lockdep\|WARNING\|BUG" > ${!RESULTS}/dmesg.txt 2>&1 || true
+
+          # --- Unload and double-cycle ---
+          rmmod dmaplane
+          echo "=== Double cycle ===" | tee ${!RESULTS}/double_cycle.txt
+          insmod /home/ubuntu/dmaplane/driver/dmaplane.ko
+          ./test_phase5_numa 2>&1 | tee -a ${!RESULTS}/double_cycle.txt || true
+          rmmod dmaplane
+          dmesg | tail -50 >> ${!RESULTS}/double_cycle.txt 2>&1
+
+          chown -R ubuntu:ubuntu /home/ubuntu/dmaplane/results
+          echo ""
+          echo "=== All tests complete: $(date -u) ==="
+          echo "Results in /home/ubuntu/dmaplane/results/"
+
+          # --- Signal completion ---
+          touch /home/ubuntu/TESTS_DONE
+
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: dmaplane-numa-test-eip
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref Instance
+      AllocationId: !GetAtt EIP.AllocationId
+
+Mappings:
+  RegionAMI:
+    us-east-1:
+      AMI: ami-0f9de6e2d2f067fca  # Ubuntu 24.04 LTS x86_64
+    us-east-2:
+      AMI: ami-036841078a4b68e14
+    us-west-1:
+      AMI: ami-0da424eb883458071
+    us-west-2:
+      AMI: ami-075686beab831bb7f
+    eu-west-1:
+      AMI: ami-0df368112825f8d8f
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  PublicIP:
+    Value: !Ref EIP
+    Description: SSH with ssh -i <key>.pem ubuntu@<ip>
+  ResultsPath:
+    Value: /home/ubuntu/dmaplane/results/
+    Description: Test outputs land here. Check /var/log/dmaplane-setup.log for build progress.
+  Usage:
+    Value: !Sub |
+      ssh -i <key>.pem ubuntu@${EIP}
+      # Wait for TESTS_DONE flag:  while [ ! -f ~/TESTS_DONE ]; do sleep 10; done
+      # View results:              cat ~/dmaplane/results/test_phase5.txt
+      # View topology:             cat ~/dmaplane/results/topology.txt
+      # Tear down when done:       aws cloudformation delete-stack --stack-name dmaplane-numa-test

@@ -96,18 +96,21 @@ NUMA Distance Matrix:
   node0  10
 ```
 
-On a dual-socket production server (2x Intel Xeon, 8 NUMA nodes with Sub-NUMA Clustering), the matrix expands:
+On a dual-socket c5.metal (2x Xeon Platinum 8124M):
 
 ```
+NUMA Topology:
+  Nodes: 2   CPUs: 96
+  Node 0: 48 CPUs, 97936 MB total, 93898 MB free
+  Node 1: 48 CPUs, 98304 MB total, 95615 MB free
+
 NUMA Distance Matrix:
-         node0  node1  node2  node3
-  node0  10     21     21     21
-  node1  21     10     21     21
-  node2  21     21     10     21
-  node3  21     21     21     10
+       node0  node1
+  node0 10     21
+  node1 21     10
 ```
 
-The asymmetry between 10 (local) and 21 (remote) is the penalty factor. A distance of 21 means remote access costs roughly 2.1x local access in latency. Bandwidth penalties are typically 30-50%, not 2.1x, because bandwidth depends on link width and saturation, not just hop count.
+The asymmetry between 10 (local) and 21 (remote) is the penalty factor. A distance of 21 means remote access costs roughly 2.1x local access in latency. Bandwidth penalties are lower than the latency ratio suggests -- 18% on this Skylake-SP platform with 64 MB buffers -- because bandwidth depends on link width and saturation, not just hop count. On older microarchitectures or 4-socket systems with 2-hop paths (distance 30+), the bandwidth penalty grows to 40-60%.
 
 ---
 
@@ -131,28 +134,45 @@ The benchmark uses plain `memcpy` rather than DMA operations. CPU memcpy measure
 
 Both buffers are touched with `memset` before timing begins, ensuring all pages are faulted in. Without this warmup, the first iteration includes page fault overhead that distorts the measurement.
 
-On a single-socket workstation (32 CPUs, 1 NUMA node, ~130 GB RAM), the benchmark produces a 1x1 matrix:
+On a single-socket development workstation, the benchmark produces a 1x1 matrix with only local bandwidth -- the interesting case requires multi-socket hardware.
 
-```
-Single-node system -- no cross-node penalty to measure.
-Local bandwidth: 49675 MB/s
-```
+On a dual-socket c5.metal (2x Xeon Platinum 8124M, 96 CPUs, 36 MB L3 per socket), the results depend critically on buffer size.
 
-On a dual-socket system, the expected output is a 2x2 matrix:
+With 1 MB buffers:
 
 ```
 Cross-Node Bandwidth Matrix (MB/s):
   cpu\buf | node0  | node1  |
-  --------|---------|---------
-  node0   | 48200  | 28900  |
-  node1   | 29100  | 47800  |
+  ------------------------
+  node0   |  8015  |  8983  |
+  node1   |  8945  |  9637  |
 
 Cross-Node Penalty Analysis:
-  node0 -> node1: 40% penalty (28900 vs 48200 MB/s)
-  node1 -> node0: 39% penalty (29100 vs 47800 MB/s)
+  node0 -> node1: 0% penalty (8983 vs 8015 MB/s)
+  node1 -> node0: 8% penalty (8945 vs 9637 MB/s)
 ```
 
-The diagonal entries (local bandwidth) are roughly symmetric. The off-diagonal entries (cross-node bandwidth) show the 30-40% penalty that the ACPI SLIT distance of 21 predicts. On a 4-socket system with 2-hop paths, the penalty for distance-30 nodes can exceed 60%.
+No penalty. Remote is actually *faster* for node 0. This is wrong -- or rather, it is measuring the wrong thing. Both the 1 MB source and 1 MB destination fit entirely in the 36 MB L3 cache. After the `memset` pre-touch, both buffers are L3-resident. The benchmark is measuring cache-to-cache bandwidth, not DRAM-to-DRAM bandwidth. The NUMA penalty is invisible because the data never leaves the cache hierarchy.
+
+With 64 MB buffers (exceeding the 36 MB L3):
+
+```
+Cross-Node Bandwidth Matrix (MB/s):
+  cpu\buf | node0  | node1  |
+  ------------------------
+  node0   |  6778  |  5577  |
+  node1   |  5013  |  6095  |
+
+Cross-Node Penalty Analysis:
+  node0 -> node1: 18% penalty (5577 vs 6778 MB/s)
+  node1 -> node0: 18% penalty (5013 vs 6095 MB/s)
+```
+
+Now the penalty is visible and symmetric. Local access averages ~6.4 GB/s, remote ~5.3 GB/s, an 18% penalty in both directions. The 64 MB working set exceeds L3 capacity, forcing the memcpy to stream from DRAM, and cross-node access pays the UPI interconnect cost.
+
+The 18% penalty on Skylake-SP is lower than the 40-50% seen on older Broadwell Xeons. Intel's wider UPI mesh in the Skylake generation narrows the gap. But 18% still compounds: across thousands of all-reduce iterations in a training run, an 18% throughput loss on every gradient transfer adds up to hours of wasted compute.
+
+**The L3 caching effect is itself a lesson.** Production gradient buffers and KV-cache blocks are hundreds of megabytes to gigabytes -- they will never fit in L3. But microbenchmarks often use small buffers for speed, and the results look great because the cache hides the penalty. Any NUMA benchmark that reports zero cross-node penalty should be suspected of measuring cache, not memory. The fix is simple: use buffers larger than the last-level cache. On a 4-socket system with 2-hop paths and distance-30 nodes, the penalty at DRAM-scale buffers can exceed 60%.
 
 ---
 
@@ -166,16 +186,16 @@ The NUMA benchmark measures exactly this cost at the CPU-to-memory level. The sa
 
 ## Single-Socket Development: What You See vs. Production
 
-**On a single-socket workstation, all NUMA tests pass with trivial results.** One node, 32 CPUs, a 1x1 distance matrix with `distance[0][0] = 10`, and all allocations landing on node 0:
+**On a single-socket workstation, all NUMA tests pass with trivial results.** One node, a 1x1 distance matrix with `distance[0][0] = 10`, and all allocations landing on node 0. On the dual-socket c5.metal, the stats after running the full regression suite (phases 1-5) show:
 
 ```
 NUMA Stats:
   numa_local_allocs:  2
   numa_remote_allocs: 0
-  numa_anon_allocs:   1
+  numa_anon_allocs:   1093
 ```
 
-This is correct and expected. The code exercises the same allocation paths, topology queries, and benchmark machinery that a multi-socket system uses. The difference is that production hardware produces a matrix that reveals real penalties, while the development machine confirms the code works without exercising the interesting case.
+The 1093 anonymous allocations come from Phase 2/3/4 regression tests, all using `DMAPLANE_NUMA_ANY`. The 2 local allocations are from Phase 5's explicit node-0 tests. Zero remote allocations confirms that with 94 GB free per node, the buddy allocator never falls back. After a clean module reload (double-cycle test), the stats reset to `local=2, remote=0, anon=1` -- only Phase 5's own allocations.
 
 The test suite validates eight scenarios: topology query, allocation on a specific node, NUMA_ANY allocation, invalid node rejection, coherent buffer NUMA reporting, NUMA stats counters, the cross-node benchmark, and a regression test that confirms mmap-and-pattern-write still works with NUMA-aware allocation. All eight pass on single-socket hardware. On multi-socket hardware, the benchmark test additionally reveals the penalty matrix.
 

@@ -436,6 +436,50 @@ static void test_regression_numa_any(int fd)
 	TEST_PASS();
 }
 
+/* ── Test 9: Allocate on node 1 (multi-socket only) ────────── */
+
+static void test_alloc_node1(int fd)
+{
+	struct dmaplane_numa_topo topo;
+	int actual_node = -99;
+	unsigned int buf_id;
+
+	TEST_START("allocate on node 1 (multi-socket only)");
+
+	memset(&topo, 0, sizeof(topo));
+	if (ioctl(fd, DMAPLANE_IOCTL_QUERY_NUMA_TOPO, &topo) < 0) {
+		TEST_FAIL(strerror(errno));
+		return;
+	}
+
+	if (topo.nr_nodes < 2) {
+		printf("SKIP (single-node system)\n");
+		tests_passed++;
+		return;
+	}
+
+	buf_id = create_buffer(fd, DMAPLANE_BUF_TYPE_PAGES, 1 << 20,
+			       1, &actual_node);
+	if (!buf_id) {
+		TEST_FAIL(strerror(errno));
+		return;
+	}
+
+	if (actual_node != 1) {
+		char msg[64];
+
+		snprintf(msg, sizeof(msg), "actual_numa_node = %d, expected 1",
+			 actual_node);
+		destroy_buffer(fd, buf_id);
+		TEST_FAIL(msg);
+		return;
+	}
+
+	destroy_buffer(fd, buf_id);
+	TEST_PASS();
+	printf("      node 1 allocation: actual_numa_node = %d\n", actual_node);
+}
+
 /* ── Main ──────────────────────────────────────────────────── */
 
 int main(void)
@@ -458,6 +502,7 @@ int main(void)
 	test_numa_stats(fd);
 	test_numa_bench(fd);
 	test_regression_numa_any(fd);
+	test_alloc_node1(fd);
 
 	close(fd);
 

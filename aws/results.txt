@@ -1,0 +1,332 @@
+ubuntu@ip-10-0-0-144:~/dmaplane/tests$ sudo ./test_phase5_numa 2>&1 | tee ~/dmaplane/results/test_phase5.txt
+
+
+=== Phase 5: NUMA Topology & Optimization Tests ===
+
+  [1] NUMA topology query                                PASS
+
+    NUMA Topology:
+      Nodes: 2   CPUs: 96
+      Node 0: 48 CPUs, 97936 MB total, 93898 MB free
+      Node 1: 48 CPUs, 98304 MB total, 95615 MB free
+
+    NUMA Distance Matrix:
+           node0  node1  
+      node0 10     21     
+      node1 21     10     
+
+  [2] allocate page-backed buffer on node 0              PASS
+      actual_numa_node = 0
+  [3] allocate page-backed buffer with NUMA_ANY          PASS
+      actual_numa_node = 0
+  [4] invalid NUMA node (99) returns EINVAL              PASS
+  [5] coherent buffer NUMA reporting (informational)     PASS
+      requested=0, actual=0 (coherent cannot be steered)
+  [6] NUMA stats (via GET_BUF_STATS)                     PASS
+
+    Phase 5 NUMA Stats:
+      numa_local_allocs:  2
+      numa_remote_allocs: 0
+      numa_anon_allocs:   1093
+
+  [7] cross-node bandwidth benchmark                     PASS
+
+    Cross-Node Bandwidth Matrix (MB/s):
+      cpu\buf | node0  | node1  |
+      ------------------------
+      node0  |  8015  |  8983  |
+      node1  |  8945  |  9637  |
+
+    Cross-Node Penalty Analysis:
+      node0 -> node1: 0% penalty (8983 vs 8015 MB/s)
+      node1 -> node0: 8% penalty (8945 vs 9637 MB/s)
+
+  [8] regression: buffer + mmap + pattern with NUMA_ANY  PASS
+
+=== Results: 8 passed, 0 failed ===
+
+
+ubuntu@ip-10-0-0-144:~/dmaplane/tests$ sudo ./test_phase5_numa 2>&1 | tee ~/dmaplane/results/double_cycle.txt
+=== Phase 5: NUMA Topology & Optimization Tests ===
+
+  [1] NUMA topology query                                PASS
+
+    NUMA Topology:
+      Nodes: 2   CPUs: 96
+      Node 0: 48 CPUs, 97936 MB total, 93934 MB free
+      Node 1: 48 CPUs, 98304 MB total, 95614 MB free
+
+    NUMA Distance Matrix:
+           node0  node1  
+      node0 10     21     
+      node1 21     10     
+
+  [2] allocate page-backed buffer on node 0              PASS
+      actual_numa_node = 0
+  [3] allocate page-backed buffer with NUMA_ANY          PASS
+      actual_numa_node = 0
+  [4] invalid NUMA node (99) returns EINVAL              PASS
+  [5] coherent buffer NUMA reporting (informational)     PASS
+      requested=0, actual=0 (coherent cannot be steered)
+  [6] NUMA stats (via GET_BUF_STATS)                     PASS
+
+    Phase 5 NUMA Stats:
+      numa_local_allocs:  2
+      numa_remote_allocs: 0
+      numa_anon_allocs:   1
+
+  [7] cross-node bandwidth benchmark                     PASS
+
+    Cross-Node Bandwidth Matrix (MB/s):
+      cpu\buf | node0  | node1  |
+      ------------------------
+      node0  |  7850  |  8768  |
+      node1  |  8677  |  9384  |
+
+    Cross-Node Penalty Analysis:
+      node0 -> node1: 0% penalty (8768 vs 7850 MB/s)
+      node1 -> node0: 8% penalty (8677 vs 9384 MB/s)
+
+  [8] regression: buffer + mmap + pattern with NUMA_ANY  PASS
+
+=== Results: 8 passed, 0 failed ===
+
+
+ubuntu@ip-10-0-0-144:~/dmaplane/tests$ numactl --hardware
+available: 2 nodes (0-1)
+node 0 cpus: 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65 66 67 68 69 70 71
+node 0 size: 96281 MB
+node 0 free: 93968 MB
+node 1 cpus: 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 72 73 74 75 76 77 78 79 80 81 82 83 84 85 86 87 88 89 90 91 92 93 94 95
+node 1 size: 96745 MB
+node 1 free: 95633 MB
+node distances:
+node   0   1 
+  0:  10  21 
+  1:  21  10 
+
+ubuntu@ip-10-0-0-144:~/dmaplane/tests$ lstopo-no-graphics --no-io 
+Machine (189GB total)
+  Package L#0
+    NUMANode L#0 (P#0 94GB)
+    L3 L#0 (36MB)
+      L2 L#0 (1024KB) + L1d L#0 (32KB) + L1i L#0 (32KB) + Core L#0
+        PU L#0 (P#0)
+        PU L#1 (P#48)
+      L2 L#1 (1024KB) + L1d L#1 (32KB) + L1i L#1 (32KB) + Core L#1
+        PU L#2 (P#1)
+        PU L#3 (P#49)
+      L2 L#2 (1024KB) + L1d L#2 (32KB) + L1i L#2 (32KB) + Core L#2
+        PU L#4 (P#2)
+        PU L#5 (P#50)
+      L2 L#3 (1024KB) + L1d L#3 (32KB) + L1i L#3 (32KB) + Core L#3
+        PU L#6 (P#3)
+        PU L#7 (P#51)
+      L2 L#4 (1024KB) + L1d L#4 (32KB) + L1i L#4 (32KB) + Core L#4
+        PU L#8 (P#4)
+        PU L#9 (P#52)
+      L2 L#5 (1024KB) + L1d L#5 (32KB) + L1i L#5 (32KB) + Core L#5
+        PU L#10 (P#5)
+        PU L#11 (P#53)
+      L2 L#6 (1024KB) + L1d L#6 (32KB) + L1i L#6 (32KB) + Core L#6
+        PU L#12 (P#6)
+        PU L#13 (P#54)
+      L2 L#7 (1024KB) + L1d L#7 (32KB) + L1i L#7 (32KB) + Core L#7
+        PU L#14 (P#7)
+        PU L#15 (P#55)
+      L2 L#8 (1024KB) + L1d L#8 (32KB) + L1i L#8 (32KB) + Core L#8
+        PU L#16 (P#8)
+        PU L#17 (P#56)
+      L2 L#9 (1024KB) + L1d L#9 (32KB) + L1i L#9 (32KB) + Core L#9
+        PU L#18 (P#9)
+        PU L#19 (P#57)
+      L2 L#10 (1024KB) + L1d L#10 (32KB) + L1i L#10 (32KB) + Core L#10
+        PU L#20 (P#10)
+        PU L#21 (P#58)
+      L2 L#11 (1024KB) + L1d L#11 (32KB) + L1i L#11 (32KB) + Core L#11
+        PU L#22 (P#11)
+        PU L#23 (P#59)
+      L2 L#12 (1024KB) + L1d L#12 (32KB) + L1i L#12 (32KB) + Core L#12
+        PU L#24 (P#12)
+        PU L#25 (P#60)
+      L2 L#13 (1024KB) + L1d L#13 (32KB) + L1i L#13 (32KB) + Core L#13
+        PU L#26 (P#13)
+        PU L#27 (P#61)
+      L2 L#14 (1024KB) + L1d L#14 (32KB) + L1i L#14 (32KB) + Core L#14
+        PU L#28 (P#14)
+        PU L#29 (P#62)
+      L2 L#15 (1024KB) + L1d L#15 (32KB) + L1i L#15 (32KB) + Core L#15
+        PU L#30 (P#15)
+        PU L#31 (P#63)
+      L2 L#16 (1024KB) + L1d L#16 (32KB) + L1i L#16 (32KB) + Core L#16
+        PU L#32 (P#16)
+        PU L#33 (P#64)
+      L2 L#17 (1024KB) + L1d L#17 (32KB) + L1i L#17 (32KB) + Core L#17
+        PU L#34 (P#17)
+        PU L#35 (P#65)
+      L2 L#18 (1024KB) + L1d L#18 (32KB) + L1i L#18 (32KB) + Core L#18
+        PU L#36 (P#18)
+        PU L#37 (P#66)
+      L2 L#19 (1024KB) + L1d L#19 (32KB) + L1i L#19 (32KB) + Core L#19
+        PU L#38 (P#19)
+        PU L#39 (P#67)
+      L2 L#20 (1024KB) + L1d L#20 (32KB) + L1i L#20 (32KB) + Core L#20
+        PU L#40 (P#20)
+        PU L#41 (P#68)
+      L2 L#21 (1024KB) + L1d L#21 (32KB) + L1i L#21 (32KB) + Core L#21
+        PU L#42 (P#21)
+        PU L#43 (P#69)
+      L2 L#22 (1024KB) + L1d L#22 (32KB) + L1i L#22 (32KB) + Core L#22
+        PU L#44 (P#22)
+        PU L#45 (P#70)
+      L2 L#23 (1024KB) + L1d L#23 (32KB) + L1i L#23 (32KB) + Core L#23
+        PU L#46 (P#23)
+        PU L#47 (P#71)
+  Package L#1
+    NUMANode L#1 (P#1 94GB)
+    L3 L#1 (36MB)
+      L2 L#24 (1024KB) + L1d L#24 (32KB) + L1i L#24 (32KB) + Core L#24
+        PU L#48 (P#24)
+        PU L#49 (P#72)
+      L2 L#25 (1024KB) + L1d L#25 (32KB) + L1i L#25 (32KB) + Core L#25
+        PU L#50 (P#25)
+        PU L#51 (P#73)
+      L2 L#26 (1024KB) + L1d L#26 (32KB) + L1i L#26 (32KB) + Core L#26
+        PU L#52 (P#26)
+        PU L#53 (P#74)
+      L2 L#27 (1024KB) + L1d L#27 (32KB) + L1i L#27 (32KB) + Core L#27
+        PU L#54 (P#27)
+        PU L#55 (P#75)
+      L2 L#28 (1024KB) + L1d L#28 (32KB) + L1i L#28 (32KB) + Core L#28
+        PU L#56 (P#28)
+        PU L#57 (P#76)
+      L2 L#29 (1024KB) + L1d L#29 (32KB) + L1i L#29 (32KB) + Core L#29
+        PU L#58 (P#29)
+        PU L#59 (P#77)
+      L2 L#30 (1024KB) + L1d L#30 (32KB) + L1i L#30 (32KB) + Core L#30
+        PU L#60 (P#30)
+        PU L#61 (P#78)
+      L2 L#31 (1024KB) + L1d L#31 (32KB) + L1i L#31 (32KB) + Core L#31
+        PU L#62 (P#31)
+        PU L#63 (P#79)
+      L2 L#32 (1024KB) + L1d L#32 (32KB) + L1i L#32 (32KB) + Core L#32
+        PU L#64 (P#32)
+        PU L#65 (P#80)
+      L2 L#33 (1024KB) + L1d L#33 (32KB) + L1i L#33 (32KB) + Core L#33
+        PU L#66 (P#33)
+        PU L#67 (P#81)
+      L2 L#34 (1024KB) + L1d L#34 (32KB) + L1i L#34 (32KB) + Core L#34
+        PU L#68 (P#34)
+        PU L#69 (P#82)
+      L2 L#35 (1024KB) + L1d L#35 (32KB) + L1i L#35 (32KB) + Core L#35
+        PU L#70 (P#35)
+        PU L#71 (P#83)
+      L2 L#36 (1024KB) + L1d L#36 (32KB) + L1i L#36 (32KB) + Core L#36
+        PU L#72 (P#36)
+        PU L#73 (P#84)
+      L2 L#37 (1024KB) + L1d L#37 (32KB) + L1i L#37 (32KB) + Core L#37
+        PU L#74 (P#37)
+        PU L#75 (P#85)
+      L2 L#38 (1024KB) + L1d L#38 (32KB) + L1i L#38 (32KB) + Core L#38
+        PU L#76 (P#38)
+        PU L#77 (P#86)
+      L2 L#39 (1024KB) + L1d L#39 (32KB) + L1i L#39 (32KB) + Core L#39
+        PU L#78 (P#39)
+        PU L#79 (P#87)
+      L2 L#40 (1024KB) + L1d L#40 (32KB) + L1i L#40 (32KB) + Core L#40
+        PU L#80 (P#40)
+        PU L#81 (P#88)
+      L2 L#41 (1024KB) + L1d L#41 (32KB) + L1i L#41 (32KB) + Core L#41
+        PU L#82 (P#41)
+        PU L#83 (P#89)
+      L2 L#42 (1024KB) + L1d L#42 (32KB) + L1i L#42 (32KB) + Core L#42
+        PU L#84 (P#42)
+        PU L#85 (P#90)
+      L2 L#43 (1024KB) + L1d L#43 (32KB) + L1i L#43 (32KB) + Core L#43
+        PU L#86 (P#43)
+        PU L#87 (P#91)
+      L2 L#44 (1024KB) + L1d L#44 (32KB) + L1i L#44 (32KB) + Core L#44
+        PU L#88 (P#44)
+        PU L#89 (P#92)
+      L2 L#45 (1024KB) + L1d L#45 (32KB) + L1i L#45 (32KB) + Core L#45
+        PU L#90 (P#45)
+        PU L#91 (P#93)
+      L2 L#46 (1024KB) + L1d L#46 (32KB) + L1i L#46 (32KB) + Core L#46
+        PU L#92 (P#46)
+        PU L#93 (P#94)
+      L2 L#47 (1024KB) + L1d L#47 (32KB) + L1i L#47 (32KB) + Core L#47
+        PU L#94 (P#47)
+        PU L#95 (P#95)
+
+
+
+buffer size 64MB
+
+ubuntu@ip-10-0-0-144:~/dmaplane/tests$ sudo ./test_phase5_numa 
+=== Phase 5: NUMA Topology & Optimization Tests ===
+
+  [1] NUMA topology query                                PASS
+
+    NUMA Topology:
+      Nodes: 2   CPUs: 96
+      Node 0: 48 CPUs, 97936 MB total, 93989 MB free
+      Node 1: 48 CPUs, 98304 MB total, 95622 MB free
+
+    NUMA Distance Matrix:
+           node0  node1  
+      node0 10     21     
+      node1 21     10     
+
+  [2] allocate page-backed buffer on node 0              PASS
+      actual_numa_node = 0
+  [3] allocate page-backed buffer with NUMA_ANY          PASS
+      actual_numa_node = 0
+  [4] invalid NUMA node (99) returns EINVAL              PASS
+  [5] coherent buffer NUMA reporting (informational)     PASS
+      requested=0, actual=0 (coherent cannot be steered)
+  [6] NUMA stats (via GET_BUF_STATS)                     PASS
+
+    Phase 5 NUMA Stats:
+      numa_local_allocs:  8
+      numa_remote_allocs: 0
+      numa_anon_allocs:   7
+
+  [7] cross-node bandwidth benchmark                     PASS
+
+    Cross-Node Bandwidth Matrix (MB/s):
+      cpu\buf | node0  | node1  |
+      ------------------------
+      node0  |  6778  |  5577  |
+      node1  |  5013  |  6095  |
+
+    Cross-Node Penalty Analysis:
+      node0 -> node1: 18% penalty (5577 vs 6778 MB/s)
+      node1 -> node0: 18% penalty (5013 vs 6095 MB/s)
+
+  [8] regression: buffer + mmap + pattern with NUMA_ANY  PASS
+
+=== Results: 8 passed, 0 failed ===
+
+
+There it is. The NUMA penalty is now visible and symmetric:
+
+```
+              node0    node1
+  node0       6778     5577    (18% penalty crossing to node1)
+  node1       5013     6095    (18% penalty crossing to node0)
+```
+
+Local access: ~6.4 GB/s average. Remote access: ~5.3 GB/s average. 18% penalty both directions — consistent with the distance=21 SLIT value on this Xeon Platinum.
+
+Comparing the two runs tells the whole story:
+
+| Buffer size | Local (avg) | Remote (avg) | Penalty | Why |
+|---|---|---|---|---|
+| 1 MB | ~8.8 GB/s | ~8.9 GB/s | 0% | Fits in 36 MB L3 — measuring cache, not DRAM |
+| 64 MB | ~6.4 GB/s | ~5.3 GB/s | 18% | Exceeds L3 — measuring actual DRAM + QPI |
+
+Both numbers belong in the blog post. The 1 MB run is the "why benchmarks lie" example — the L3 cache masks the penalty at small working sets. The 64 MB run shows what production workloads actually hit with gradient buffers and KV-cache blocks.
+
+The 18% is lower than the 40–50% you'd see on older Broadwell Xeons. Skylake-SP (the c5 generation) has a wider UPI mesh that narrows the gap. Still enough to matter at scale — 18% across every all-reduce iteration adds up.
+
+Go ahead and destroy the stack. You've got the numbers you need.
