@@ -20,80 +20,173 @@ The 32-bit immediate value encodes `(layer_index, chunk_index)` so the receiver 
 
 In loopback mode, the sender owns both MRs on the same machine (QP-A sends, QP-B receives). Two-machine peer mode is structurally stubbed for EC2 deployment.
 
-## Prerequisites
+## Dependencies
+
+### System (required for all tests)
+
+- Linux kernel 6.5+ with `rdma_rxe` module
+- `dmaplane.ko` kernel module loaded
+- `rdma-core` package (`rdma link` command)
+- GCC, Make
+
+### C tools (kvcache_sender, kvcache_receiver)
+
+- CUDA runtime (`libcudart`) — optional, only needed for `--gpu` flag
+- `-lm` (math library)
+
+### Python wrapper (dmaplane_py.py, test_dmaplane_py.py)
+
+- Python 3.8+
+- No pip dependencies (uses `struct` + `fcntl` only)
+- PyTorch — optional, only for `allocate_aligned_gpu_tensor` and GPU tests
+
+### End-to-end inference test (test_kvcache_local.py)
 
 ```bash
-# Load dmaplane and configure soft-RoCE
-sudo modprobe rdma_rxe
-IFACE=$(ip -o link show up | grep -v lo | head -1 | awk -F: '{print $2}' | tr -d ' ')
-sudo rdma link add rxe_${IFACE} type rxe netdev ${IFACE}
-make -C driver load     # from repo root
-
-# Build
-make -C examples/kvcache
+sudo pip install torch transformers accelerate
 ```
 
-For Python tests: `sudo pip install torch transformers accelerate`
+- CUDA GPU (any NVIDIA GPU with compute capability 7.0+)
+- TinyLlama-1.1B-Chat model (auto-downloaded on first run, ~2 GB)
+- `dmaplane.ko` loaded + Soft-RoCE configured
+
+## Setup
+
+### 1. Load dmaplane and configure Soft-RoCE
+
+```bash
+# From repo root
+bash scripts/setup_rxe.sh            # auto-detects interface
+sudo insmod driver/dmaplane.ko
+```
+
+Or manually:
+
+```bash
+sudo modprobe rdma_rxe
+IFACE=$(ip route show default | awk '{print $5; exit}')
+sudo rdma link add rxe_${IFACE} type rxe netdev ${IFACE}
+sudo insmod driver/dmaplane.ko
+```
+
+Verify: `rdma link show` should show an `rxe_<iface>` device, and `/dev/dmaplane` should exist.
+
+### 2. Build C tools
+
+```bash
+make -C examples/kvcache              # or just 'make' from repo root
+```
+
+Builds `kvcache_sender` (with CUDA if available) and `kvcache_receiver`.
 
 ## Files
 
-| File | Description |
-|------|-------------|
-| `kvcache_common.h` | Shared C header: ioctl wrappers, timing, credit tracker, recv loop helpers, latency stats, layer bitmap |
-| `kvcache_sender.c` | Loopback WRITEIMM sender with credit window, GPU source path, data verification |
-| `kvcache_receiver.c` | Loopback self-test + peer mode stub with recv loop skeleton |
-| `dmaplane_py.py` | Python `struct`/`fcntl` wrapper for all dmaplane ioctls |
-| `test_dmaplane_py.py` | Python wrapper tests: struct sizes, ioctl round-trips, GPU pin |
-| `kvcache_inference.py` | `extract_kvcache`, `consolidate_kvcache`, `reconstruct_kvcache_zero_copy` |
-| `test_kvcache_local.py` | End-to-end test: TinyLlama prefill → WRITEIMM → reconstruct → decode |
-| `kvcache_bench.sh` | Benchmark sweep: chunk_size x credit_window x layers → CSV |
-| `ec2_setup.sh` | EC2 g5.xlarge setup: deps, rxe, build, model download, smoke test |
+| File | Lines | Description |
+|------|------:|-------------|
+| `kvcache_common.h` | 585 | Shared C header: ioctl wrappers, timing, credit tracker, recv loop helpers, latency stats, layer bitmap |
+| `kvcache_sender.c` | 662 | Loopback WRITEIMM sender with credit window, GPU source path, data verification |
+| `kvcache_receiver.c` | 357 | Loopback self-test + peer mode stub with recv loop skeleton |
+| `dmaplane_py.py` | 481 | Python `struct`/`fcntl` wrapper for all dmaplane ioctls |
+| `test_dmaplane_py.py` | 293 | Python wrapper tests: struct sizes, ioctl round-trips, GPU pin |
+| `kvcache_inference.py` | 195 | `extract_kvcache`, `consolidate_kvcache`, `reconstruct_kvcache_zero_copy` |
+| `test_kvcache_local.py` | 472 | End-to-end test: TinyLlama prefill → WRITEIMM → reconstruct → decode |
+| `kvcache_bench.sh` | 84 | Benchmark sweep: chunk_size x credit_window x layers → CSV |
+| `ec2_setup.sh` | 153 | EC2 g5.xlarge setup: deps, rxe, build, model download, smoke test |
+| `Makefile` | 38 | C build with CUDA detection |
+| `PYTHON_GUIDE.md` | 337 | Python API reference and usage examples |
 
-## Quick start
+## Acceptance Tests
 
-### C loopback (no GPU required)
+Run in this order. Each step validates a layer of the stack.
 
-```bash
-# 128 chunks (32 layers x 4 chunks x 1MB), data integrity check
-sudo ./kvcache_sender --loopback --verify
-
-# GPU-backed source MR
-sudo ./kvcache_sender --loopback --gpu --verify
-
-# Smaller test
-sudo ./kvcache_sender --loopback --layers 4 --chunks-per-layer 2 --verify
-```
-
-### Python wrapper validation
+### Step 1: Phase 8 regression (verify ioctl renumbering)
 
 ```bash
-# Struct size check (no root needed)
-python3 dmaplane_py.py
-
-# Ioctl round-trip tests (needs root + dmaplane.ko)
-sudo python3 test_dmaplane_py.py
+make -C tests clean && make -C tests
+sudo ./tests/test_phase8_gpu
+# Expected: 7/7 passed
 ```
 
-### Full disaggregated inference test
+### Step 2: C loopback — basic WRITEIMM round-trip
 
 ```bash
-# Requires: CUDA GPU, TinyLlama model, dmaplane.ko + rxe
-sudo python3 test_kvcache_local.py
+sudo ./examples/kvcache/kvcache_sender --loopback --layers 4 --chunks-per-layer 2 --verify
+# Expected: 8 chunks transferred, data integrity PASS, credit stalls reported
 ```
 
-This runs:
-1. Prefill with TinyLlama-1.1B-Chat
-2. Extract + consolidate KVCache into aligned GPU staging buffer
-3. WRITEIMM chunks over loopback (GPU MR → host MR)
-4. Reconstruct KVCache via `torch.as_strided` (zero-copy)
-5. Greedy-decode 20 tokens and verify they match `model.generate()` output
-
-### Benchmark sweep
+### Step 3: C loopback — full 128-chunk simulated KVCache
 
 ```bash
-sudo bash kvcache_bench.sh
-# Writes bench_results.csv with throughput/latency across parameter combinations
+sudo ./examples/kvcache/kvcache_sender --loopback --verify
+# Expected: 32 layers x 4 chunks = 128 chunks, 128 MB, ~1000+ MB/s on rxe
+#           128/128 received, data integrity PASS
 ```
+
+### Step 4: C loopback — GPU-backed source (requires CUDA)
+
+```bash
+sudo ./examples/kvcache/kvcache_sender --loopback --gpu --verify
+# Expected: GPU MR as source, same transfer pattern, data verified
+#           ~10 MB/s (rxe reads GPU BAR pages via software — slow by design)
+```
+
+### Step 5: C loopback — credit pressure
+
+```bash
+sudo ./examples/kvcache/kvcache_sender --loopback --credit-window 2 --layers 8 --verify
+# Expected: many credit stalls (30 on 32 chunks), lower throughput, data correct
+```
+
+### Step 6: Python struct validation (no root needed)
+
+```bash
+python3 examples/kvcache/dmaplane_py.py
+# Expected: all 11 struct sizes match, all ioctl numbers printed
+```
+
+### Step 7: Python ioctl round-trip tests
+
+```bash
+sudo python3 examples/kvcache/test_dmaplane_py.py
+# Expected: 7+ tests pass (struct sizes, IMM encoding, buffer+MR,
+#           fast-reg MR, WRITEIMM round-trip, GPU tests if PyTorch available)
+```
+
+### Step 8: Full disaggregated inference test (requires CUDA + PyTorch)
+
+```bash
+sudo python3 examples/kvcache/test_kvcache_local.py
+# Expected: 6 tests pass:
+#   1. KVCache extract + consolidate (shape, contiguity, manifest offsets)
+#   2. as_strided zero-copy reconstruction (bitwise identical to originals)
+#   3. Decode with reconstructed KVCache matches model.generate() reference
+#   4. WRITEIMM loopback GPU→host with real KVCache (TinyLlama 135 KB,
+#      GPU pin → WRITEIMM chunks → host mmap → reconstruct → decode → verify)
+#   5. GPU tensor alignment + pin at KVCache size
+#   6. Multiple prompts reuse pinned buffers without re-allocation
+```
+
+### Step 9: Benchmark sweep
+
+```bash
+sudo bash examples/kvcache/kvcache_bench.sh
+# Expected: 32 data points across chunk_size(64K,256K,1M,4M) x
+#           credit_window(4,8,16,32) x layers(8,32)
+#           Results written to bench_results.csv
+```
+
+## Expected Performance (rxe loopback)
+
+| Chunk Size | Peak Throughput | Avg Latency | P50 | P99 |
+|-----------|----------------|-------------|-----|-----|
+| 64 KB | ~310 MB/s | 0.1ms | 0.2ms | 0.3ms |
+| 256 KB | ~1025 MB/s | 0.1–0.3ms | 0.2–0.4ms | 0.4–0.6ms |
+| 1 MB | ~1115 MB/s | 0.5–0.7ms | 0.8ms | 1.2–1.4ms |
+| 4 MB | ~1210 MB/s | 1.8–2.3ms | 3.2ms | 3.6–5.8ms |
+
+Throughput saturates around 1.2 GB/s — rxe's single-threaded memcpy limit. Credit window has minimal effect at large chunks (serialized by rxe).
+
+GPU source path: ~10 MB/s (117x slower than host). Each 1 MB chunk requires rxe to build 256 individual IB packets (4 KB MTU) from GPU BAR pages, with per-packet checksums and protocol processing. This bottleneck disappears with real RDMA NICs — ConnectX does hardware DMA from GPU BAR at line rate via GPUDirect.
 
 ## Sender CLI reference
 
@@ -118,3 +211,5 @@ sudo bash kvcache_bench.sh
 - **Credit window** — sender tracks pre-posted recvs; stalls and drains when credits hit 0
 - **64KB alignment** — GPU tensors are over-allocated and sliced for NVIDIA P2P API compatibility
 - **Zero-copy reconstruct** — `torch.as_strided` views into the RDMA landing buffer, no memcpy
+- **IMM encoding** — `KVCACHE_IMM_ENCODE(layer, chunk)` packs into 32-bit immediate (upper 16 = layer, lower 16 = chunk), `KVCACHE_SENTINEL = 0xFFFFFFFF` signals end-of-transfer
+- **Byte order** — `cpu_to_be32(imm_data)` on send, `be32_to_cpu(wc.ex.imm_data)` on recv per IB spec
