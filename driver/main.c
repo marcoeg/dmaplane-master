@@ -86,6 +86,7 @@
 #include "dmabuf_export.h"
 #include "rdma_engine.h"
 #include "benchmark.h"
+#include "numa_topology.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
@@ -893,8 +894,11 @@ static long dmaplane_ioctl_get_buf_stats(struct dmaplane_file_ctx *ctx,
 	struct dmaplane_dev *dev = ctx->dev;
 	struct dmaplane_buf_stats bstats;
 
-	bstats.buffers_created  = atomic64_read(&dev->stats.buffers_created);
+	bstats.buffers_created   = atomic64_read(&dev->stats.buffers_created);
 	bstats.buffers_destroyed = atomic64_read(&dev->stats.buffers_destroyed);
+	bstats.numa_local_allocs  = atomic64_read(&dev->stats.numa_local_allocs);
+	bstats.numa_remote_allocs = atomic64_read(&dev->stats.numa_remote_allocs);
+	bstats.numa_anon_allocs   = atomic64_read(&dev->stats.numa_anon_allocs);
 
 	if (copy_to_user((void __user *)arg, &bstats, sizeof(bstats)))
 		return -EFAULT;
@@ -1259,6 +1263,96 @@ static long dmaplane_ioctl_get_rdma_stats(struct dmaplane_file_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 5 ioctl handlers: NUMA                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dmaplane_ioctl_query_numa_topo — Query NUMA topology.
+ *
+ * Returns node count, per-node CPU counts, memory sizes, and the
+ * ACPI SLIT distance matrix.  No lock needed — topology data is
+ * maintained by the kernel and doesn't change at runtime.
+ *
+ * The struct is heap-allocated (~600 bytes) because it exceeds
+ * safe kernel stack usage (8 KB on x86).
+ *
+ * Returns:
+ *   0       on success.
+ *  -ENOMEM  if kmalloc fails.
+ *  -EFAULT  if copy_to_user fails.
+ */
+static long dmaplane_ioctl_query_numa_topo(struct dmaplane_file_ctx *ctx,
+					   unsigned long arg)
+{
+	struct dmaplane_numa_topo *topo;
+	int ret;
+
+	topo = kmalloc(sizeof(*topo), GFP_KERNEL);
+	if (!topo)
+		return -ENOMEM;
+
+	ret = dmaplane_query_numa_topo(topo);
+	if (ret) {
+		kfree(topo);
+		return ret;
+	}
+
+	if (copy_to_user((void __user *)arg, topo, sizeof(*topo))) {
+		kfree(topo);
+		return -EFAULT;
+	}
+
+	kfree(topo);
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_numa_bench — Run NxN cross-node bandwidth benchmark.
+ *
+ * Spawns kthreads to measure memcpy throughput between all NUMA node
+ * pairs.  No lock needed — the benchmark allocates its own temporary
+ * buffers and doesn't touch any dmaplane device state.
+ *
+ * The struct is heap-allocated (~1100 bytes) because it exceeds
+ * safe kernel stack usage.
+ *
+ * Returns:
+ *   0       on success.
+ *  -ENOMEM  if kmalloc fails.
+ *  -EFAULT  if copy_from_user/copy_to_user fails.
+ *  -EINVAL  if buffer_size or iterations are out of range.
+ */
+static long dmaplane_ioctl_numa_bench(struct dmaplane_file_ctx *ctx,
+				      unsigned long arg)
+{
+	struct dmaplane_numa_bench_params *p;
+	int ret;
+
+	p = kmalloc(sizeof(*p), GFP_KERNEL);
+	if (!p)
+		return -ENOMEM;
+
+	if (copy_from_user(p, (void __user *)arg, sizeof(*p))) {
+		kfree(p);
+		return -EFAULT;
+	}
+
+	ret = dmaplane_numa_bench(p);
+	if (ret) {
+		kfree(p);
+		return ret;
+	}
+
+	if (copy_to_user((void __user *)arg, p, sizeof(*p))) {
+		kfree(p);
+		return -EFAULT;
+	}
+
+	kfree(p);
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1386,6 +1480,12 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	case DMAPLANE_IOCTL_GET_RDMA_STATS:
 		return dmaplane_ioctl_get_rdma_stats(ctx, arg);
 
+	/* Phase 5: NUMA */
+	case DMAPLANE_IOCTL_QUERY_NUMA_TOPO:
+		return dmaplane_ioctl_query_numa_topo(ctx, arg);
+	case DMAPLANE_IOCTL_NUMA_BENCH:
+		return dmaplane_ioctl_numa_bench(ctx, arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -1461,6 +1561,11 @@ static int __init dmaplane_init(void)
 	atomic64_set(&dma_dev->stats.completion_errors, 0);
 	atomic64_set(&dma_dev->stats.bytes_sent, 0);
 	atomic64_set(&dma_dev->stats.bytes_received, 0);
+
+	/* Phase 5: NUMA allocation tracking */
+	atomic64_set(&dma_dev->stats.numa_local_allocs, 0);
+	atomic64_set(&dma_dev->stats.numa_remote_allocs, 0);
+	atomic64_set(&dma_dev->stats.numa_anon_allocs, 0);
 
 	/*
 	 * Create platform device for DMA operations.

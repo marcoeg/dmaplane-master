@@ -53,7 +53,7 @@ static int dev_open(void)
 
 static unsigned int create_buffer(int fd, unsigned int type, unsigned long size)
 {
-	struct dmaplane_buf_params p = {0};
+	struct dmaplane_buf_params p = { .numa_node = DMAPLANE_NUMA_ANY };
 
 	p.alloc_type = type;
 	p.size = size;

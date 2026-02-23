@@ -130,14 +130,27 @@ struct dmaplane_stats {
 #define DMAPLANE_BUF_TYPE_COHERENT	0
 #define DMAPLANE_BUF_TYPE_PAGES		1
 
+/* NUMA placement: -1 = allocate on current CPU's local node (default) */
+#define DMAPLANE_NUMA_ANY		(-1)
+
 /*
  * Buffer creation parameters: passed to IOCTL_CREATE_BUFFER.
- * On success, buf_id is filled with the assigned buffer handle.
+ * On success, buf_id and actual_numa_node are filled.
+ *
+ * numa_node controls NUMA placement:
+ *   DMAPLANE_NUMA_ANY (-1): allocate on the current CPU's local node
+ *     (same as plain alloc_page behavior).
+ *   0..N: request allocation on the specified NUMA node.  This is
+ *     best-effort — the kernel may fall back silently to other nodes
+ *     if the target node is under memory pressure.  actual_numa_node
+ *     reports where pages actually landed.
  */
 struct dmaplane_buf_params {
 	__u32 buf_id;		/* out — assigned buffer handle (never 0) */
 	__u32 alloc_type;	/* in  — DMAPLANE_BUF_TYPE_* */
 	__u64 size;		/* in  — buffer size in bytes */
+	__s32 numa_node;	/* in  — NUMA node (-1 = any/local) */
+	__s32 actual_numa_node;	/* out — node where pages were placed */
 };
 
 /*
@@ -157,8 +170,11 @@ struct dmaplane_mmap_info {
  * Racy snapshot — individually consistent, collectively approximate.
  */
 struct dmaplane_buf_stats {
-	__u64 buffers_created;	/* out — Lifetime buffers created */
-	__u64 buffers_destroyed;/* out — Lifetime buffers destroyed */
+	__u64 buffers_created;		/* out — Lifetime buffers created */
+	__u64 buffers_destroyed;	/* out — Lifetime buffers destroyed */
+	__u64 numa_local_allocs;	/* out — alloc landed on requested node */
+	__u64 numa_remote_allocs;	/* out — alloc fell back to another node */
+	__u64 numa_anon_allocs;		/* out — alloc with DMAPLANE_NUMA_ANY */
 };
 
 /* Phase 2 ioctl commands: 0x05–0x09 */
@@ -326,5 +342,65 @@ struct dmaplane_rdma_stats {
 /* Get RDMA statistics (racy snapshot). */
 #define DMAPLANE_IOCTL_GET_RDMA_STATS \
 	_IOR(DMAPLANE_IOC_MAGIC, 0x33, struct dmaplane_rdma_stats)
+
+/* ── Phase 5: NUMA topology & optimization ───────────────── */
+
+/* Maximum NUMA nodes supported in topology/benchmark structs.
+ * 8 covers all practical server topologies (dual=2, quad=4, 8-socket=8). */
+#define DMAPLANE_MAX_NUMA_NODES	8
+
+/*
+ * NUMA topology: returned by IOCTL_QUERY_NUMA_TOPO.
+ *
+ * Reports online NUMA nodes, per-node CPU counts, memory sizes,
+ * and the ACPI SLIT distance matrix.  Distance values:
+ *   10 = same node (local)
+ *   20–21 = one QPI/UPI hop (adjacent socket)
+ *   30+ = further hops
+ *
+ * Node IDs may be sparse (e.g., nodes 0 and 2 online, 1 offline).
+ * This struct compacts into contiguous indices [0..nr_nodes-1].
+ */
+struct dmaplane_numa_topo {
+	__u32 nr_nodes;		/* out — number of online NUMA nodes */
+	__u32 nr_cpus;		/* out — number of online CPUs */
+	__u32 node_cpu_count[DMAPLANE_MAX_NUMA_NODES];	/* out — CPUs per node */
+	__u32 node_online[DMAPLANE_MAX_NUMA_NODES];	/* out — 1 if online */
+	__u64 node_mem_total_kb[DMAPLANE_MAX_NUMA_NODES]; /* out — total mem */
+	__u64 node_mem_free_kb[DMAPLANE_MAX_NUMA_NODES];  /* out — free mem */
+	/* out — Distance matrix: distances[i][j] = ACPI SLIT distance i to j */
+	__u32 distances[DMAPLANE_MAX_NUMA_NODES][DMAPLANE_MAX_NUMA_NODES];
+};
+
+/*
+ * NUMA bandwidth benchmark: passed to IOCTL_NUMA_BENCH.
+ *
+ * For each (cpu_node, buf_node) pair, spawns a kthread pinned to
+ * cpu_node, measures memcpy throughput to a buffer on buf_node.
+ * Result is an NxN bandwidth matrix quantifying cross-node penalty.
+ */
+struct dmaplane_numa_bench_params {
+	__u64 buffer_size;	/* in  — test buffer size per node (bytes) */
+	__u32 iterations;	/* in  — memcpy iterations per cell */
+	__u32 pad;		/* padding — explicit pad for alignment */
+	/* Output: NxN bandwidth matrix in MB/s.
+	 * bw_mbps[cpu_node][buf_node] = throughput when a thread on
+	 * cpu_node writes to a buffer allocated on buf_node. */
+	__u64 bw_mbps[DMAPLANE_MAX_NUMA_NODES][DMAPLANE_MAX_NUMA_NODES];
+	/* Output: NxN latency matrix in nanoseconds per iteration. */
+	__u64 lat_ns[DMAPLANE_MAX_NUMA_NODES][DMAPLANE_MAX_NUMA_NODES];
+	__u32 nr_nodes;		/* out — nodes measured */
+	__u32 status;		/* out — 0 on success */
+};
+
+/* Phase 5 ioctl commands: NUMA 0x50–0x51 */
+
+/* Query NUMA topology: nodes, CPUs, memory, distance matrix. */
+#define DMAPLANE_IOCTL_QUERY_NUMA_TOPO \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x50, struct dmaplane_numa_topo)
+
+/* Run NxN cross-node bandwidth benchmark. */
+#define DMAPLANE_IOCTL_NUMA_BENCH \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x51, struct dmaplane_numa_bench_params)
 
 #endif /* _DMAPLANE_UAPI_H */

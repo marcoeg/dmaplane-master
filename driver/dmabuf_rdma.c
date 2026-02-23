@@ -26,15 +26,26 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mm.h>
+#include <linux/numa.h>
+#include <linux/nodemask.h>
 
 #include "dmabuf_rdma.h"
 
 /*
- * dmabuf_rdma_create_buffer — Allocate a DMA buffer.
+ * dmabuf_rdma_create_buffer — Allocate a DMA buffer with NUMA awareness.
  *
- * Validates size and alloc_type, finds a free slot in the buffer array,
- * allocates memory via the requested path, and returns the handle in
- * params->buf_id.
+ * Validates size, alloc_type, and NUMA node, finds a free slot in the
+ * buffer array, allocates memory via the requested path, and returns
+ * the handle in params->buf_id.
+ *
+ * NUMA placement (Phase 5):
+ *   DMAPLANE_NUMA_ANY (-1): allocate on the current CPU's local node
+ *     (same as plain alloc_page behavior).
+ *   0..N: request allocation on that node via alloc_pages_node().  This
+ *     is best-effort — the buddy allocator tries the target node's
+ *     zonelist first, but falls back SILENTLY to distant nodes under
+ *     memory pressure.  Post-hoc verification via page_to_nid() is the
+ *     only way to detect misplacement.
  *
  * Concurrency: acquires buf_lock for the duration of slot search,
  * allocation, and bookkeeping.  The lock is held during allocation
@@ -48,6 +59,8 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 	unsigned int nr_pages;
 	unsigned int i;
 	int slot;
+	int target_node;
+	int local_count = 0, remote_count = 0;
 
 	/* Validate inputs */
 	if (params->size == 0 || params->size > DMAPLANE_MAX_BUF_SIZE)
@@ -56,6 +69,19 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 	if (params->alloc_type != DMAPLANE_BUF_TYPE_COHERENT &&
 	    params->alloc_type != DMAPLANE_BUF_TYPE_PAGES)
 		return -EINVAL;
+
+	/*
+	 * NUMA node validation — before acquiring the mutex so we
+	 * fail fast on invalid input without blocking other callers.
+	 */
+	target_node = params->numa_node;
+	if (target_node != DMAPLANE_NUMA_ANY) {
+		if (target_node < 0 || target_node >= MAX_NUMNODES ||
+		    !node_online(target_node)) {
+			pr_err("invalid NUMA node %d\n", target_node);
+			return -EINVAL;
+		}
+	}
 
 	mutex_lock(&dev->buf_lock);
 
@@ -84,6 +110,7 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 
 	buf->alloc_type = params->alloc_type;
 	buf->size = params->size;
+	buf->numa_node = target_node;
 
 	switch (params->alloc_type) {
 	case DMAPLANE_BUF_TYPE_COHERENT:
@@ -92,8 +119,12 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 		 * memory with a single DMA address.  The kernel and device see
 		 * consistent data without explicit cache flushes.
 		 *
+		 * dma_alloc_coherent does NOT accept a NUMA node parameter —
+		 * it allocates from the device's local node (determined by the
+		 * platform_device's NUMA affinity).  actual_numa_node is set
+		 * post-hoc via page_to_nid() for informational reporting only.
+		 *
 		 * Uses &dev->pdev->dev — the platform device, not the char device.
-		 * The DMA API programs IOMMU entries for this device's DMA context.
 		 */
 		buf->vaddr = dma_alloc_coherent(&dev->pdev->dev, buf->size,
 						&buf->dma_handle, GFP_KERNEL);
@@ -106,17 +137,38 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 		 * via mmap.  dma_alloc_coherent does not guarantee zeroing.
 		 */
 		memset(buf->vaddr, 0, buf->size);
+
+		/* Best-effort: report node of the underlying pages.
+		 * page_to_nid(virt_to_page()) works on x86-64 but is
+		 * architecture-dependent — used for reporting only. */
+		buf->actual_numa_node = page_to_nid(virt_to_page(buf->vaddr));
+		if (target_node == DMAPLANE_NUMA_ANY)
+			atomic64_inc(&dev->stats.numa_anon_allocs);
+		else if (buf->actual_numa_node == target_node)
+			atomic64_inc(&dev->stats.numa_local_allocs);
+		else
+			atomic64_inc(&dev->stats.numa_remote_allocs);
 		break;
 
 	case DMAPLANE_BUF_TYPE_PAGES:
 		/*
-		 * Allocate individual order-0 pages.  In Phase 2 we use plain
-		 * alloc_page(GFP_KERNEL | __GFP_ZERO).  Phase 3 upgrades this
-		 * to alloc_pages_node() for NUMA-aware placement.
+		 * NUMA-aware page allocation.
+		 *
+		 * alloc_pages_node(nid, gfp, order) selects which NUMA node's
+		 * zonelist to walk first.  Each NUMA node maintains independent
+		 * free page pools per zone (ZONE_DMA, ZONE_NORMAL, etc.).
+		 *
+		 * If the target node is exhausted, the allocator falls back
+		 * SILENTLY to progressively more distant nodes in the zonelist
+		 * (ordered by ACPI SLIT distance).  There is no strict/fail
+		 * mode — alloc_pages_node is always best-effort.
+		 *
+		 * For DMAPLANE_NUMA_ANY we pass NUMA_NO_NODE, which skips
+		 * node targeting and uses the current CPU's local node —
+		 * equivalent to plain alloc_pages(GFP_KERNEL, 0).
 		 *
 		 * __GFP_ZERO: critical — prevents leaking kernel memory to
-		 * userspace via mmap.  Without this, stale data from previously
-		 * freed pages would be visible to the mapping process.
+		 * userspace via mmap.
 		 */
 		nr_pages = DIV_ROUND_UP(buf->size, PAGE_SIZE);
 		buf->pages = kvcalloc(nr_pages, sizeof(struct page *), GFP_KERNEL);
@@ -126,7 +178,14 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 		}
 
 		for (i = 0; i < nr_pages; i++) {
-			buf->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+			/* NUMA_NO_NODE → allocator uses current CPU's local
+			 * node; specific nid → tries that node's buddy lists
+			 * first, falls back to distant nodes under pressure. */
+			int alloc_node = (target_node == DMAPLANE_NUMA_ANY)
+					  ? NUMA_NO_NODE : target_node;
+
+			buf->pages[i] = alloc_pages_node(alloc_node,
+							 GFP_KERNEL | __GFP_ZERO, 0);
 			if (!buf->pages[i]) {
 				/* Unwind: free all pages allocated so far */
 				while (i > 0)
@@ -136,15 +195,46 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 				mutex_unlock(&dev->buf_lock);
 				return -ENOMEM;
 			}
+
+			/* Post-hoc placement verification.
+			 * page_to_nid() reads the page's node from its
+			 * struct page flags — the only way to detect
+			 * silent fallback by the buddy allocator. */
+			if (target_node != DMAPLANE_NUMA_ANY) {
+				int actual = page_to_nid(buf->pages[i]);
+
+				if (actual == target_node)
+					local_count++;
+				else
+					remote_count++;
+			}
 		}
 		buf->nr_pages = nr_pages;
 
+		/* Determine actual NUMA node (majority vote across pages) */
+		if (target_node == DMAPLANE_NUMA_ANY) {
+			buf->actual_numa_node = (nr_pages > 0)
+				? page_to_nid(buf->pages[0]) : -1;
+			atomic64_inc(&dev->stats.numa_anon_allocs);
+		} else {
+			buf->actual_numa_node = (local_count >= remote_count)
+				? target_node
+				: page_to_nid(buf->pages[0]);
+			if (remote_count == 0)
+				atomic64_inc(&dev->stats.numa_local_allocs);
+			else
+				atomic64_inc(&dev->stats.numa_remote_allocs);
+		}
+
+		if (remote_count > 0)
+			pr_warn("buffer NUMA placement: %d/%u pages on node %d, %d misplaced\n",
+				local_count, nr_pages, target_node, remote_count);
+
 		/*
 		 * vmap: create a contiguous kernel virtual address from scattered
-		 * physical pages.  Without this, the kernel would need kmap_page()
-		 * for each page individually.  The vmapped address is used by the
-		 * RDMA engine (Phase 4) as the SGE virtual address for rxe's
-		 * memcpy-based send path.
+		 * physical pages.  The vmapped address is used by the RDMA engine
+		 * (Phase 4) as the SGE virtual address for rxe's memcpy-based
+		 * send path.
 		 */
 		buf->vaddr = vmap(buf->pages, nr_pages, VM_MAP, PAGE_KERNEL);
 		if (!buf->vaddr) {
@@ -168,11 +258,13 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 
 	/* Fill output fields for userspace */
 	params->buf_id = buf->id;
+	params->actual_numa_node = buf->actual_numa_node;
 
 	atomic64_inc(&dev->stats.buffers_created);
 
-	pr_debug("buffer %u created: type=%d size=%zu nr_pages=%u\n",
-		 buf->id, buf->alloc_type, buf->size, buf->nr_pages);
+	pr_debug("buffer %u created: type=%d size=%zu nr_pages=%u numa_req=%d numa_actual=%d\n",
+		 buf->id, buf->alloc_type, buf->size, buf->nr_pages,
+		 buf->numa_node, buf->actual_numa_node);
 
 	mutex_unlock(&dev->buf_lock);
 	return 0;

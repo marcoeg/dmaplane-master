@@ -34,6 +34,8 @@
 #include <linux/cache.h>
 #include <linux/rwsem.h>
 #include <linux/scatterlist.h>
+#include <linux/numa.h>
+#include <linux/nodemask.h>
 #include <rdma/ib_verbs.h>
 
 /* ── Phase 2: Buffer constants ──────────────────────────── */
@@ -127,6 +129,15 @@ struct dmaplane_stats_kern {
 	atomic64_t completion_errors;	/* Lifetime CQ completion errors */
 	atomic64_t bytes_sent;		/* Lifetime bytes sent */
 	atomic64_t bytes_received;	/* Lifetime bytes received */
+
+	/* Phase 5: NUMA allocation tracking.
+	 * Per-buffer counters — each CREATE_BUFFER increments exactly one.
+	 * numa_local: all pages landed on the requested node.
+	 * numa_remote: at least one page landed on a different node.
+	 * numa_anon: allocated with DMAPLANE_NUMA_ANY. */
+	atomic64_t numa_local_allocs;
+	atomic64_t numa_remote_allocs;
+	atomic64_t numa_anon_allocs;
 };
 
 /*
@@ -289,6 +300,14 @@ struct dmaplane_buffer {
 	 *   Used for cleanup and diagnostics. */
 	bool dmabuf_exported;
 	struct dma_buf *dmabuf;
+
+	/* Phase 5: NUMA placement tracking.
+	 * numa_node: the node requested by userspace (-1 = DMAPLANE_NUMA_ANY).
+	 * actual_numa_node: the node where the majority of pages actually
+	 *   landed, determined post-hoc via page_to_nid(). May differ from
+	 *   numa_node due to silent buddy allocator fallback. */
+	int numa_node;
+	int actual_numa_node;
 };
 
 /* ── Phase 4: RDMA types ───────────────────────────────── */

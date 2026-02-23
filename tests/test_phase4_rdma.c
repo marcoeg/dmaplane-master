@@ -82,6 +82,7 @@ static int create_page_buffer(int fd, __u64 size, __u32 *buf_id)
 	struct dmaplane_buf_params bp = {
 		.alloc_type = DMAPLANE_BUF_TYPE_PAGES,
 		.size = size,
+		.numa_node = DMAPLANE_NUMA_ANY,
 	};
 	int ret;
 
@@ -199,6 +200,7 @@ static void test_mr_register_coherent(int fd)
 	memset(&bp, 0, sizeof(bp));
 	bp.alloc_type = DMAPLANE_BUF_TYPE_COHERENT;
 	bp.size = 4096;
+	bp.numa_node = DMAPLANE_NUMA_ANY;
 
 	ret = ioctl(fd, DMAPLANE_IOCTL_CREATE_BUFFER, &bp);
 	if (ret < 0) {

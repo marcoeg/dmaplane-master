@@ -105,7 +105,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **File operations:**
 - `dmaplane_open`: Checks `capable(CAP_SYS_ADMIN)` — DMA buffer allocation and mmap of kernel pages are privileged operations. Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`.
 - `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
-- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33).
+- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33, Phase 5: 0x50–0x51).
 - `dmaplane_mmap`: Maps DMA buffer pages into userspace. Extracts `buf_id = vma->vm_pgoff`, finds buffer under `buf_lock`. Sets `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Coherent: `dma_mmap_coherent` (resets `vm_pgoff = 0` first — `dma_mmap_coherent` interprets pgoff as offset into the allocation). Pages: `vm_insert_page` loop. Increments `mmap_count` on success (NOT via `vma_open` — Linux does not call `vma_open` for the initial mmap). VMA ops: `dmaplane_vma_open` (increment on fork/mremap), `dmaplane_vma_close` (decrement on munmap/exit).
 
 **Ioctl handlers:**
@@ -119,7 +119,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | `DMAPLANE_IOCTL_CREATE_BUFFER` | `dmaplane_ioctl_create_buffer` | `copy_from_user`, delegates to `dmabuf_rdma_create_buffer`, `copy_to_user` result. **copy_to_user undo**: if `copy_to_user` fails after buffer creation, destroys the buffer to prevent an orphaned allocation that userspace can never reference |
 | `DMAPLANE_IOCTL_DESTROY_BUFFER` | `dmaplane_ioctl_destroy_buffer` | `copy_from_user` bare `__u32` handle, delegates to `dmabuf_rdma_destroy_buffer`. Returns `-EBUSY` if `mmap_count > 0` or `dmabuf_exported` |
 | `DMAPLANE_IOCTL_GET_MMAP_INFO` | `dmaplane_ioctl_get_mmap_info` | Looks up buffer under `buf_lock`, returns `mmap_offset = buf_id << PAGE_SHIFT` and `mmap_size = buf->size`. Userspace uses these to call `mmap(2)` |
-| `DMAPLANE_IOCTL_GET_BUF_STATS` | `dmaplane_ioctl_get_buf_stats` | Reads `buffers_created` and `buffers_destroyed` atomics into `dmaplane_buf_stats` UAPI struct |
+| `DMAPLANE_IOCTL_GET_BUF_STATS` | `dmaplane_ioctl_get_buf_stats` | Reads `buffers_created`, `buffers_destroyed`, and 3 NUMA counters (`numa_local_allocs`, `numa_remote_allocs`, `numa_anon_allocs`) into `dmaplane_buf_stats` UAPI struct |
 | `DMAPLANE_IOCTL_EXPORT_DMABUF` | `dmaplane_ioctl_export_dmabuf` | `copy_from_user`, delegates to `dmaplane_dmabuf_export` (holds `buf_lock` for entire operation), `copy_to_user`. **No copy_to_user undo** — fd already installed in process fd table by `dma_buf_fd` |
 | `DMAPLANE_IOCTL_GET_DMABUF_STATS` | `dmaplane_ioctl_get_dmabuf_stats` | Reads 6 device-level dma-buf atomic counters into `dmaplane_dmabuf_stats` UAPI struct |
 | `DMAPLANE_IOCTL_SETUP_RDMA` | `dmaplane_ioctl_setup_rdma` | `copy_from_user`, null-terminate `ib_dev_name`, `down_write(&rdma_sem)`, call `rdma_engine_setup`, `up_write`, `copy_to_user`. **Undo on copy_to_user failure**: `down_write`, `rdma_engine_teardown`, `up_write` |
@@ -130,6 +130,8 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | `DMAPLANE_IOCTL_PINGPONG_BENCH` | `dmaplane_ioctl_pingpong_bench` | Same pattern with `benchmark_pingpong` |
 | `DMAPLANE_IOCTL_STREAMING_BENCH` | `dmaplane_ioctl_streaming_bench` | Same pattern with `benchmark_streaming` |
 | `DMAPLANE_IOCTL_GET_RDMA_STATS` | `dmaplane_ioctl_get_rdma_stats` | Read 8 RDMA atomic counters, `copy_to_user`. No lock — all stats are `atomic64_t` |
+| `DMAPLANE_IOCTL_QUERY_NUMA_TOPO` | `dmaplane_ioctl_query_numa_topo` | `kmalloc` topology struct (~600B, too large for stack), call `dmaplane_query_numa_topo`, `copy_to_user`, `kfree`. No lock — reads kernel-maintained topology data |
+| `DMAPLANE_IOCTL_NUMA_BENCH` | `dmaplane_ioctl_numa_bench` | `kmalloc` bench struct (~1100B), `copy_from_user`, call `dmaplane_numa_bench`, `copy_to_user`, `kfree`. No lock — benchmark allocates its own temporary buffers |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -394,3 +396,19 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 **ERR transition before QP destroy**: Transitioning QPs to `IB_QPS_ERR` before destruction causes the RDMA subsystem to flush all outstanding WRs, generating error completions. Without this, destroying a QP with outstanding WRs leaves the provider holding references to our CQE/SGE memory.
 
 **Buffer lookup in rdma_engine.c**: `rdma_engine_register_mr` does its own inline linear scan of `edev->buffers[]` under `buf_lock` rather than calling `dmabuf_rdma_find_buffer`. This is intentional: it needs to snapshot additional fields (`pages`, `nr_pages`, `vaddr`, `size`) atomically under the same lock hold, and the find function is static in main.c.
+
+### Phase 5: NUMA Topology & Optimization
+
+**Files:** `driver/numa_topology.h` (declarations), `driver/numa_topology.c` (~553 lines, topology query + NxN bandwidth benchmark). Modified: `driver/dmabuf_rdma.c` (NUMA-aware allocation), `driver/main.c` (2 ioctl handlers, stats init), `include/dmaplane_uapi.h` (2 structs, 2 ioctls, buf_params + 2 fields, buf_stats + 3 fields).
+
+**NUMA-aware buffer allocation** (`dmabuf_rdma_create_buffer`): `dmaplane_buf_params` gains `numa_node` (input) and `actual_numa_node` (output). For page-backed buffers, `alloc_page` is replaced by `alloc_pages_node(alloc_node, GFP_KERNEL | __GFP_ZERO, 0)` where `alloc_node = (target_node == DMAPLANE_NUMA_ANY) ? NUMA_NO_NODE : target_node`. NUMA_NO_NODE delegates to the current CPU's local node (same as old behavior). Post-hoc verification via `page_to_nid()` on each page tracks local vs remote counts; majority vote determines `actual_numa_node`. For coherent buffers, `dma_alloc_coherent` has no node parameter — placement is reported via `page_to_nid(virt_to_page(buf->vaddr))` for informational purposes only.
+
+**NUMA stats are per-buffer, not per-page**: Each `CREATE_BUFFER` increments exactly one of `numa_local_allocs` (all pages on requested node), `numa_remote_allocs` (at least one page misplaced), or `numa_anon_allocs` (NUMA_ANY). Stats live on `dmaplane_stats_kern` and are exposed via `GET_BUF_STATS`.
+
+**ABI change**: `dmaplane_buf_params` grows 16→24 bytes, `dmaplane_buf_stats` grows 16→40 bytes. The `_IOR`/`_IOWR` macros encode struct size in the ioctl number — kernel and userspace must agree or `ioctl()` returns `-ENOTTY`. All existing userspace callers updated to set `.numa_node = DMAPLANE_NUMA_ANY`. Note: `{0}` initializes `numa_node` to 0 (node 0), not -1 (DMAPLANE_NUMA_ANY) — explicit initialization is required.
+
+**Topology query** (`dmaplane_query_numa_topo`): Enumerates online NUMA nodes with sparse-to-compact index mapping via `node_to_idx[]` (kvcalloc). Populates per-node CPU counts via `for_each_online_cpu` + `cpu_to_node`, memory via `node_present_pages` + zone walk for free pages, and the ACPI SLIT distance matrix via `node_distance(a, b)`. No lock needed — kernel topology data is static.
+
+**Bandwidth benchmark** (`dmaplane_numa_bench`): For each (cpu_node, buf_node) pair, allocates target buffer on buf_node and source buffer on cpu_node via `alloc_pages_node` + `vmap`, spawns a kthread pinned to cpu_node via `set_cpus_allowed_ptr`, runs timed `memcpy` loop with `barrier()` after each iteration (prevents compiler optimization), and reports bandwidth (MB/s) and latency (ns/iter). Uses kthreads rather than workqueues for precise CPU affinity control. Sequential execution (not parallel) avoids cross-cell memory bus interference. Buffers allocated per-cell to avoid cache warming. Pre-touches buffers with `memset` before timing to eliminate page fault overhead.
+
+**No lock for topology or benchmark ioctls**: Topology reads kernel-maintained data structures. The benchmark allocates temporary buffers and doesn't touch any dmaplane device state. Both ioctl structs are heap-allocated (`kmalloc`) because they exceed safe kernel stack size (~600B and ~1100B vs 8KB stack on x86).

@@ -8,7 +8,7 @@ Blog posts and technical notes documenting each phase of the dmaplane project.
 | 2 | DMA Memory: Two Allocation Paths and the Zero-Copy Chain | Complete |
 | 3 | dma-buf Export and Zero-Copy Sharing | Complete |
 | 4 | Kernel-Space RDMA from First Principles | Complete |
-| 5 | Zero-Copy Sharing with dma-buf | Planned |
+| 5 | NUMA Topology and the Silent Performance Killer | Complete |
 | 6 | Backpressure: Why CQ Overflow Corrupts Data | Planned |
 | 7 | Instrumenting the Kernel Data Path | Planned |
 | 8 | GPU Memory Over the Wire | Planned |
@@ -24,4 +24,6 @@ Blog posts and technical notes documenting each phase of the dmaplane project.
 - `blog_03_dmabuf_zero_copy.md` — Phase 3 blog post
 - `phase04_technical_notes.md` — Phase 4 technical walkthrough
 - `blog_04_rdma_engine.md` — Phase 4 blog post
+- `phase05_technical_notes.md` — Phase 5 technical walkthrough
+- `blog_05_numa_topology.md` — Phase 5 blog post
 - `reference/` — Engineering plan, code overview, narrative (input documents)

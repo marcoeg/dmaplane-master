@@ -25,7 +25,7 @@
 
 static void explore_buffer(int fd, const char *name, unsigned int type)
 {
-	struct dmaplane_buf_params p = {0};
+	struct dmaplane_buf_params p = { .numa_node = DMAPLANE_NUMA_ANY };
 	struct dmaplane_mmap_info info = {0};
 	void *ptr;
 	uint32_t *data;

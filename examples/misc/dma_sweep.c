@@ -34,7 +34,7 @@ static uint64_t now_ns(void)
 static int sweep_one(int fd, size_t size, uint64_t *create_ns,
 		     uint64_t *map_ns, uint64_t *write_ns, uint64_t *total_ns)
 {
-	struct dmaplane_buf_params p = {0};
+	struct dmaplane_buf_params p = { .numa_node = DMAPLANE_NUMA_ANY };
 	struct dmaplane_mmap_info info = {0};
 	void *ptr;
 	uint32_t *data;

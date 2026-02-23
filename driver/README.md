@@ -80,6 +80,8 @@ Character device kernel module at `/dev/dmaplane`. Ioctl-driven, with per-channe
 | `DMAPLANE_IOCTL_PINGPONG_BENCH` | `_IOWR` | `dmaplane_bench_params` | Ping-pong latency benchmark |
 | `DMAPLANE_IOCTL_STREAMING_BENCH` | `_IOWR` | `dmaplane_bench_params` | Streaming throughput benchmark |
 | `DMAPLANE_IOCTL_GET_RDMA_STATS` | `_IOR` | `dmaplane_rdma_stats` | Return RDMA statistics |
+| `DMAPLANE_IOCTL_QUERY_NUMA_TOPO` | `_IOR` | `dmaplane_numa_topo` | Query NUMA topology: nodes, CPUs, memory, distances |
+| `DMAPLANE_IOCTL_NUMA_BENCH` | `_IOWR` | `dmaplane_numa_bench_params` | Run NxN cross-node bandwidth benchmark |
 
 ## Concurrency Model
 

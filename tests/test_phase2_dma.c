@@ -57,7 +57,7 @@ static int dev_open(void)
  */
 static unsigned int create_buffer(int fd, unsigned int type, unsigned long size)
 {
-	struct dmaplane_buf_params p = {0};
+	struct dmaplane_buf_params p = { .numa_node = DMAPLANE_NUMA_ANY };
 
 	p.alloc_type = type;
 	p.size = size;
@@ -466,7 +466,7 @@ static void test_large_buffer(int fd)
 static void test_invalid_params(int fd)
 {
 	const char *name = "invalid parameters";
-	struct dmaplane_buf_params p = {0};
+	struct dmaplane_buf_params p = { .numa_node = DMAPLANE_NUMA_ANY };
 	struct dmaplane_mmap_info info = {0};
 	__u32 bad_id = 99999;
 

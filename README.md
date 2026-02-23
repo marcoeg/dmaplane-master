@@ -9,8 +9,8 @@ A Linux kernel module for learning the host-side data path between AI frameworks
 | 1 | Complete | Driver foundations & concurrency |
 | 2 | Complete | DMA memory allocation |
 | 3 | Complete | dma-buf export & zero-copy sharing |
-| 4 | **Current** | RDMA engine |
-| 5 | Planned | dma-buf & zero-copy sharing |
+| 4 | Complete | RDMA engine |
+| 5 | **Current** | NUMA, topology & optimization |
 | 6 | Planned | Backpressure & flow control |
 | 7 | Planned | Instrumentation & latency measurement |
 | 8 | Planned | GPU memory integration |
@@ -39,6 +39,9 @@ sudo ./tests/test_phase3_dmabuf
 # Run Phase 4 tests (requires Soft-RoCE: bash scripts/setup_rxe.sh)
 sudo ./tests/test_phase4_rdma
 
+# Run Phase 5 tests
+sudo ./tests/test_phase5_numa
+
 # Run Phase 2 examples
 sudo ./examples/misc/dma_explorer
 sudo ./examples/misc/dma_sweep
@@ -66,6 +69,8 @@ dmaplane-master/
 │   ├── rdma_engine.c          # RDMA setup/teardown, MR registration, post/poll
 │   ├── benchmark.h            # RDMA benchmark API declarations
 │   ├── benchmark.c            # Loopback, ping-pong, streaming benchmarks
+│   ├── numa_topology.h        # NUMA topology API declarations
+│   ├── numa_topology.c        # Topology query, NxN bandwidth benchmark
 │   └── main.c                 # Char device, ioctl dispatch, mmap, module init/exit
 ├── include/                   # Userspace-visible headers
 │   └── dmaplane_uapi.h       # Ioctl numbers, shared structs (kernel ↔ user)
@@ -73,7 +78,8 @@ dmaplane-master/
 │   ├── test_phase1_driver.c   # Phase 1: rings, workers, stress test
 │   ├── test_phase2_dma.c      # Phase 2: buffer alloc, mmap, lifecycle
 │   ├── test_phase3_dmabuf.c   # Phase 3: dma-buf export, fd lifecycle, mmap
-│   └── test_phase4_rdma.c    # Phase 4: RDMA setup, MR, loopback, benchmarks
+│   ├── test_phase4_rdma.c    # Phase 4: RDMA setup, MR, loopback, benchmarks
+│   └── test_phase5_numa.c   # Phase 5: NUMA topology, allocation, benchmark
 ├── examples/                  # Progressive demos (populated in later phases)
 │   ├── misc/                  # Standalone demos (Phase 2+)
 │   ├── streamer/              # Weight-streaming TUI (Phase 6)

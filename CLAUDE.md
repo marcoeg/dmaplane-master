@@ -6,7 +6,7 @@ dmaplane is a Linux kernel module for learning the host-side data path between A
 
 ## Current Phase
 
-Phase 4 — RDMA Integration — **COMPLETE**. See `docs/reference/MASTER_PLAN.md` for the next phase spec.
+Phase 5 — NUMA, Topology & Optimization — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the next phase spec.
 
 ## Key References
 
@@ -116,7 +116,7 @@ dmaplane-master/
 | 2 | **COMPLETE** | DMA memory allocation |
 | 3 | **COMPLETE** | dma-buf export & zero-copy sharing |
 | 4 | **COMPLETE** | RDMA engine |
-| 5 | Planned | dma-buf & zero-copy sharing |
+| 5 | **CURRENT** | NUMA, topology & optimization |
 | 6 | Planned | Backpressure & flow control |
 | 7 | Planned | Instrumentation & latency measurement |
 | 8 | Planned | GPU memory integration |
