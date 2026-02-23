@@ -87,6 +87,7 @@
 #include "rdma_engine.h"
 #include "benchmark.h"
 #include "numa_topology.h"
+#include "flow_control.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
@@ -1353,6 +1354,177 @@ static long dmaplane_ioctl_numa_bench(struct dmaplane_file_ctx *ctx,
 }
 
 /* ------------------------------------------------------------------ */
+/* Phase 6 ioctl handlers: Flow control                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * dmaplane_ioctl_configure_flow — Configure credit-based flow control.
+ *
+ * Sets max_credits, high/low watermarks.  No lock needed — configuration
+ * fields are only read by the benchmark send loop (single-threaded).
+ * Expected to be called before running a sustained benchmark.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user/copy_to_user fails.
+ *  -EINVAL  if parameters are out of range.
+ */
+static long dmaplane_ioctl_configure_flow(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_flow_params p;
+	int ret;
+
+	if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+		return -EFAULT;
+
+	ret = dmaplane_flow_configure(dev, &p);
+	if (ret)
+		return ret;
+
+	p.status = 0;
+	if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+		return -EFAULT;
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_sustained_stream — Run sustained streaming benchmark.
+ *
+ * Runs for duration_secs wall-clock seconds with credit-based flow
+ * control.  Acquires rdma_sem read lock to protect the RDMA context.
+ *
+ * The struct is heap-allocated for consistency with other large
+ * benchmark handlers (sweep at ~800 bytes requires heap allocation;
+ * sustained at ~72 bytes doesn't strictly need it but follows the
+ * same pattern).
+ *
+ * Returns:
+ *   0       on success.
+ *  -ENOMEM  if kmalloc fails.
+ *  -EFAULT  if copy_from_user/copy_to_user fails.
+ *  -ENODEV  if RDMA is not initialized.
+ */
+static long dmaplane_ioctl_sustained_stream(struct dmaplane_file_ctx *ctx,
+					    unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_sustained_params *sp;
+	int ret;
+
+	sp = kmalloc(sizeof(*sp), GFP_KERNEL);
+	if (!sp)
+		return -ENOMEM;
+
+	if (copy_from_user(sp, (void __user *)arg, sizeof(*sp))) {
+		kfree(sp);
+		return -EFAULT;
+	}
+
+	down_read(&dev->rdma_sem);
+	if (!dev->rdma.initialized) {
+		up_read(&dev->rdma_sem);
+		kfree(sp);
+		return -ENODEV;
+	}
+	ret = dmaplane_sustained_stream(dev, sp);
+	up_read(&dev->rdma_sem);
+
+	if (ret) {
+		kfree(sp);
+		return ret;
+	}
+
+	if (copy_to_user((void __user *)arg, sp, sizeof(*sp))) {
+		kfree(sp);
+		return -EFAULT;
+	}
+	kfree(sp);
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_qdepth_sweep — Run queue depth sweep benchmark.
+ *
+ * Iterates across queue depths, producing throughput/latency curves.
+ * Acquires rdma_sem read lock.
+ *
+ * The struct is heap-allocated (~800+ bytes — three arrays of 32 x u64
+ * exceed safe kernel stack usage).
+ *
+ * Returns:
+ *   0       on success.
+ *  -ENOMEM  if kmalloc fails.
+ *  -EFAULT  if copy_from_user/copy_to_user fails.
+ *  -ENODEV  if RDMA is not initialized.
+ */
+static long dmaplane_ioctl_qdepth_sweep(struct dmaplane_file_ctx *ctx,
+					unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_sweep_params *sp;
+	int ret;
+
+	sp = kmalloc(sizeof(*sp), GFP_KERNEL);
+	if (!sp)
+		return -ENOMEM;
+
+	if (copy_from_user(sp, (void __user *)arg, sizeof(*sp))) {
+		kfree(sp);
+		return -EFAULT;
+	}
+
+	down_read(&dev->rdma_sem);
+	if (!dev->rdma.initialized) {
+		up_read(&dev->rdma_sem);
+		kfree(sp);
+		return -ENODEV;
+	}
+	ret = dmaplane_qdepth_sweep(dev, sp);
+	up_read(&dev->rdma_sem);
+
+	if (ret) {
+		kfree(sp);
+		return ret;
+	}
+
+	if (copy_to_user((void __user *)arg, sp, sizeof(*sp))) {
+		kfree(sp);
+		return -EFAULT;
+	}
+	kfree(sp);
+	return 0;
+}
+
+/*
+ * dmaplane_ioctl_get_flow_stats — Copy flow control statistics to userspace.
+ *
+ * No lock needed — all stats are atomic64_t, individually consistent.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_to_user fails.
+ */
+static long dmaplane_ioctl_get_flow_stats(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_flow_stats fs = {
+		.credit_stalls         = atomic64_read(&dev->stats.credit_stalls),
+		.high_watermark_events = atomic64_read(&dev->stats.high_watermark_events),
+		.low_watermark_events  = atomic64_read(&dev->stats.low_watermark_events),
+		.cq_overflows          = atomic64_read(&dev->stats.cq_overflows),
+		.total_sustained_bytes = atomic64_read(&dev->stats.sustained_bytes),
+		.total_sustained_ops   = atomic64_read(&dev->stats.sustained_ops),
+	};
+
+	if (copy_to_user((void __user *)arg, &fs, sizeof(fs)))
+		return -EFAULT;
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
 
@@ -1486,6 +1658,16 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	case DMAPLANE_IOCTL_NUMA_BENCH:
 		return dmaplane_ioctl_numa_bench(ctx, arg);
 
+	/* Phase 6: Flow control */
+	case DMAPLANE_IOCTL_CONFIGURE_FLOW:
+		return dmaplane_ioctl_configure_flow(ctx, arg);
+	case DMAPLANE_IOCTL_SUSTAINED_STREAM:
+		return dmaplane_ioctl_sustained_stream(ctx, arg);
+	case DMAPLANE_IOCTL_QDEPTH_SWEEP:
+		return dmaplane_ioctl_qdepth_sweep(ctx, arg);
+	case DMAPLANE_IOCTL_GET_FLOW_STATS:
+		return dmaplane_ioctl_get_flow_stats(ctx, arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -1566,6 +1748,20 @@ static int __init dmaplane_init(void)
 	atomic64_set(&dma_dev->stats.numa_local_allocs, 0);
 	atomic64_set(&dma_dev->stats.numa_remote_allocs, 0);
 	atomic64_set(&dma_dev->stats.numa_anon_allocs, 0);
+
+	/* Phase 6: Flow control */
+	atomic_set(&dma_dev->flow.credits, 0);
+	dma_dev->flow.max_credits = 0;
+	dma_dev->flow.high_watermark = 0;
+	dma_dev->flow.low_watermark = 0;
+	dma_dev->flow.configured = false;
+	dma_dev->flow.paused = false;
+	atomic64_set(&dma_dev->stats.credit_stalls, 0);
+	atomic64_set(&dma_dev->stats.high_watermark_events, 0);
+	atomic64_set(&dma_dev->stats.low_watermark_events, 0);
+	atomic64_set(&dma_dev->stats.cq_overflows, 0);
+	atomic64_set(&dma_dev->stats.sustained_bytes, 0);
+	atomic64_set(&dma_dev->stats.sustained_ops, 0);
 
 	/*
 	 * Create platform device for DMA operations.

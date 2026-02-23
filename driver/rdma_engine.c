@@ -990,3 +990,43 @@ int rdma_engine_post_recv(struct dmaplane_dev *edev,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(rdma_engine_post_recv);
+
+/*
+ * rdma_engine_flush_cq — Drain all pending completions from a CQ.
+ *
+ * Polls until no more completions are available.  Used between benchmark
+ * runs to clear stale completions that would poison the next run.
+ */
+int rdma_engine_flush_cq(struct ib_cq *cq)
+{
+	struct ib_wc wc;
+	int flushed = 0;
+	int ret;
+
+	for (;;) {
+		ret = ib_poll_cq(cq, 1, &wc);
+		if (ret <= 0)
+			break;
+		flushed++;
+	}
+	return flushed;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_flush_cq);
+
+/*
+ * rdma_engine_cmp_u64 — Comparator for __u64 arrays.
+ *
+ * For use with kernel sort() to compute latency percentiles.
+ */
+int rdma_engine_cmp_u64(const void *a, const void *b)
+{
+	__u64 va = *(__u64 *)a;
+	__u64 vb = *(__u64 *)b;
+
+	if (va < vb)
+		return -1;
+	if (va > vb)
+		return 1;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_cmp_u64);

@@ -6,7 +6,7 @@ dmaplane is a Linux kernel module for learning the host-side data path between A
 
 ## Current Phase
 
-Phase 5 — NUMA, Topology & Optimization — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the next phase spec.
+Phase 6 — Backpressure & Throughput Modeling — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the next phase spec.
 
 ## Key References
 
@@ -61,7 +61,7 @@ important, flag it before implementing.
 
 ### Ioctl numbering
 - Magic: `0xE4`
-- Groups: buffer management `0x01`–`0x09`, RDMA `0x10`–`0x19`, MR `0x20`–`0x29`, benchmarks `0x30`–`0x39`, stats `0x40`–`0x49`, NUMA `0x50`–`0x59`, GPU `0x60`–`0x69`, peer QP `0x70`–`0x79`, WRITEIMM `0x80`–`0x89`
+- Groups: buffer management `0x01`–`0x09`, RDMA `0x10`–`0x19`, MR `0x20`–`0x29`, benchmarks `0x30`–`0x39`, stats `0x40`–`0x49`, NUMA `0x50`–`0x59`, flow control `0x60`–`0x63`, peer QP `0x70`–`0x79`, WRITEIMM `0x80`–`0x89` (GPU deferred from `0x60` to `0x70+`)
 - Phase 1 uses `0x01`–`0x04` (create channel, submit, complete, get stats)
 
 ### Build system
@@ -116,8 +116,8 @@ dmaplane-master/
 | 2 | **COMPLETE** | DMA memory allocation |
 | 3 | **COMPLETE** | dma-buf export & zero-copy sharing |
 | 4 | **COMPLETE** | RDMA engine |
-| 5 | **CURRENT** | NUMA, topology & optimization |
-| 6 | Planned | Backpressure & flow control |
+| 5 | **COMPLETE** | NUMA, topology & optimization |
+| 6 | **CURRENT** | Backpressure & flow control |
 | 7 | Planned | Instrumentation & latency measurement |
 | 8 | Planned | GPU memory integration |
 | 9 | Planned | Disaggregated inference demo |

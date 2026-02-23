@@ -55,4 +55,22 @@ int rdma_engine_post_recv(struct dmaplane_dev *edev,
  */
 int rdma_engine_poll_cq(struct ib_cq *cq, struct ib_wc *wc, int timeout_ms);
 
+/*
+ * rdma_engine_flush_cq() — Drain all pending completions from a CQ.
+ *
+ * Polls until no more completions are available.  Used to clean up stale
+ * completions between benchmark runs — prevents poisoning from a previous
+ * run's leftover CQEs.
+ *
+ * Returns: number of completions flushed.
+ */
+int rdma_engine_flush_cq(struct ib_cq *cq);
+
+/*
+ * rdma_engine_cmp_u64() — Comparator for __u64 arrays.
+ *
+ * For use with kernel sort() to compute latency percentiles (P99).
+ */
+int rdma_engine_cmp_u64(const void *a, const void *b);
+
 #endif /* _RDMA_ENGINE_H */

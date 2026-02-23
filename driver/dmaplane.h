@@ -138,6 +138,19 @@ struct dmaplane_stats_kern {
 	atomic64_t numa_local_allocs;
 	atomic64_t numa_remote_allocs;
 	atomic64_t numa_anon_allocs;
+
+	/* Phase 6: Flow control tracking.
+	 * Cumulative across all sustained streaming runs.
+	 * credit_stalls: sender couldn't send due to zero credits.
+	 * high/low_watermark_events: hysteresis transitions.
+	 * cq_overflows: should always be 0 if credits are configured.
+	 * sustained_bytes/ops: total data moved by sustained benchmarks. */
+	atomic64_t credit_stalls;
+	atomic64_t high_watermark_events;
+	atomic64_t low_watermark_events;
+	atomic64_t cq_overflows;
+	atomic64_t sustained_bytes;
+	atomic64_t sustained_ops;
 };
 
 /*
@@ -489,6 +502,32 @@ struct dmaplane_dev {
 
 	__u32 next_mr_id;	/* Monotonically increasing.  Wraps to 1
 				 * (skips 0) to avoid handle 0 ambiguity. */
+
+	/* ── Phase 6: Flow control ── */
+
+	/*
+	 * Credit-based backpressure state.
+	 *
+	 * credits tracks available send slots (atomic for send/completion
+	 * race in the general case, though IB_POLL_DIRECT makes polling
+	 * synchronous).  paused implements watermark hysteresis — only
+	 * accessed from the benchmark's single-threaded send loop, never
+	 * concurrently.  max_credits/high_watermark/low_watermark are
+	 * set by CONFIGURE_FLOW and read by the benchmark loop.
+	 *
+	 * No dedicated lock: paused is single-threaded (one benchmark
+	 * send loop at a time), credits is atomic, and the configuration
+	 * fields are only written by CONFIGURE_FLOW (expected to be called
+	 * before running a benchmark).
+	 */
+	struct {
+		atomic_t credits;	/* available send slots */
+		unsigned int max_credits;	/* configured ceiling */
+		unsigned int high_watermark;	/* pause threshold */
+		unsigned int low_watermark;	/* resume threshold */
+		bool configured;	/* true after CONFIGURE_FLOW */
+		bool paused;		/* sender in backpressure state */
+	} flow;
 };
 
 /*

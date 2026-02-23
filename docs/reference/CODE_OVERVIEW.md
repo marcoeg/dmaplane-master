@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 5 — NUMA, Topology & Optimization
+## Current State: Phase 6 — Backpressure & Throughput Modeling
 
 ## Licensing
 
@@ -60,6 +60,14 @@ The userspace-visible API header. This is the primary definition point for all t
 - NUMA benchmark (`dmaplane_numa_bench_params`): `__u64 buffer_size` (in), `__u32 iterations` (in), `__u64 bw_mbps[8][8]` (out), `__u64 lat_ns[8][8]` (out), `__u32 nr_nodes` (out), `__u32 status` (out)
 - Ioctl commands: `DMAPLANE_IOCTL_QUERY_NUMA_TOPO` (`_IOR`, 0x50), `DMAPLANE_IOCTL_NUMA_BENCH` (`_IOWR`, 0x51)
 
+**Phase 6 additions:**
+- Flow control configuration (`dmaplane_flow_params`): `__u32 max_credits` (in), `__u32 high_watermark` (in), `__u32 low_watermark` (in), `__u32 status` (out)
+- Sustained streaming (`dmaplane_sustained_params`): `__u32 mr_id` (in), `__u32 msg_size` (in), `__u32 queue_depth` (in), `__u32 duration_secs` (in), `__u64 total_bytes` (out), `__u64 total_ops` (out), `__u64 avg_throughput_mbps` (out), `__u64 min_window_mbps` (out), `__u64 max_window_mbps` (out), `__u64 stall_count` (out), `__u64 cq_overflow_count` (out), `__u32 status` (out)
+- Sweep constant: `DMAPLANE_MAX_SWEEP_POINTS` (32)
+- Queue depth sweep (`dmaplane_sweep_params`): `__u32 mr_id` (in), `__u32 msg_size` (in), `__u32 iterations` (in), `__u32 min_qdepth` (in), `__u32 max_qdepth` (in), `__u32 step` (in), `__u64 throughput_mbps[32]` (out), `__u64 avg_latency_ns[32]` (out), `__u64 p99_latency_ns[32]` (out), `__u32 nr_points` (out), `__u32 saturation_qdepth` (out, 0 = no saturation detected), `__u32 status` (out)
+- Flow stats (`dmaplane_flow_stats`): 6 `__u64` counters — `credit_stalls`, `high_watermark_events`, `low_watermark_events`, `cq_overflows`, `total_sustained_bytes`, `total_sustained_ops`
+- Ioctl commands: `DMAPLANE_IOCTL_CONFIGURE_FLOW` (`_IOWR`, 0x60), `DMAPLANE_IOCTL_SUSTAINED_STREAM` (`_IOWR`, 0x61), `DMAPLANE_IOCTL_QDEPTH_SWEEP` (`_IOWR`, 0x62), `DMAPLANE_IOCTL_GET_FLOW_STATS` (`_IOR`, 0x63)
+
 All userspace consumers (`tests/`, `examples/misc/`) include this header via `-I../include` or `-I../../include`.
 
 ### `driver/dmaplane.h`
@@ -68,13 +76,13 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 
 **Kernel-internal types:**
 - `struct dmaplane_ring`: array of `dmaplane_ring_entry[RING_SIZE]`, `spinlock_t lock`, `unsigned int head` (producer writes, `____cacheline_aligned_in_smp`), `unsigned int tail` (consumer reads, `____cacheline_aligned_in_smp`). Head and tail are monotonically increasing — modulo is applied only when indexing into the array. Full when `(head - tail) == RING_SIZE`, empty when `head == tail`.
-- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`, plus Phase 4 RDMA counters: `atomic64_t mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`, plus Phase 5 NUMA counters: `atomic64_t numa_local_allocs`, `numa_remote_allocs`, `numa_anon_allocs`. All counters are device-level (survive individual resource cycles). Safe for concurrent updates and reads.
+- `struct dmaplane_stats_kern`: kernel-internal stats with `atomic64_t total_submissions`, `atomic64_t total_completions`, `atomic_t ring_high_watermark`, `atomic_t dropped_count`, `atomic64_t buffers_created`, `atomic64_t buffers_destroyed`, plus Phase 3 dma-buf counters: `atomic64_t dmabufs_exported`, `dmabufs_released`, `dmabuf_attachments`, `dmabuf_detachments`, `dmabuf_maps`, `dmabuf_unmaps`, plus Phase 4 RDMA counters: `atomic64_t mrs_registered`, `mrs_deregistered`, `sends_posted`, `recvs_posted`, `completions_polled`, `completion_errors`, `bytes_sent`, `bytes_received`, plus Phase 5 NUMA counters: `atomic64_t numa_local_allocs`, `numa_remote_allocs`, `numa_anon_allocs`, plus Phase 6 flow control counters: `atomic64_t credit_stalls`, `high_watermark_events`, `low_watermark_events`, `cq_overflows`, `sustained_bytes`, `sustained_ops`. All counters are device-level (survive individual resource cycles). Safe for concurrent updates and reads.
 - `struct dmaplane_channel`: `struct kref refcount` (channel lifetime), `struct mutex lock` (per-channel state lock), `sub_ring` (submission ring), `comp_ring` (completion ring), `struct task_struct *worker` (kthread), `wait_queue_head_t wait_queue` (worker sleeps here), `unsigned int id` (channel index), `atomic_t in_flight` (submissions not yet completed), `bool shutdown` (signals worker to exit), `bool active` (slot is in use, set to false by kref release callback), `struct dmaplane_stats_kern stats` (atomic counters).
 - `struct dmaplane_buffer` (Phase 2+3): per-buffer tracking. `unsigned int id` (handle, never 0), `int alloc_type` (`BUF_TYPE_COHERENT` or `BUF_TYPE_PAGES`), `size_t size`, `bool in_use` (protected by `buf_lock`), `void *vaddr` (kernel VA — from `dma_alloc_coherent` or `vmap`), `dma_addr_t dma_handle` (coherent only), `struct page **pages` + `unsigned int nr_pages` (page-backed only), `atomic_t mmap_count` (active userspace mappings, prevents destroy while mapped). Phase 3 additions: `bool dmabuf_exported` (prevents double export and blocks DESTROY_BUFFER while a dma-buf wraps this buffer, set/cleared under `buf_lock`), `struct dma_buf *dmabuf` (back-pointer, NULL when not exported). Phase 5 additions: `int numa_node` (requested NUMA node, -1 = DMAPLANE_NUMA_ANY), `int actual_numa_node` (actual node where majority of pages landed, determined post-hoc via `page_to_nid`).
 - `struct poll_cq_wait` (Phase 4): managed CQ completion wait — `struct ib_cqe cqe` (callback entry, `.done = poll_cq_done`), `struct ib_wc wc` (stashed work completion), `struct completion done` (signaled by callback). Used with `IB_POLL_DIRECT` CQs.
 - `struct dmaplane_mr_entry` (Phase 4): per-MR tracking — `__u32 id`, `__u32 buf_id`, `struct ib_mr *mr` (NULL for local-only, non-NULL for fast-reg), `__u32 lkey`, `__u32 rkey`, `__u64 sge_addr` (kernel VA for rxe, IOMMU addr for real HW), `struct sg_table *sgt`, `int sgt_nents`, `bool in_use`, `ktime_t reg_time`. Two paths: local-only uses `pd->local_dma_lkey` (rkey=0), fast-reg uses `ib_alloc_mr` + `IB_WR_REG_MR` for remote access.
 - `struct dmaplane_rdma_ctx` (Phase 4): RDMA connection context — `struct ib_device *ib_dev`, `struct ib_pd *pd`, `struct ib_cq *cq_a`/`*cq_b` (loopback CQs), `struct ib_qp *qp_a`/`*qp_b` (loopback QPs), `__u8 port`, `__u16 lid`, `int gid_index`, `union ib_gid gid`, `bool initialized`. The loopback pair (QP-A sends, QP-B receives) benchmarks the full DMA data path without a remote peer.
-- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Phase 4 additions: `struct dmaplane_rdma_ctx rdma`, `struct rw_semaphore rdma_sem` (read for MR/benchmark ops, write for setup/teardown), `struct dmaplane_mr_entry mrs[DMAPLANE_MAX_MRS]` (64 slots), `struct mutex mr_lock` (protects MR array), `__u32 next_mr_id`. Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
+- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Phase 4 additions: `struct dmaplane_rdma_ctx rdma`, `struct rw_semaphore rdma_sem` (read for MR/benchmark ops, write for setup/teardown), `struct dmaplane_mr_entry mrs[DMAPLANE_MAX_MRS]` (64 slots), `struct mutex mr_lock` (protects MR array), `__u32 next_mr_id`. Phase 6 additions: `struct { atomic_t credits; unsigned int max_credits, high_watermark, low_watermark; bool configured, paused; } flow` — credit-based flow control state (no dedicated lock: `paused` is single-threaded from the benchmark send loop, `credits` is atomic, config fields are write-before-read). Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
 - `struct dmaplane_file_ctx`: `struct dmaplane_dev *dev`, `struct dmaplane_channel *chan` (NULL until CREATE_CHANNEL).
 - `dmaplane_channel_release()`: kref release callback — marks slot inactive (`active = false`), decrements `active_channels`, increments `total_channels_destroyed`. Called when the last kref drops to zero.
 - Inline helpers: `dmaplane_ring_full()`, `dmaplane_ring_empty()`, `dmaplane_ring_count()`.
@@ -94,7 +102,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **Module init** (`dmaplane_init`):
 - `kzalloc` the device context
 - `platform_device_alloc("dmaplane_dma")` + `platform_device_add` + `dma_set_mask_and_coherent` (64-bit, fallback 32-bit) — creates a DMA-capable device. `device_create` alone is NOT DMA-capable; the DMA API requires a bus-registered device with a DMA mask.
-- `mutex_init` for `buf_lock`, `next_buf_id = 1`. Phase 4: `init_rwsem(&rdma_sem)`, `mutex_init(&mr_lock)`, `next_mr_id = 1`, 8 RDMA `atomic64_set` calls
+- `mutex_init` for `buf_lock`, `next_buf_id = 1`. Phase 4: `init_rwsem(&rdma_sem)`, `mutex_init(&mr_lock)`, `next_mr_id = 1`, 8 RDMA `atomic64_set` calls. Phase 6: `flow.credits = 0`, `flow.configured = false`, `flow.paused = false`, 6 flow control `atomic64_set` calls
 - `alloc_chrdev_region` for dynamic major number
 - `cdev_init` + `cdev_add`
 - `class_create` + `device_create` for `/dev/dmaplane` udev node
@@ -112,7 +120,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **File operations:**
 - `dmaplane_open`: Checks `capable(CAP_SYS_ADMIN)` — DMA buffer allocation and mmap of kernel pages are privileged operations. Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`.
 - `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
-- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33, Phase 5: 0x50–0x51).
+- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33, Phase 5: 0x50–0x51, Phase 6: 0x60–0x63).
 - `dmaplane_mmap`: Maps DMA buffer pages into userspace. Extracts `buf_id = vma->vm_pgoff`, finds buffer under `buf_lock`. Sets `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Coherent: `dma_mmap_coherent` (resets `vm_pgoff = 0` first — `dma_mmap_coherent` interprets pgoff as offset into the allocation). Pages: `vm_insert_page` loop. Increments `mmap_count` on success (NOT via `vma_open` — Linux does not call `vma_open` for the initial mmap). VMA ops: `dmaplane_vma_open` (increment on fork/mremap), `dmaplane_vma_close` (decrement on munmap/exit).
 
 **Ioctl handlers:**
@@ -139,6 +147,10 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | `DMAPLANE_IOCTL_GET_RDMA_STATS` | `dmaplane_ioctl_get_rdma_stats` | Read 8 RDMA atomic counters, `copy_to_user`. No lock — all stats are `atomic64_t` |
 | `DMAPLANE_IOCTL_QUERY_NUMA_TOPO` | `dmaplane_ioctl_query_numa_topo` | `kmalloc` topology struct (~600B, too large for stack), call `dmaplane_query_numa_topo`, `copy_to_user`, `kfree`. No lock — reads kernel-maintained topology data |
 | `DMAPLANE_IOCTL_NUMA_BENCH` | `dmaplane_ioctl_numa_bench` | `kmalloc` bench struct (~1100B), `copy_from_user`, call `dmaplane_numa_bench`, `copy_to_user`, `kfree`. No lock — benchmark allocates its own temporary buffers |
+| `DMAPLANE_IOCTL_CONFIGURE_FLOW` | `dmaplane_ioctl_configure_flow` | `copy_from_user`, call `dmaplane_flow_configure`, `copy_to_user`. No lock — config fields are write-before-read |
+| `DMAPLANE_IOCTL_SUSTAINED_STREAM` | `dmaplane_ioctl_sustained_stream` | `kmalloc` params, `copy_from_user`, `down_read(&rdma_sem)`, check `rdma.initialized`, call `dmaplane_sustained_stream`, `up_read`, `copy_to_user`, `kfree`. Returns `-ENODEV` if RDMA not initialized |
+| `DMAPLANE_IOCTL_QDEPTH_SWEEP` | `dmaplane_ioctl_qdepth_sweep` | `kmalloc` params (~800B, three arrays of 32 × `__u64`), same rdma_sem read pattern, call `dmaplane_qdepth_sweep` |
+| `DMAPLANE_IOCTL_GET_FLOW_STATS` | `dmaplane_ioctl_get_flow_stats` | Read 6 flow control atomic counters, `copy_to_user`. No lock |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -223,7 +235,7 @@ dma-buf exporter for page-backed buffers. Implements the `dma_buf_ops` vtable wi
 
 ### `driver/rdma_engine.h`
 
-Header declaring the RDMA engine API: `poll_cq_done` (managed CQ callback), `rdma_engine_setup`/`teardown`, `rdma_engine_register_mr`/`deregister_mr`, `rdma_engine_post_send`/`post_recv`, `rdma_engine_poll_cq`. Locking contract: callers must hold `rdma_sem` (read for MR/benchmark ops, write for setup/teardown).
+Header declaring the RDMA engine API: `poll_cq_done` (managed CQ callback), `rdma_engine_setup`/`teardown`, `rdma_engine_register_mr`/`deregister_mr`, `rdma_engine_post_send`/`post_recv`, `rdma_engine_poll_cq`, `rdma_engine_flush_cq` (drain stale completions), `rdma_engine_cmp_u64` (comparator for sort/P99). Locking contract: callers must hold `rdma_sem` (read for MR/benchmark ops, write for setup/teardown).
 
 ### `driver/rdma_engine.c`
 
@@ -245,6 +257,8 @@ Kernel-level InfiniBand Verbs client. Communicates with `ib_core` and `rdma_rxe`
 - `rdma_engine_deregister_mr`: under `mr_lock`, `ib_dma_unmap_sg` (defensive NULL check on `ib_dev`), `sg_free_table`, `kfree(sgt)`, `ib_dereg_mr` if fast-reg, mark `in_use = false`.
 - `rdma_engine_post_send`/`post_recv`: build SGE from MR entry, init completion, post via `ib_post_send`/`ib_post_recv`.
 - `rdma_engine_poll_cq`: busy-poll with wall-clock deadline, `ib_poll_cq` + `usleep_range(50, 200)` + `cond_resched`. Returns 1 (success), 0 (timeout), negative (error).
+- `rdma_engine_flush_cq` (Phase 6): drains all pending completions from a CQ. Tight loop calling `ib_poll_cq` until no more available. Returns count flushed. Used between benchmark runs to clear stale completions. Shared utility — moved from `benchmark.c` static to avoid duplication with `flow_control.c`.
+- `rdma_engine_cmp_u64` (Phase 6): comparator for `__u64` arrays, for use with kernel `sort()` for P99 latency. Also moved from `benchmark.c` static.
 
 ### `driver/benchmark.h`
 
@@ -252,11 +266,11 @@ Header declaring three benchmark functions: `benchmark_loopback`, `benchmark_pin
 
 ### `driver/benchmark.c`
 
-Three RDMA benchmarks over the loopback QP pair. All snapshot MR and buffer fields by value under locks, then release locks before I/O.
+Three RDMA benchmarks over the loopback QP pair. All snapshot MR and buffer fields by value under locks, then release locks before I/O. Phase 6 moved `flush_cq` and `cmp_u64` from static helpers here to `rdma_engine.c` as shared exported functions — `benchmark.c` now calls `rdma_engine_flush_cq` and `rdma_engine_cmp_u64`.
 
 - `benchmark_loopback`: single send (QP-A) → recv (QP-B). Writes 0xDEADBEEF pattern, polls both CQs, reports `latency_ns`.
-- `benchmark_pingpong`: N iterations of send+recv. Collects per-iteration latency, sorts via `sort()`, computes avg, P99, throughput (MB/s = bytes * 1000 / ns).
-- `benchmark_streaming`: pipelines sends up to `queue_depth` outstanding. Pre-posts `min(2*qdepth, iterations)` receives, replenishes during the send/poll loop. Eagerly drains recv CQ-B to prevent overflow. Flushes both CQs before and after for clean state.
+- `benchmark_pingpong`: N iterations of send+recv. Collects per-iteration latency, sorts via `sort()` + `rdma_engine_cmp_u64`, computes avg, P99, throughput (MB/s = bytes * 1000 / ns).
+- `benchmark_streaming`: pipelines sends up to `queue_depth` outstanding. Pre-posts `min(2*qdepth, iterations)` receives, replenishes during the send/poll loop. Eagerly drains recv CQ-B to prevent overflow. Flushes both CQs via `rdma_engine_flush_cq` before and after for clean state.
 
 All three are `EXPORT_SYMBOL_GPL`.
 
@@ -337,6 +351,21 @@ Userspace test suite for Phase 5 NUMA topology and optimization. Opens `/dev/dma
 6. **NUMA stats** — call `GET_BUF_STATS`, verify `numa_local_allocs + numa_remote_allocs + numa_anon_allocs > 0`
 7. **Cross-node bandwidth benchmark** — `NUMA_BENCH` with 1 MB, 100 iterations. Print NxN bandwidth matrix. On single-node, print 1x1 result. On multi-node, compute and print penalty ratios.
 8. **Regression with NUMA_ANY** — create buffer, mmap, write/read `0xDEAD0000|i` pattern, munmap, destroy. Verifies NUMA fields didn't break existing functionality.
+9. **Allocate on node 1 (multi-socket only)** — queries topology, skips on single-node systems. On multi-socket, allocates 1 MB on node 1, verifies `actual_numa_node == 1`.
+
+### `tests/test_phase6_backpressure.c`
+
+Userspace test suite for Phase 6 backpressure and throughput modeling. Auto-detects the rxe device. Tests 1-3 run before RDMA setup (flow control configuration and the ENODEV error path). Tests 4-8 run after RDMA setup with a 1 MB buffer and registered MR. Cleans up at exit: deregisters MR, destroys buffer, tears down RDMA (device-global resources survive `close(fd)`).
+
+**Test cases:**
+1. **Configure flow control** — `max_credits=64, high=48, low=16`, verify `status == 0`. Read flow stats, verify `cq_overflows == 0`.
+2. **Invalid flow control parameters** — `high > max` → EINVAL, `low >= high` → EINVAL, `max > 128` → EINVAL, `max = 0` → EINVAL.
+3. **Sustained without RDMA (must fail)** — call `SUSTAINED_STREAM` on a separate fd without `SETUP_RDMA`, verify `-ENODEV`.
+4. **Sustained streaming (10 seconds)** — configure flow control, run with `msg_size=4096, queue_depth=8, duration=10`. Verify `total_bytes > 0`, `cq_overflow_count == 0`, `avg_throughput > 0`, `min_window > 0`.
+5. **Credit stall detection** — `max_credits=4, high=3, low=1` (very tight). Sustained 5 seconds, `queue_depth=4`. Verify `stall_count > 0`, `cq_overflow_count == 0`.
+6. **Queue depth sweep** — `msg_size=4096, iterations=500, min=1, max=32, step=4`. Verify `nr_points == 8`, all `throughput > 0`. Print sweep table. `saturation_qdepth` may be 0 (no saturation on rxe).
+7. **Flow stats accumulation** — after tests 4+5, verify `total_sustained_bytes > 0`, `total_sustained_ops > 0`, `cq_overflows == 0`.
+8. **Regression: Phase 4 benchmarks** — loopback, pingpong (100 iters, 4KB), streaming (100 iters, 4KB, QD=8). Verify all succeed.
 
 ---
 
@@ -435,3 +464,17 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 **Bandwidth benchmark** (`dmaplane_numa_bench`): For each (cpu_node, buf_node) pair, allocates target buffer on buf_node and source buffer on cpu_node via `alloc_pages_node` + `vmap`, spawns a kthread pinned to cpu_node via `set_cpus_allowed_ptr`, runs timed `memcpy` loop with `barrier()` after each iteration (prevents compiler optimization), and reports bandwidth (MB/s) and latency (ns/iter). Uses kthreads rather than workqueues for precise CPU affinity control. Sequential execution (not parallel) avoids cross-cell memory bus interference. Buffers allocated per-cell to avoid cache warming. Pre-touches buffers with `memset` before timing to eliminate page fault overhead.
 
 **No lock for topology or benchmark ioctls**: Topology reads kernel-maintained data structures. The benchmark allocates temporary buffers and doesn't touch any dmaplane device state. Both ioctl structs are heap-allocated (`kmalloc`) because they exceed safe kernel stack size (~600B and ~1100B vs 8KB stack on x86).
+
+### Phase 6: Backpressure & Throughput Modeling
+
+**Files:** `driver/flow_control.h` (declarations), `driver/flow_control.c` (~550 lines, credit operations + sustained streaming + QD sweep). Modified: `driver/main.c` (4 ioctl handlers, stats init), `driver/rdma_engine.h`/`rdma_engine.c` (added shared `flush_cq`/`cmp_u64` helpers), `driver/benchmark.c` (refactored to use shared helpers), `include/dmaplane_uapi.h` (4 structs, 4 ioctls, 1 constant), `driver/dmaplane.h` (flow sub-struct on `dmaplane_dev`, 6 stats atomics). **No ABI changes to existing structs** — only new structs and new ioctls.
+
+**Credit-based flow control** (`dmaplane_flow_configure`): Establishes `max_credits` (max in-flight operations, ≤ 128 = CQ depth), `high_watermark` (in-flight count to pause), `low_watermark` (in-flight count to resume). By keeping `max_credits ≤ CQ depth`, CQ overflow is impossible by construction. Credits are tracked via `atomic_t` on `dmaplane_dev.flow.credits`. `dmaplane_flow_can_send` implements watermark hysteresis — pauses when in-flight reaches `high_watermark`, resumes only when in-flight drops below `low_watermark`. Without hysteresis, the sender oscillates between send/stall on every credit change. `dmaplane_flow_on_send` decrements credits, `dmaplane_flow_on_completion` increments. No dedicated lock: `paused` is single-threaded (one benchmark send loop), `credits` is atomic.
+
+**Sustained streaming** (`dmaplane_sustained_stream`): Runs for `duration_secs` wall-clock seconds (1–600), not a fixed iteration count. Duration-based testing catches resource leaks and scheduling pathologies that iteration-based benchmarks miss. Per-second windowing tracks `min_window_mbps` and `max_window_mbps` to reveal throughput variance. Auto-configures flow control with conservative defaults if `CONFIGURE_FLOW` was not called (`max_credits = min(2 * queue_depth, 128)`, `high = 3/4`, `low = 1/4`). Main loop: `dmaplane_flow_can_send` → `rdma_engine_post_send` → `flow_on_send` → poll CQ-A → `flow_on_completion` → replenish recv. `cond_resched()` on credit stalls. Drain phase at end with 5-second timeout. Final CQ flush for clean state.
+
+**Queue depth sweep** (`dmaplane_qdepth_sweep`): Iterates from `min_qdepth` to `max_qdepth` by `step`, running a fixed-iteration streaming benchmark at each point. Records throughput, average latency, and P99 latency. Detects saturation: the smallest QD where throughput reaches 95% of the maximum observed. Reports `saturation_qdepth = 0` when throughput is still climbing at the last point (no plateau detected). Per-iteration latency via `ktime_get()` adds ~20–50 ns overhead — acceptable for rxe (~200 µs per operation).
+
+**Shared utility refactoring**: `flush_cq` (drain stale CQ completions) and `cmp_u64` (comparator for `sort()` P99) moved from `static` in `benchmark.c` to `EXPORT_SYMBOL_GPL` in `rdma_engine.c` as `rdma_engine_flush_cq` and `rdma_engine_cmp_u64`. Both `benchmark.c` and `flow_control.c` use the shared versions.
+
+**Ioctl numbering**: Phase 6 uses 0x60–0x63, which overlaps with CLAUDE.md's original GPU range (0x60–0x69). GPU ioctls (Phase 8) will be relocated to 0x70+ when implemented.

@@ -163,18 +163,7 @@ int benchmark_loopback(struct dmaplane_dev *edev,
 	return 0;
 }
 
-/* Comparison function for sorting latency samples (for P99) */
-static int cmp_u64(const void *a, const void *b)
-{
-	__u64 va = *(__u64 *)a;
-	__u64 vb = *(__u64 *)b;
-
-	if (va < vb)
-		return -1;
-	if (va > vb)
-		return 1;
-	return 0;
-}
+/* Use shared comparator from rdma_engine for P99 sorting */
 
 /*
  * benchmark_pingpong — Measure round-trip latency over multiple iterations.
@@ -293,7 +282,7 @@ int benchmark_pingpong(struct dmaplane_dev *edev,
 		atomic64_add(params->msg_size, &edev->stats.bytes_received);
 	}
 
-	sort(latencies, params->iterations, sizeof(__u64), cmp_u64, NULL);
+	sort(latencies, params->iterations, sizeof(__u64), rdma_engine_cmp_u64, NULL);
 
 	params->total_ns = total_ns;
 	params->avg_latency_ns = total_ns / params->iterations;
@@ -315,27 +304,6 @@ int benchmark_pingpong(struct dmaplane_dev *edev,
 out:
 	kvfree(latencies);
 	return ret;
-}
-
-/*
- * flush_cq — Drain all pending completions from a CQ.
- *
- * Used to clean up stale completions between benchmark runs.
- * Returns the number of completions flushed.
- */
-static int flush_cq(struct ib_cq *cq)
-{
-	struct ib_wc wc;
-	int flushed = 0;
-	int ret;
-
-	for (;;) {
-		ret = ib_poll_cq(cq, 1, &wc);
-		if (ret <= 0)
-			break;
-		flushed++;
-	}
-	return flushed;
 }
 
 /*
@@ -406,8 +374,8 @@ int benchmark_streaming(struct dmaplane_dev *edev,
 	latencies = kvcalloc(params->iterations, sizeof(__u64), GFP_KERNEL);
 
 	/* Flush any stale completions from previous runs */
-	flush_cq(ctx->cq_a);
-	flush_cq(ctx->cq_b);
+	rdma_engine_flush_cq(ctx->cq_a);
+	rdma_engine_flush_cq(ctx->cq_b);
 
 	/*
 	 * Pre-post receives up to 2x queue depth (not all iterations).
@@ -533,7 +501,7 @@ done:
 
 	/* Compute p99 from per-completion inter-arrival times */
 	if (latencies && completed > 0) {
-		sort(latencies, completed, sizeof(__u64), cmp_u64, NULL);
+		sort(latencies, completed, sizeof(__u64), rdma_engine_cmp_u64, NULL);
 		params->p99_latency_ns = latencies[(completed * 99) / 100];
 	}
 	params->mr_reg_ns = ktime_to_ns(local_mr.reg_time);
@@ -544,8 +512,8 @@ done:
 
 	/* Always flush both CQs — leave clean state for next run */
 	{
-		int fa = flush_cq(ctx->cq_a);
-		int fb = flush_cq(ctx->cq_b);
+		int fa = rdma_engine_flush_cq(ctx->cq_a);
+		int fb = rdma_engine_flush_cq(ctx->cq_b);
 
 		if (fa || fb)
 			pr_debug("streaming cleanup flushed %d from CQ-A, %d from CQ-B\n",

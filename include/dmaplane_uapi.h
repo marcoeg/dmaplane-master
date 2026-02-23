@@ -403,4 +403,111 @@ struct dmaplane_numa_bench_params {
 #define DMAPLANE_IOCTL_NUMA_BENCH \
 	_IOWR(DMAPLANE_IOC_MAGIC, 0x51, struct dmaplane_numa_bench_params)
 
+/* ── Phase 6: Backpressure & throughput modeling ─────────── */
+
+/*
+ * Flow control configuration: passed to IOCTL_CONFIGURE_FLOW.
+ *
+ * Establishes credit-based backpressure for the RDMA send path.
+ * max_credits limits outstanding in-flight operations — setting it
+ * at or below CQ depth makes CQ overflow impossible by construction.
+ *
+ * Watermark hysteresis prevents oscillation:
+ *   - Sender pauses when in-flight count reaches high_watermark.
+ *   - Sender resumes only when in-flight drops below low_watermark.
+ * Without hysteresis, the sender would toggle between send/stall on
+ * every single credit change, destroying throughput.
+ */
+struct dmaplane_flow_params {
+	__u32 max_credits;	/* in  — total credits (max in-flight ops) */
+	__u32 high_watermark;	/* in  — in-flight count to pause sending */
+	__u32 low_watermark;	/* in  — in-flight count to resume sending */
+	__u32 status;		/* out — 0 on success */
+};
+
+/*
+ * Sustained streaming parameters: passed to IOCTL_SUSTAINED_STREAM.
+ *
+ * Runs a pipelined send/recv benchmark for a configurable wall-clock
+ * duration (not iteration count).  Per-second windowing tracks throughput
+ * stability — min/max windows reveal variance that averages hide.
+ *
+ * If CONFIGURE_FLOW was not called, auto-configures with conservative
+ * defaults: max_credits = min(2*queue_depth, 128), high = 3/4, low = 1/4.
+ */
+struct dmaplane_sustained_params {
+	__u32 mr_id;			/* in  — memory region to stream */
+	__u32 msg_size;			/* in  — bytes per send */
+	__u32 queue_depth;		/* in  — pipeline depth */
+	__u32 duration_secs;		/* in  — how long to stream (1–600) */
+	__u64 total_bytes;		/* out — total bytes transferred */
+	__u64 total_ops;		/* out — total send/recv completions */
+	__u64 avg_throughput_mbps;	/* out — bytes * 1000 / elapsed_ns */
+	__u64 min_window_mbps;		/* out — worst 1-second window */
+	__u64 max_window_mbps;		/* out — best 1-second window */
+	__u64 stall_count;		/* out — times sender blocked on credits */
+	__u64 cq_overflow_count;	/* out — should be 0 */
+	__u32 status;			/* out — 0 on success */
+	__u32 pad;			/* padding — explicit pad for alignment */
+};
+
+/*
+ * Queue depth sweep parameters: passed to IOCTL_QDEPTH_SWEEP.
+ *
+ * Iterates across queue depths from min_qdepth to max_qdepth,
+ * running a fixed-iteration streaming benchmark at each point.
+ * Produces throughput/latency curves and detects the saturation
+ * point — the smallest queue depth where throughput reaches 95%
+ * of the maximum observed.
+ */
+#define DMAPLANE_MAX_SWEEP_POINTS	32
+
+struct dmaplane_sweep_params {
+	__u32 mr_id;		/* in  — MR to use */
+	__u32 msg_size;		/* in  — message size per operation */
+	__u32 iterations;	/* in  — iterations per queue depth point */
+	__u32 min_qdepth;	/* in  — starting queue depth */
+	__u32 max_qdepth;	/* in  — ending queue depth */
+	__u32 step;		/* in  — queue depth increment */
+	__u64 throughput_mbps[DMAPLANE_MAX_SWEEP_POINTS];	/* out — MB/s per point */
+	__u64 avg_latency_ns[DMAPLANE_MAX_SWEEP_POINTS];	/* out — avg latency per point */
+	__u64 p99_latency_ns[DMAPLANE_MAX_SWEEP_POINTS];	/* out — P99 latency per point */
+	__u32 nr_points;		/* out — actual points measured */
+	__u32 saturation_qdepth;	/* out — QD where throughput plateaus */
+	__u32 status;			/* out — 0 on success */
+	__u32 pad;			/* padding — explicit pad for alignment */
+};
+
+/*
+ * Flow control statistics: returned by IOCTL_GET_FLOW_STATS.
+ * Lifetime counters — cumulative across all sustained streaming runs.
+ * Separately tracked from RDMA stats to avoid ABI changes.
+ */
+struct dmaplane_flow_stats {
+	__u64 credit_stalls;		/* out — sender blocked on zero credits */
+	__u64 high_watermark_events;	/* out — times high watermark reached */
+	__u64 low_watermark_events;	/* out — times low watermark crossed */
+	__u64 cq_overflows;		/* out — CQ full events (should be 0) */
+	__u64 total_sustained_bytes;	/* out — cumulative sustained bytes */
+	__u64 total_sustained_ops;	/* out — cumulative sustained ops */
+};
+
+/* Phase 6 ioctl commands: flow control 0x60–0x63 */
+
+/* Configure credit-based flow control parameters. */
+#define DMAPLANE_IOCTL_CONFIGURE_FLOW \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x60, struct dmaplane_flow_params)
+
+/* Run sustained streaming benchmark for a wall-clock duration. */
+#define DMAPLANE_IOCTL_SUSTAINED_STREAM \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x61, struct dmaplane_sustained_params)
+
+/* Run queue depth sweep: throughput/latency across queue depths. */
+#define DMAPLANE_IOCTL_QDEPTH_SWEEP \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x62, struct dmaplane_sweep_params)
+
+/* Get flow control statistics (racy snapshot). */
+#define DMAPLANE_IOCTL_GET_FLOW_STATS \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x63, struct dmaplane_flow_stats)
+
 #endif /* _DMAPLANE_UAPI_H */
