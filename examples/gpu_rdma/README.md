@@ -10,20 +10,48 @@ Cross-machine demo sending GPU VRAM over RDMA to a remote host without GPU.
 ## Prerequisites
 
 - `dmaplane.ko` loaded on BOTH machines
-- Soft-RoCE configured on both machines (`bash scripts/setup_rxe.sh`)
+- Soft-RoCE (rxe) configured on both machines (see below)
 - CUDA runtime on Machine A (sender) for `cudaMalloc`
 - Real network connectivity between machines (same subnet for rxe)
 
-## Usage
+## Setup Soft-RoCE
 
-Receiver starts FIRST:
+Before running either the sender or the receiver, configure Soft-RoCE on
+**each machine**. The `setup_rxe.sh` script auto-detects the default
+network interface:
 
 ```bash
-# Machine B (receiver, start FIRST):
-sudo ./examples/gpu_rdma/gpu_receiver 9876
+# On both machines:
+bash scripts/setup_rxe.sh
+```
 
-# Machine A (sender, start AFTER receiver):
-sudo ./examples/gpu_rdma/gpu_sender <machine_b_ip> 9876
+Or specify the interface explicitly:
+
+```bash
+# Machine A (GPU host, e.g., interface enp0s31f6):
+bash scripts/setup_rxe.sh enp0s31f6     # creates rxe_enp0s31f6
+
+# Machine B (NUC, no GPU, e.g., interface enp44s0):
+bash scripts/setup_rxe.sh enp44s0       # creates rxe_enp44s0
+```
+
+Verify with `rdma link show` — you should see an `rxe_<iface>` device on
+each machine.
+
+## Usage
+
+Receiver starts FIRST. The sender connects to it.
+
+```bash
+# Machine B (NUC, receiver — start FIRST):
+sudo ./gpu_receiver 9876
+# auto-detects rxe device, or specify explicitly:
+sudo ./gpu_receiver 9876 rxe_enp44s0
+
+# Machine A (GPU host, sender — start AFTER receiver):
+sudo ./gpu_sender 192.168.50.17 9876
+# auto-detects rxe device, or specify explicitly:
+sudo ./gpu_sender 192.168.50.17 9876 rxe_enp0s31f6
 ```
 
 ## Note

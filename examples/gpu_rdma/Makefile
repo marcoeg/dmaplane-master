@@ -5,7 +5,15 @@ SENDER_LDFLAGS := -lcuda -lcudart -lm
 RECEIVER_CFLAGS := -Wall -Wextra -O2 -I../../include
 RECEIVER_LDFLAGS := -lm
 
-all: gpu_sender gpu_receiver
+# Check for CUDA — sender requires it, receiver does not.
+HAVE_CUDA := $(shell echo 'int main(){}' | $(CC) -x c - -lcuda -lcudart -o /dev/null 2>/dev/null && echo yes)
+
+TARGETS := gpu_receiver
+ifeq ($(HAVE_CUDA),yes)
+TARGETS += gpu_sender
+endif
+
+all: $(TARGETS)
 
 gpu_sender: gpu_sender.c
 	$(CC) $(SENDER_CFLAGS) -o $@ $< $(SENDER_LDFLAGS)
