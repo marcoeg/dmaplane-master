@@ -30,6 +30,7 @@
 #include <linux/nodemask.h>
 
 #include "dmabuf_rdma.h"
+#include "dmaplane_trace.h"
 
 /*
  * dmabuf_rdma_create_buffer — Allocate a DMA buffer with NUMA awareness.
@@ -61,6 +62,7 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 	int slot;
 	int target_node;
 	int local_count = 0, remote_count = 0;
+	ktime_t alloc_start = ktime_get();
 
 	/* Validate inputs */
 	if (params->size == 0 || params->size > DMAPLANE_MAX_BUF_SIZE)
@@ -261,6 +263,11 @@ int dmabuf_rdma_create_buffer(struct dmaplane_dev *dev,
 	params->actual_numa_node = buf->actual_numa_node;
 
 	atomic64_inc(&dev->stats.buffers_created);
+
+	trace_dmaplane_buf_alloc(buf->id, params->size, params->alloc_type,
+				 buf->actual_numa_node,
+				 ktime_to_ns(ktime_sub(ktime_get(),
+						       alloc_start)));
 
 	pr_debug("buffer %u created: type=%d size=%zu nr_pages=%u numa_req=%d numa_actual=%d\n",
 		 buf->id, buf->alloc_type, buf->size, buf->nr_pages,

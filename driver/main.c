@@ -88,6 +88,9 @@
 #include "benchmark.h"
 #include "numa_topology.h"
 #include "flow_control.h"
+#include "dmaplane_trace.h"
+#include "dmaplane_debugfs.h"
+#include "dmaplane_histogram.h"
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
@@ -524,6 +527,9 @@ static long dmaplane_ioctl_submit(struct dmaplane_file_ctx *ctx,
 	atomic_inc(&chan->in_flight);
 	atomic64_inc(&chan->stats.total_submissions);
 
+	trace_dmaplane_ring_submit(chan->id, params.entry.payload,
+				   dmaplane_ring_count(&chan->sub_ring));
+
 	/* Wake the worker so it sees the new entry */
 	wake_up_interruptible(&chan->wait_queue);
 
@@ -569,6 +575,8 @@ static long dmaplane_ioctl_complete(struct dmaplane_file_ctx *ctx,
 	smp_store_release(&ring->tail, ring->tail + 1);
 
 	spin_unlock_irqrestore(&ring->lock, flags);
+
+	trace_dmaplane_ring_complete(chan->id, params.entry.payload);
 
 	if (copy_to_user((void __user *)arg, &params, sizeof(params)))
 		return -EFAULT;
@@ -1524,6 +1532,51 @@ static long dmaplane_ioctl_get_flow_stats(struct dmaplane_file_ctx *ctx,
 	return 0;
 }
 
+/*
+ * dmaplane_ioctl_get_histogram — Read latency histogram with optional reset.
+ *
+ * Computes P50/P99/P999 from bucket counts, copies bucket array and
+ * summary to userspace.  If reset=1, atomically clears the histogram
+ * after reading.
+ *
+ * No lock needed — all histogram fields are atomic64_t.
+ *
+ * Returns:
+ *   0       on success.
+ *  -EFAULT  if copy_from_user or copy_to_user fails.
+ */
+static long dmaplane_ioctl_get_histogram(struct dmaplane_file_ctx *ctx,
+					  unsigned long arg)
+{
+	struct dmaplane_dev *dev = ctx->dev;
+	struct dmaplane_hist_params hp;
+	struct dmaplane_hist_summary summary = {0};
+	int i;
+
+	if (copy_from_user(&hp, (void __user *)arg, sizeof(hp)))
+		return -EFAULT;
+
+	dmaplane_histogram_summarize(&dev->rdma_hist, &summary);
+
+	hp.count = summary.count;
+	hp.p50_ns = summary.p50_ns;
+	hp.p99_ns = summary.p99_ns;
+	hp.p999_ns = summary.p999_ns;
+	hp.avg_ns = summary.avg_ns;
+	hp.min_ns = summary.min_ns;
+	hp.max_ns = summary.max_ns;
+
+	for (i = 0; i < DMAPLANE_HIST_BUCKETS; i++)
+		hp.buckets[i] = atomic64_read(&dev->rdma_hist.buckets[i]);
+
+	if (hp.reset)
+		dmaplane_histogram_reset(&dev->rdma_hist);
+
+	if (copy_to_user((void __user *)arg, &hp, sizeof(hp)))
+		return -EFAULT;
+	return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* File operations                                                     */
 /* ------------------------------------------------------------------ */
@@ -1668,6 +1721,10 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	case DMAPLANE_IOCTL_GET_FLOW_STATS:
 		return dmaplane_ioctl_get_flow_stats(ctx, arg);
 
+	/* Phase 7: Instrumentation */
+	case DMAPLANE_IOCTL_GET_HISTOGRAM:
+		return dmaplane_ioctl_get_histogram(ctx, arg);
+
 	default:
 		return -ENOTTY;
 	}
@@ -1763,6 +1820,15 @@ static int __init dmaplane_init(void)
 	atomic64_set(&dma_dev->stats.sustained_bytes, 0);
 	atomic64_set(&dma_dev->stats.sustained_ops, 0);
 
+	/* Phase 7: Histogram and debugfs */
+	dmaplane_histogram_init(&dma_dev->rdma_hist);
+
+	/* Phase 7: Cacheline alignment verification — compile-time assertion.
+	 * Verifies that the ____cacheline_aligned_in_smp annotations on
+	 * ring head/tail actually produce separate cache lines. */
+	BUILD_BUG_ON(offsetof(struct dmaplane_ring, head) % SMP_CACHE_BYTES != 0);
+	BUILD_BUG_ON(offsetof(struct dmaplane_ring, tail) % SMP_CACHE_BYTES != 0);
+
 	/*
 	 * Create platform device for DMA operations.
 	 *
@@ -1836,6 +1902,9 @@ static int __init dmaplane_init(void)
 		goto err_class_destroy;
 	}
 
+	/* Phase 7: debugfs — non-fatal on failure */
+	dmaplane_debugfs_init(dma_dev);
+
 	pr_info("module loaded (major %d)\n", MAJOR(dma_dev->devno));
 
 	/* Run dma-buf self-test if requested via module parameter */
@@ -1894,6 +1963,10 @@ static void __exit dmaplane_exit(void)
 		atomic64_read(&dma_dev->total_channels_destroyed),
 		atomic64_read(&dma_dev->stats.buffers_created),
 		atomic64_read(&dma_dev->stats.buffers_destroyed));
+
+	/* Phase 7: Remove debugfs before device teardown — debugfs show
+	 * functions reference dmaplane_dev fields. */
+	dmaplane_debugfs_exit();
 
 	/* 2. Tear down char device — prevents new ioctls/opens */
 	device_destroy(dma_dev->class, dma_dev->devno);

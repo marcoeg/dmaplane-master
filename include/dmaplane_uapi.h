@@ -510,4 +510,43 @@ struct dmaplane_flow_stats {
 #define DMAPLANE_IOCTL_GET_FLOW_STATS \
 	_IOR(DMAPLANE_IOC_MAGIC, 0x63, struct dmaplane_flow_stats)
 
+/* ── Phase 7: Instrumentation ─────────────────────────────── */
+
+/*
+ * Latency histogram: log₂ buckets in microseconds.
+ * 16 buckets cover [0, 1), [1, 2), [2, 4), ... [32768, ∞) µs.
+ * For rxe (~200 µs per op), most samples land in buckets 7-8.
+ * For ConnectX hardware (~1-5 µs), buckets 0-2.
+ *
+ * Coarse but constant-space: 128 bytes for bucket counters plus
+ * metadata.  Trade precision for zero-allocation O(1) recording.
+ * Exact percentiles require sorting N samples (what QD sweep does);
+ * the histogram gives approximate percentiles with O(1) memory.
+ */
+#define DMAPLANE_HIST_BUCKETS	16
+
+/*
+ * Histogram output: returned by IOCTL_GET_HISTOGRAM.
+ * Bucket counts + computed percentiles + summary statistics.
+ * Set reset=1 to atomically read-and-clear the histogram.
+ */
+struct dmaplane_hist_params {
+	__u64 buckets[DMAPLANE_HIST_BUCKETS];	/* out — sample count per bucket */
+	__u64 count;		/* out — total samples recorded */
+	__u64 p50_ns;		/* out — 50th percentile (bucket upper bound) */
+	__u64 p99_ns;		/* out — 99th percentile (bucket upper bound) */
+	__u64 p999_ns;		/* out — 99.9th percentile (bucket upper bound) */
+	__u64 avg_ns;		/* out — arithmetic mean of all samples */
+	__u64 min_ns;		/* out — minimum latency observed */
+	__u64 max_ns;		/* out — maximum latency observed */
+	__u32 reset;		/* in  — 1 = reset histogram after reading */
+	__u32 pad;		/* padding — explicit pad for alignment */
+};
+
+/* Phase 7 ioctl commands: instrumentation 0x70 */
+
+/* Read latency histogram; optionally reset after reading. */
+#define DMAPLANE_IOCTL_GET_HISTOGRAM \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x70, struct dmaplane_hist_params)
+
 #endif /* _DMAPLANE_UAPI_H */

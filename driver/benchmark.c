@@ -32,6 +32,7 @@
 #include "rdma_engine.h"
 #include "dmabuf_rdma.h"
 #include "benchmark.h"
+#include "dmaplane_histogram.h"
 
 #define POLL_TIMEOUT_MS  5000
 
@@ -277,6 +278,7 @@ int benchmark_pingpong(struct dmaplane_dev *edev,
 		iter_end = ktime_get();
 		latencies[i] = ktime_to_ns(ktime_sub(iter_end, iter_start));
 		total_ns += latencies[i];
+		dmaplane_histogram_record(&edev->rdma_hist, latencies[i]);
 
 		atomic64_add(params->msg_size, &edev->stats.bytes_sent);
 		atomic64_add(params->msg_size, &edev->stats.bytes_received);
@@ -501,6 +503,14 @@ done:
 
 	/* Compute p99 from per-completion inter-arrival times */
 	if (latencies && completed > 0) {
+		unsigned int j;
+
+		/* Record every latency sample in the histogram before sorting
+		 * (sort reorders, but histogram doesn't care about order) */
+		for (j = 0; j < completed; j++)
+			dmaplane_histogram_record(&edev->rdma_hist,
+						  latencies[j]);
+
 		sort(latencies, completed, sizeof(__u64), rdma_engine_cmp_u64, NULL);
 		params->p99_latency_ns = latencies[(completed * 99) / 100];
 	}

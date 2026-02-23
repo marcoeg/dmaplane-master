@@ -43,6 +43,7 @@
 #include "dmaplane.h"
 #include "rdma_engine.h"
 #include "dmabuf_rdma.h"
+#include "dmaplane_trace.h"
 
 /* ====================================================================
  * Internal Helpers
@@ -450,8 +451,11 @@ int rdma_engine_poll_cq(struct ib_cq *cq, struct ib_wc *wc, int timeout_ms)
 
 	do {
 		ret = ib_poll_cq(cq, 1, wc);
-		if (ret > 0)
+		if (ret > 0) {
+			trace_dmaplane_rdma_completion(wc->status,
+						       wc->byte_len, 0);
 			return 1;
+		}
 		if (ret < 0)
 			return ret;
 		cond_resched();
@@ -948,6 +952,7 @@ int rdma_engine_post_send(struct dmaplane_dev *edev,
 		pr_err("ib_post_send failed: %d\n", ret);
 	else {
 		atomic64_inc(&edev->stats.sends_posted);
+		trace_dmaplane_rdma_post("send", sge.length, wr.wr_id);
 		pr_debug("post_send OK qp=%u sge.addr=0x%llx len=%zu lkey=0x%x\n",
 			 qp->qp_num, sge.addr, size, sge.lkey);
 	}
@@ -984,8 +989,10 @@ int rdma_engine_post_recv(struct dmaplane_dev *edev,
 	ret = ib_post_recv(qp, &wr, &bad_wr);
 	if (ret)
 		pr_err("ib_post_recv failed: %d\n", ret);
-	else
+	else {
 		atomic64_inc(&edev->stats.recvs_posted);
+		trace_dmaplane_rdma_post("recv", sge.length, wr.wr_id);
+	}
 
 	return ret;
 }

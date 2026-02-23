@@ -37,6 +37,7 @@
 #include <linux/numa.h>
 #include <linux/nodemask.h>
 #include <rdma/ib_verbs.h>
+#include "dmaplane_histogram.h"
 
 /* ── Phase 2: Buffer constants ──────────────────────────── */
 
@@ -528,6 +529,17 @@ struct dmaplane_dev {
 		bool configured;	/* true after CONFIGURE_FLOW */
 		bool paused;		/* sender in backpressure state */
 	} flow;
+
+	/* ── Phase 7: Latency histogram ── */
+
+	/*
+	 * RDMA latency histogram — records per-operation latencies
+	 * during benchmarks (pingpong, sustained streaming, QD sweep).
+	 * All fields are atomic — no dedicated lock needed.  Multiple
+	 * benchmark code paths can record simultaneously.
+	 * Read via IOCTL_GET_HISTOGRAM or debugfs /dmaplane/histogram.
+	 */
+	struct dmaplane_histogram rdma_hist;
 };
 
 /*

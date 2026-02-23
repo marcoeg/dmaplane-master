@@ -40,6 +40,8 @@
 #include "rdma_engine.h"
 #include "dmabuf_rdma.h"
 #include "flow_control.h"
+#include "dmaplane_trace.h"
+#include "dmaplane_histogram.h"
 
 #define POLL_TIMEOUT_MS		5000
 #define DRAIN_TIMEOUT_MS	5000
@@ -250,6 +252,14 @@ int dmaplane_sustained_stream(struct dmaplane_dev *dev,
 	size_t buf_size;
 	int ret;
 
+	/* Phase 7: Timestamp ring for per-operation histogram recording.
+	 * 128 entries (power of 2, >= max queue_depth).  Pairs sends with
+	 * completions by FIFO order — RC QP guarantees in-order completion.
+	 * Heap-allocated to avoid -Wframe-larger-than= warning. */
+#define TS_RING_SIZE	128
+	ktime_t *send_ts = NULL;
+	unsigned int ts_head = 0, ts_tail = 0;
+
 	if (!ctx->initialized)
 		return -ENODEV;
 
@@ -297,6 +307,11 @@ int dmaplane_sustained_stream(struct dmaplane_dev *dev,
 	if (!dev->flow.configured)
 		sustained_auto_configure(dev, qdepth);
 
+	/* Phase 7: Allocate timestamp ring for histogram latency pairing */
+	send_ts = kvcalloc(TS_RING_SIZE, sizeof(ktime_t), GFP_KERNEL);
+	if (!send_ts)
+		return -ENOMEM;
+
 	/* Reset credits for this run */
 	atomic_set(&dev->flow.credits, dev->flow.max_credits);
 	dev->flow.paused = false;
@@ -318,6 +333,7 @@ int dmaplane_sustained_stream(struct dmaplane_dev *dev,
 		if (ret) {
 			pr_err("sustained pre-post recv %u failed: %d\n",
 			       recv_posted, ret);
+			kvfree(send_ts);
 			return ret;
 		}
 	}
@@ -367,13 +383,24 @@ int dmaplane_sustained_stream(struct dmaplane_dev *dev,
 					goto done;
 				}
 				dmaplane_flow_on_send(dev);
+				send_ts[ts_head & (TS_RING_SIZE - 1)] = ktime_get();
+				ts_head++;
 				sent++;
 				outstanding++;
 			} else if (!can_send) {
+				ktime_t stall_start, stall_end;
+
 				stall_count++;
 				atomic64_inc(&dev->stats.credit_stalls);
 				/* Yield — let rxe softirq process completions */
+				stall_start = ktime_get();
 				cond_resched();
+				stall_end = ktime_get();
+				trace_dmaplane_flow_stall(
+					atomic_read(&dev->flow.credits),
+					outstanding,
+					ktime_to_ns(ktime_sub(stall_end,
+							      stall_start)));
 			}
 		}
 
@@ -381,6 +408,12 @@ int dmaplane_sustained_stream(struct dmaplane_dev *dev,
 		ret = ib_poll_cq(ctx->cq_a, 1, &wc);
 		if (ret > 0) {
 			if (wc.status == IB_WC_SUCCESS) {
+				ktime_t lat = ktime_sub(ktime_get(),
+					send_ts[ts_tail & (TS_RING_SIZE - 1)]);
+				ts_tail++;
+				dmaplane_histogram_record(&dev->rdma_hist,
+							  ktime_to_ns(lat));
+
 				completed++;
 				outstanding--;
 				dmaplane_flow_on_completion(dev);
@@ -503,6 +536,7 @@ done:
 		 sent, completed, total_bytes, params->avg_throughput_mbps,
 		 stall_count, cq_overflow_count, params->duration_secs);
 
+	kvfree(send_ts);
 	return ret;
 }
 EXPORT_SYMBOL_GPL(dmaplane_sustained_stream);
@@ -706,6 +740,13 @@ int dmaplane_qdepth_sweep(struct dmaplane_dev *dev,
 					total_ns / completed;
 
 			if (latencies && completed > 0) {
+				unsigned int j;
+
+				/* Record all latency samples in histogram */
+				for (j = 0; j < completed; j++)
+					dmaplane_histogram_record(
+						&dev->rdma_hist, latencies[j]);
+
 				sort(latencies, completed, sizeof(__u64),
 				     rdma_engine_cmp_u64, NULL);
 				params->p99_latency_ns[point] =

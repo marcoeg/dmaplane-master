@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 6 — Backpressure & Throughput Modeling
+## Current State: Phase 7 — Instrumentation & Microarchitectural Awareness
 
 ## Licensing
 
@@ -68,6 +68,11 @@ The userspace-visible API header. This is the primary definition point for all t
 - Flow stats (`dmaplane_flow_stats`): 6 `__u64` counters — `credit_stalls`, `high_watermark_events`, `low_watermark_events`, `cq_overflows`, `total_sustained_bytes`, `total_sustained_ops`
 - Ioctl commands: `DMAPLANE_IOCTL_CONFIGURE_FLOW` (`_IOWR`, 0x60), `DMAPLANE_IOCTL_SUSTAINED_STREAM` (`_IOWR`, 0x61), `DMAPLANE_IOCTL_QDEPTH_SWEEP` (`_IOWR`, 0x62), `DMAPLANE_IOCTL_GET_FLOW_STATS` (`_IOR`, 0x63)
 
+**Phase 7 additions:**
+- Histogram constant: `DMAPLANE_HIST_BUCKETS` (16) — log₂ bucket count, shared between kernel and userspace
+- Histogram output (`dmaplane_hist_params`): `__u64 buckets[16]` (out — sample count per bucket), `__u64 count` (out), `__u64 p50_ns` (out), `__u64 p99_ns` (out), `__u64 p999_ns` (out), `__u64 avg_ns` (out), `__u64 min_ns` (out), `__u64 max_ns` (out), `__u32 reset` (in — 1 = reset after read), `__u32 pad`
+- Ioctl command: `DMAPLANE_IOCTL_GET_HISTOGRAM` (`_IOWR`, 0x70)
+
 All userspace consumers (`tests/`, `examples/misc/`) include this header via `-I../include` or `-I../../include`.
 
 ### `driver/dmaplane.h`
@@ -82,7 +87,7 @@ The kernel-internal header. Includes `dmaplane_uapi.h` for the shared types, the
 - `struct poll_cq_wait` (Phase 4): managed CQ completion wait — `struct ib_cqe cqe` (callback entry, `.done = poll_cq_done`), `struct ib_wc wc` (stashed work completion), `struct completion done` (signaled by callback). Used with `IB_POLL_DIRECT` CQs.
 - `struct dmaplane_mr_entry` (Phase 4): per-MR tracking — `__u32 id`, `__u32 buf_id`, `struct ib_mr *mr` (NULL for local-only, non-NULL for fast-reg), `__u32 lkey`, `__u32 rkey`, `__u64 sge_addr` (kernel VA for rxe, IOMMU addr for real HW), `struct sg_table *sgt`, `int sgt_nents`, `bool in_use`, `ktime_t reg_time`. Two paths: local-only uses `pd->local_dma_lkey` (rkey=0), fast-reg uses `ib_alloc_mr` + `IB_WR_REG_MR` for remote access.
 - `struct dmaplane_rdma_ctx` (Phase 4): RDMA connection context — `struct ib_device *ib_dev`, `struct ib_pd *pd`, `struct ib_cq *cq_a`/`*cq_b` (loopback CQs), `struct ib_qp *qp_a`/`*qp_b` (loopback QPs), `__u8 port`, `__u16 lid`, `int gid_index`, `union ib_gid gid`, `bool initialized`. The loopback pair (QP-A sends, QP-B receives) benchmarks the full DMA data path without a remote peer.
-- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Phase 4 additions: `struct dmaplane_rdma_ctx rdma`, `struct rw_semaphore rdma_sem` (read for MR/benchmark ops, write for setup/teardown), `struct dmaplane_mr_entry mrs[DMAPLANE_MAX_MRS]` (64 slots), `struct mutex mr_lock` (protects MR array), `__u32 next_mr_id`. Phase 6 additions: `struct { atomic_t credits; unsigned int max_credits, high_watermark, low_watermark; bool configured, paused; } flow` — credit-based flow control state (no dedicated lock: `paused` is single-threaded from the benchmark send loop, `credits` is atomic, config fields are write-before-read). Counters are printed via `pr_info` at module unload; Phase 7 will export through debugfs.
+- `struct dmaplane_dev`: `struct platform_device *pdev` (DMA-capable device for all DMA API calls), `channels[DMAPLANE_MAX_CHANNELS]`, `struct mutex dev_mutex`, `struct cdev`, `struct class *`, `dev_t devno`, `struct device *`, `buffers[DMAPLANE_MAX_BUFFERS]` (64 slots), `struct mutex buf_lock` (protects buffer array), `unsigned int next_buf_id` (monotonically increasing, skips 0), `struct dmaplane_stats_kern stats` (shared atomic counters), plus device-level atomic counters: `atomic_t active_channels`, `atomic64_t total_opens`, `atomic64_t total_closes`, `atomic64_t total_channels_created`, `atomic64_t total_channels_destroyed`. Phase 4 additions: `struct dmaplane_rdma_ctx rdma`, `struct rw_semaphore rdma_sem` (read for MR/benchmark ops, write for setup/teardown), `struct dmaplane_mr_entry mrs[DMAPLANE_MAX_MRS]` (64 slots), `struct mutex mr_lock` (protects MR array), `__u32 next_mr_id`. Phase 6 additions: `struct { atomic_t credits; unsigned int max_credits, high_watermark, low_watermark; bool configured, paused; } flow` — credit-based flow control state (no dedicated lock: `paused` is single-threaded from the benchmark send loop, `credits` is atomic, config fields are write-before-read). Phase 7 additions: `struct dmaplane_histogram rdma_hist` — per-RDMA-operation latency histogram with 16 log₂ buckets, all `atomic64_t` fields (no lock). Includes `dmaplane_histogram.h` for struct definition. Device-level counters exported through debugfs (Phase 7).
 - `struct dmaplane_file_ctx`: `struct dmaplane_dev *dev`, `struct dmaplane_channel *chan` (NULL until CREATE_CHANNEL).
 - `dmaplane_channel_release()`: kref release callback — marks slot inactive (`active = false`), decrements `active_channels`, increments `total_channels_destroyed`. Called when the last kref drops to zero.
 - Inline helpers: `dmaplane_ring_full()`, `dmaplane_ring_empty()`, `dmaplane_ring_count()`.
@@ -102,7 +107,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **Module init** (`dmaplane_init`):
 - `kzalloc` the device context
 - `platform_device_alloc("dmaplane_dma")` + `platform_device_add` + `dma_set_mask_and_coherent` (64-bit, fallback 32-bit) — creates a DMA-capable device. `device_create` alone is NOT DMA-capable; the DMA API requires a bus-registered device with a DMA mask.
-- `mutex_init` for `buf_lock`, `next_buf_id = 1`. Phase 4: `init_rwsem(&rdma_sem)`, `mutex_init(&mr_lock)`, `next_mr_id = 1`, 8 RDMA `atomic64_set` calls. Phase 6: `flow.credits = 0`, `flow.configured = false`, `flow.paused = false`, 6 flow control `atomic64_set` calls
+- `mutex_init` for `buf_lock`, `next_buf_id = 1`. Phase 4: `init_rwsem(&rdma_sem)`, `mutex_init(&mr_lock)`, `next_mr_id = 1`, 8 RDMA `atomic64_set` calls. Phase 6: `flow.credits = 0`, `flow.configured = false`, `flow.paused = false`, 6 flow control `atomic64_set` calls. Phase 7: `dmaplane_histogram_init(&rdma_hist)`, `dmaplane_debugfs_init(dma_dev)` (non-fatal on failure), `BUILD_BUG_ON` for cacheline alignment verification
 - `alloc_chrdev_region` for dynamic major number
 - `cdev_init` + `cdev_add`
 - `class_create` + `device_create` for `/dev/dmaplane` udev node
@@ -111,7 +116,8 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **Module exit** (`dmaplane_exit`) — ordering is critical:
 1. Acquires `dev_mutex`, stops any remaining active worker kthreads via `dmaplane_channel_destroy`
 2. Prints lifetime summary via `pr_info`: total opens, closes, channels created, channels destroyed, buffers created, buffers destroyed
-3. Tears down char device (`device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region`) — prevents new ioctls/opens from racing with cleanup
+3. Phase 7: `dmaplane_debugfs_exit()` — removes debugfs before device teardown (debugfs show functions reference `dmaplane_dev`)
+4. Tears down char device (`device_destroy` + `class_destroy` + `cdev_del` + `unregister_chrdev_region`) — prevents new ioctls/opens from racing with cleanup
 4. RDMA teardown (Phase 4): `down_write(&rdma_sem)`. If `rdma.initialized`: deregister all in-use MRs, then `rdma_engine_teardown`. Mark all MR slots `in_use = false`. `up_write`. The write lock synchronizes with any in-flight operations that started before `cdev_del` returned. MRs must be deregistered before teardown because their DMA mappings reference `ib_dev`.
 5. Destroys remaining buffers — warns on leaked mmap references (`mmap_count > 0`) and leaked dma-buf exports (`dmabuf_exported`). Must happen AFTER RDMA teardown (MR DMA mappings freed) and AFTER char device teardown, but BEFORE platform device unregister (`dma_free_coherent` needs the platform device alive)
 6. `platform_device_unregister`
@@ -120,7 +126,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 **File operations:**
 - `dmaplane_open`: Checks `capable(CAP_SYS_ADMIN)` — DMA buffer allocation and mmap of kernel pages are privileged operations. Allocates `dmaplane_file_ctx` via `kzalloc`, stores in `filp->private_data`. Increments `total_opens`.
 - `dmaplane_release`: If a channel was assigned, acquires `dev_mutex`, calls `dmaplane_channel_destroy` (signals worker shutdown, `kthread_stop`, drops both krefs), releases mutex, frees file context. Increments `total_closes`. Handles process exit without explicit cleanup.
-- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33, Phase 5: 0x50–0x51, Phase 6: 0x60–0x63).
+- `dmaplane_ioctl`: Dispatches to per-command handlers via switch (Phase 1: 0x01–0x04, Phase 2: 0x05–0x09, Phase 3: 0x0A–0x0B, Phase 4: 0x10–0x11, 0x20–0x21, 0x30–0x33, Phase 5: 0x50–0x51, Phase 6: 0x60–0x63, Phase 7: 0x70).
 - `dmaplane_mmap`: Maps DMA buffer pages into userspace. Extracts `buf_id = vma->vm_pgoff`, finds buffer under `buf_lock`. Sets `VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP`. Coherent: `dma_mmap_coherent` (resets `vm_pgoff = 0` first — `dma_mmap_coherent` interprets pgoff as offset into the allocation). Pages: `vm_insert_page` loop. Increments `mmap_count` on success (NOT via `vma_open` — Linux does not call `vma_open` for the initial mmap). VMA ops: `dmaplane_vma_open` (increment on fork/mremap), `dmaplane_vma_close` (decrement on munmap/exit).
 
 **Ioctl handlers:**
@@ -128,8 +134,8 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | Command | Handler | Description |
 |---------|---------|-------------|
 | `DMAPLANE_IOCTL_CREATE_CHANNEL` | `dmaplane_ioctl_create_channel` | Returns `-EBUSY` if fd already has a channel. Finds free slot (under `dev_mutex`), inits channel via `dmaplane_channel_init` (kref_init, mutex_init, rings, atomic stats), takes second kref for worker, creates kthread `"dmaplane/%d"` via `kthread_create`, wakes thread, increments `active_channels` and `total_channels_created`, stores channel in file context, `copy_to_user` channel ID |
-| `DMAPLANE_IOCTL_SUBMIT` | `dmaplane_ioctl_submit` | `copy_from_user`, acquire submission ring spinlock, check full (return `-ENOSPC`), write entry at `head % RING_SIZE`, `smp_store_release` on head, track high watermark via `atomic_set`, release lock, `atomic_inc(in_flight)`, `atomic64_inc(total_submissions)`, `wake_up_interruptible` worker |
-| `DMAPLANE_IOCTL_COMPLETE` | `dmaplane_ioctl_complete` | Acquire completion ring spinlock, check empty (return `-EAGAIN`), read entry at `tail % RING_SIZE`, `smp_store_release` on tail, release lock, `copy_to_user` |
+| `DMAPLANE_IOCTL_SUBMIT` | `dmaplane_ioctl_submit` | `copy_from_user`, acquire submission ring spinlock, check full (return `-ENOSPC`), write entry at `head % RING_SIZE`, `smp_store_release` on head, track high watermark via `atomic_set`, release lock, `atomic_inc(in_flight)`, `atomic64_inc(total_submissions)`, `trace_dmaplane_ring_submit` (Phase 7), `wake_up_interruptible` worker |
+| `DMAPLANE_IOCTL_COMPLETE` | `dmaplane_ioctl_complete` | Acquire completion ring spinlock, check empty (return `-EAGAIN`), read entry at `tail % RING_SIZE`, `smp_store_release` on tail, release lock, `trace_dmaplane_ring_complete` (Phase 7), `copy_to_user` |
 | `DMAPLANE_IOCTL_GET_STATS` | `dmaplane_ioctl_get_stats` | Reads `dmaplane_stats_kern` atomics into a plain `dmaplane_stats` UAPI struct, then `copy_to_user`. Each atomic read is individually consistent; the set may be momentarily inconsistent |
 | `DMAPLANE_IOCTL_CREATE_BUFFER` | `dmaplane_ioctl_create_buffer` | `copy_from_user`, delegates to `dmabuf_rdma_create_buffer`, `copy_to_user` result. **copy_to_user undo**: if `copy_to_user` fails after buffer creation, destroys the buffer to prevent an orphaned allocation that userspace can never reference |
 | `DMAPLANE_IOCTL_DESTROY_BUFFER` | `dmaplane_ioctl_destroy_buffer` | `copy_from_user` bare `__u32` handle, delegates to `dmabuf_rdma_destroy_buffer`. Returns `-EBUSY` if `mmap_count > 0` or `dmabuf_exported` |
@@ -151,6 +157,7 @@ Character device driver with ioctl dispatch, mmap support, and per-channel worke
 | `DMAPLANE_IOCTL_SUSTAINED_STREAM` | `dmaplane_ioctl_sustained_stream` | `kmalloc` params, `copy_from_user`, `down_read(&rdma_sem)`, check `rdma.initialized`, call `dmaplane_sustained_stream`, `up_read`, `copy_to_user`, `kfree`. Returns `-ENODEV` if RDMA not initialized |
 | `DMAPLANE_IOCTL_QDEPTH_SWEEP` | `dmaplane_ioctl_qdepth_sweep` | `kmalloc` params (~800B, three arrays of 32 × `__u64`), same rdma_sem read pattern, call `dmaplane_qdepth_sweep` |
 | `DMAPLANE_IOCTL_GET_FLOW_STATS` | `dmaplane_ioctl_get_flow_stats` | Read 6 flow control atomic counters, `copy_to_user`. No lock |
+| `DMAPLANE_IOCTL_GET_HISTOGRAM` | `dmaplane_ioctl_get_histogram` | `copy_from_user`, `dmaplane_histogram_summarize` for percentiles, copy bucket counts from `atomic64_read`, optional `dmaplane_histogram_reset` if `hp.reset == 1`, `copy_to_user`. No lock — all histogram fields are `atomic64_t` |
 
 **Worker thread** (`dmaplane_worker_fn`):
 - Loops until `kthread_should_stop()`
@@ -395,7 +402,7 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 
 **Atomic stats**: Per-channel stats use `atomic64_t` / `atomic_t` (`dmaplane_stats_kern`) instead of plain integers. This is portable and correct under the C memory model — plain `__u64` reads are atomic on x86-64 but not on 32-bit architectures or under compiler reordering. The UAPI struct (`dmaplane_stats`) remains plain `__u64`/`__u32`; the ioctl handler converts by reading each atomic.
 
-**Device-level observability**: `dmaplane_dev` tracks lifetime counters (opens, closes, channels created/destroyed) and a current active channel count via atomics. Printed at module unload via `pr_info`. Phase 7 will export these through debugfs.
+**Device-level observability**: `dmaplane_dev` tracks lifetime counters (opens, closes, channels created/destroyed) and a current active channel count via atomics. Printed at module unload via `pr_info`. Phase 7 exports these through debugfs under `/sys/kernel/debug/dmaplane/stats`.
 
 **Error paths**: All error paths use goto-based cleanup with reverse-order resource release. This pattern will be used throughout the project.
 
@@ -477,4 +484,20 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 
 **Shared utility refactoring**: `flush_cq` (drain stale CQ completions) and `cmp_u64` (comparator for `sort()` P99) moved from `static` in `benchmark.c` to `EXPORT_SYMBOL_GPL` in `rdma_engine.c` as `rdma_engine_flush_cq` and `rdma_engine_cmp_u64`. Both `benchmark.c` and `flow_control.c` use the shared versions.
 
-**Ioctl numbering**: Phase 6 uses 0x60–0x63, which overlaps with CLAUDE.md's original GPU range (0x60–0x69). GPU ioctls (Phase 8) will be relocated to 0x70+ when implemented.
+**Ioctl numbering**: Phase 6 uses 0x60–0x63, Phase 7 uses 0x70. GPU ioctls (Phase 8) will use 0x80+ (WRITEIMM range). Peer QP ioctls deferred to 0x71–0x79.
+
+### Phase 7: Instrumentation & Microarchitectural Awareness
+
+**Files:** `driver/dmaplane_trace.h` (6 TRACE_EVENT definitions), `driver/dmaplane_trace.c` (~10 lines, CREATE_TRACE_POINTS compilation unit), `driver/dmaplane_histogram.h` (struct + API), `driver/dmaplane_histogram.c` (~120 lines, record/summarize/reset), `driver/dmaplane_debugfs.h` (forward declarations), `driver/dmaplane_debugfs.c` (~250 lines, 5 seq_file show functions). Modified: `driver/main.c` (includes, tracepoint calls in submit/complete, histogram ioctl handler, debugfs init/exit, BUILD_BUG_ON), `driver/rdma_engine.c` (3 tracepoint calls), `driver/dmabuf_rdma.c` (1 tracepoint call with ktime), `driver/flow_control.c` (1 tracepoint call, timestamp ring for histogram, histogram recording in sweep), `driver/benchmark.c` (histogram recording in pingpong and streaming), `include/dmaplane_uapi.h` (1 struct, 1 ioctl, 1 constant), `driver/dmaplane.h` (`rdma_hist` field, histogram include). **No ABI changes to existing structs** — only new struct and new ioctl.
+
+**Kernel tracepoints** (6 events under `dmaplane:` trace system): `dmaplane_ring_submit` (channel, payload, queue_depth), `dmaplane_ring_complete` (channel, payload), `dmaplane_rdma_post` (op string, msg_size, wr_id), `dmaplane_rdma_completion` (status, byte_len, latency_ns=0 at engine layer), `dmaplane_buf_alloc` (buf_id, size, alloc_type, numa_node, duration_ns), `dmaplane_flow_stall` (credits, in_flight, stall_ns). Static branch when disabled (<1 ns), ~100–200 ns enabled. Build constraints: `CREATE_TRACE_POINTS` in exactly one .c file (`dmaplane_trace.c`), `TRACE_INCLUDE_PATH = .`, `ccflags-y += -I$(src)` in Makefile. Kernel 6.5: `__assign_str(field, src)` two-argument form.
+
+**debugfs interface** (`/sys/kernel/debug/dmaplane/`): 5 read-only files using `DEFINE_SHOW_ATTRIBUTE` + `seq_printf`. `stats` — all device-level atomic counters (channels, opens, buffers, NUMA, dma-buf, RDMA, flow, sustained). `buffers` — active buffer list with id, type, size, NUMA nodes, mmap count, dmabuf status (holds `buf_lock`). `rdma` — RDMA context state, device name, QP numbers, active MR list (holds `rdma_sem` read + `mr_lock`). `flow` — flow control config and credit state (no lock — atomic/stable). `histogram` — latency distribution with bucket table and percentiles (no lock — atomic). Lifecycle: `dmaplane_debugfs_init` creates directory and files (graceful on failure — debugfs is optional, never fatal), `dmaplane_debugfs_exit` calls `debugfs_remove_recursive` before device teardown.
+
+**Latency histogram** (`struct dmaplane_histogram`): 16 log₂ buckets covering [2^i, 2^(i+1)) microseconds. All fields `atomic64_t` — `buckets[16]`, `count`, `sum_ns`, `min_ns` (init `U64_MAX`), `max_ns`. `dmaplane_histogram_record`: converts nanoseconds to microseconds, buckets via `ilog2` (guards `ilog2(0)` → bucket 0), CAS loop for min/max. `dmaplane_histogram_summarize`: walks buckets for percentiles — P50 at `cumulative * 1000 >= total * 500`, P99 at 990, P999 at 9990 (via `* 10000`). Reports bucket upper bound as the percentile estimate (coarse but constant-space). `dmaplane_histogram_reset`: zeros all fields, resets min to `U64_MAX`. All functions `EXPORT_SYMBOL_GPL`.
+
+**Histogram instrumentation**: `benchmark_pingpong` records per-iteration latency via `dmaplane_histogram_record(&edev->rdma_hist, latencies[i])`. `benchmark_streaming` records all per-completion inter-arrival times before sort. `dmaplane_sustained_stream` uses a 128-entry heap-allocated timestamp ring (`ktime_t *send_ts`, `kvcalloc`) to pair sends with completions by FIFO order (RC QP in-order guarantee). Records `ktime_sub(now, send_ts[ts_tail])` on each CQ-A completion. Originally stack-allocated but moved to heap to avoid `-Wframe-larger-than=1024` warning. `dmaplane_qdepth_sweep` records per-iteration latencies into the histogram before sort.
+
+**Cacheline alignment verification**: `BUILD_BUG_ON(offsetof(struct dmaplane_ring, head) % SMP_CACHE_BYTES != 0)` and same for `tail` — compile-time assertion that `____cacheline_aligned_in_smp` annotations produce separate cache lines. Already present from Phase 1; Phase 7 verifies and documents.
+
+**Test:** `tests/test_phase7_instrumentation.c` — 8 tests: (1) debugfs directory exists and stats readable, (2) debugfs stats match ioctl GET_BUF_STATS, (3) debugfs buffer listing shows 3 active buffers, (4) debugfs RDMA state shows "initialized: yes", (5) histogram collects ≥1000 samples from pingpong with valid P50/P99/P999, (6) histogram reset clears count to 0, (7) histogram after 5s sustained streaming shows thousands of samples with P50 in rxe range, (8) all 6 tracepoints appear in `/sys/kernel/debug/tracing/available_events`. Tests SKIP (not FAIL) on debugfs access errors. Explicit cleanup: deregister MR, destroy buffer, teardown RDMA.
