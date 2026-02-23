@@ -26,5 +26,18 @@ test_phase6_backpressure: test_phase6_backpressure.c
 test_phase7_instrumentation: test_phase7_instrumentation.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# Phase 8: GPU test — conditional on CUDA availability.
+# Skip with a warning if nvcc/cuda headers are not found.
+CUDA_AVAILABLE := $(shell command -v nvcc >/dev/null 2>&1 && echo yes)
+ifeq ($(CUDA_AVAILABLE),yes)
+TESTS += test_phase8_gpu
+
+test_phase8_gpu: test_phase8_gpu.c
+	$(CC) $(CFLAGS) -o $@ $< -lcuda -lcudart -lm
+else
+test_phase8_gpu:
+	@echo "SKIP: test_phase8_gpu — CUDA not available (nvcc not found)"
+endif
+
 clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) test_phase8_gpu

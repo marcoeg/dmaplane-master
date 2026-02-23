@@ -549,4 +549,213 @@ struct dmaplane_hist_params {
 #define DMAPLANE_IOCTL_GET_HISTOGRAM \
 	_IOWR(DMAPLANE_IOC_MAGIC, 0x70, struct dmaplane_hist_params)
 
+/* ── Phase 8: GPU memory integration ─────────────────────── */
+
+/*
+ * GPU buffer allocation type constant.
+ * Extends the BUF_TYPE_COHERENT (0) and BUF_TYPE_PAGES (1) namespace.
+ */
+#define DMAPLANE_BUF_TYPE_GPU		2
+
+/*
+ * GPU pin parameters: passed to IOCTL_GPU_PIN.
+ * Pins a region of GPU VRAM via the NVIDIA P2P API and maps the
+ * resulting BAR1 pages with ioremap_wc for CPU access.
+ *
+ * Both gpu_va and size must be 64KB-aligned (NVIDIA P2P hardware
+ * requirement — BAR1 pages are always 64KB regardless of host PAGE_SIZE).
+ */
+struct dmaplane_gpu_pin_params {
+	__u64 gpu_va;		/* in  — CUDA device pointer (64KB-aligned) */
+	__u64 size;		/* in  — bytes to pin (64KB-multiple) */
+	__u32 handle;		/* out — GPU buffer handle for subsequent ops */
+	__s32 gpu_numa_node;	/* out — GPU's NUMA node (-1 if unknown) */
+	__u32 num_pages;	/* out — number of 64KB pages pinned */
+	__u32 _pad;		/* padding — explicit pad for alignment */
+	__u64 bar1_consumed;	/* out — total BAR1 bytes consumed */
+};
+
+/*
+ * GPU unpin parameters: passed to IOCTL_GPU_UNPIN.
+ * Releases a pinned GPU buffer. Handles both normal and revoked states:
+ *   - Normal: nvidia_p2p_put_pages releases the pin.
+ *   - Revoked (cudaFree while pinned): nvidia_p2p_free_page_table
+ *     frees the struct without taking NVIDIA locks.
+ */
+struct dmaplane_gpu_unpin_params {
+	__u32 handle;		/* in  — GPU buffer handle from GPU_PIN */
+};
+
+/*
+ * GPU DMA parameters: passed to IOCTL_GPU_DMA_TO_HOST and
+ * IOCTL_GPU_DMA_FROM_HOST.
+ *
+ * GPU_DMA_TO_HOST: reads GPU BAR pages via memcpy_fromio (PCIe
+ *   non-posted reads, ~107 MB/s on RTX 5000).
+ * GPU_DMA_FROM_HOST: writes to GPU BAR pages via memcpy_toio (PCIe
+ *   posted writes, ~10 GB/s with write-combining).
+ */
+struct dmaplane_gpu_dma_params {
+	__u32 gpu_handle;	/* in  — GPU buffer handle */
+	__u32 host_handle;	/* in  — host buffer handle (from CREATE_BUFFER) */
+	__u64 offset;		/* in  — byte offset within both buffers */
+	__u64 size;		/* in  — transfer size in bytes */
+	__u64 elapsed_ns;	/* out — transfer time in nanoseconds */
+	__u64 throughput_mbps;	/* out — throughput in MB/s */
+};
+
+/*
+ * GPU benchmark parameters: passed to IOCTL_GPU_BENCH.
+ * Runs bidirectional BAR throughput benchmark on pre-pinned GPU
+ * and pre-allocated host buffers.  Transfer size is min(gpu, host).
+ */
+struct dmaplane_gpu_bench_params {
+	__u32 gpu_handle;	/* in  — pre-pinned GPU buffer handle */
+	__u32 host_handle;	/* in  — pre-allocated host buffer handle */
+	__u64 size;		/* in  — reserved (benchmark uses min of buffer sizes) */
+	__u32 iterations;	/* in  — transfers per direction */
+	__u32 _pad;		/* padding — explicit pad for alignment */
+	__u64 h2g_bandwidth_mbps;	/* out — host→GPU throughput in MB/s */
+	__u64 g2h_bandwidth_mbps;	/* out — GPU→host throughput in MB/s */
+};
+
+/*
+ * GPU MR registration parameters: passed to IOCTL_GPU_REGISTER_MR.
+ * Registers GPU BAR pages as an RDMA memory region.  Uses the
+ * contiguous WC mapping (rdma_vaddr) as sge.addr for rxe's memcpy.
+ * Goes into the same mrs[] array as host MRs — deregister via
+ * the existing IOCTL_DEREGISTER_MR (0x21).
+ */
+struct dmaplane_gpu_mr_params {
+	__u32 gpu_handle;	/* in  — GPU buffer handle from GPU_PIN */
+	__u32 mr_id;		/* out — MR ID (shared namespace with host MRs) */
+	__u32 lkey;		/* out — local key (pd->local_dma_lkey) */
+	__u32 rkey;		/* out — remote key (0 for local_dma_lkey) */
+};
+
+/*
+ * GPU RDMA loopback parameters: passed to IOCTL_GPU_LOOPBACK.
+ * Sends data from a GPU-backed MR (on QP-A) to a host-backed MR
+ * (on QP-B) via the rxe loopback pair.  Proves GPU VRAM can
+ * traverse the RDMA data path.
+ */
+struct dmaplane_gpu_loopback_params {
+	__u32 gpu_mr_id;	/* in  — GPU-backed MR (sender on QP-A) */
+	__u32 host_mr_id;	/* in  — host-backed MR (receiver on QP-B) */
+	__u32 size;		/* in  — bytes to send */
+	__u32 _pad;		/* padding — explicit pad for alignment */
+	__u64 latency_ns;	/* out — round-trip time in nanoseconds */
+	__u32 recv_bytes;	/* out — bytes received by QP-B */
+	__u32 status;		/* out — 0 on success */
+};
+
+/*
+ * GPU statistics: returned by IOCTL_GET_GPU_STATS.
+ * Lifetime counters — always present even without CONFIG_DMAPLANE_GPU
+ * (all zeros if GPU support not compiled in).
+ */
+struct dmaplane_gpu_stats {
+	__u64 pins_total;		/* out — lifetime GPU buffers pinned */
+	__u64 unpins_total;		/* out — lifetime GPU buffers unpinned */
+	__u64 callbacks_fired;		/* out — unpin callbacks from NVIDIA */
+	__u64 dma_h2g_bytes;		/* out — host→GPU bytes transferred */
+	__u64 dma_g2h_bytes;		/* out — GPU→host bytes transferred */
+	__u64 gpu_mrs_registered;	/* out — lifetime GPU MRs registered */
+};
+
+/* Phase 8 ioctl commands: GPU 0x80–0x87 */
+
+/* Pin GPU VRAM; returns handle, page count, BAR1 consumed. */
+#define DMAPLANE_IOCTL_GPU_PIN \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x80, struct dmaplane_gpu_pin_params)
+
+/* Unpin a GPU buffer by handle. */
+#define DMAPLANE_IOCTL_GPU_UNPIN \
+	_IOW(DMAPLANE_IOC_MAGIC, 0x81, struct dmaplane_gpu_unpin_params)
+
+/* GPU VRAM → host DRAM transfer (memcpy_fromio). */
+#define DMAPLANE_IOCTL_GPU_DMA_TO_HOST \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x82, struct dmaplane_gpu_dma_params)
+
+/* Host DRAM → GPU VRAM transfer (memcpy_toio). */
+#define DMAPLANE_IOCTL_GPU_DMA_FROM_HOST \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x83, struct dmaplane_gpu_dma_params)
+
+/* Run bidirectional GPU BAR throughput benchmark. */
+#define DMAPLANE_IOCTL_GPU_BENCH \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x84, struct dmaplane_gpu_bench_params)
+
+/* Register GPU BAR pages as an RDMA memory region. */
+#define DMAPLANE_IOCTL_GPU_REGISTER_MR \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x85, struct dmaplane_gpu_mr_params)
+
+/* RDMA loopback: GPU MR → host MR via QP-A/QP-B. */
+#define DMAPLANE_IOCTL_GPU_LOOPBACK \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x86, struct dmaplane_gpu_loopback_params)
+
+/* Get GPU statistics (racy snapshot). */
+#define DMAPLANE_IOCTL_GET_GPU_STATS \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x87, struct dmaplane_gpu_stats)
+
+/* ── Phase 8: Peer RDMA (cross-machine) ──────────────────── */
+
+/*
+ * Peer RDMA connection info: exchanged between machines via TCP.
+ * Each side calls IOCTL_RDMA_INIT_PEER to get local metadata,
+ * sends it to the remote side, then calls IOCTL_RDMA_CONNECT_PEER
+ * with the remote side's metadata to connect the peer QP.
+ *
+ * The MAC address is required for RoCEv2 — without the correct
+ * destination MAC in the Address Handle, Ethernet frames go nowhere.
+ */
+struct dmaplane_rdma_peer_info {
+	__u32 qp_num;		/* out/in — QP number */
+	__u16 lid;		/* out/in — Local Identifier (unused for RoCE) */
+	__u16 _pad1;		/* padding */
+	__u8  gid[16];		/* out/in — GID (IPv6 format, 16 bytes) */
+	__u8  mac[6];		/* out/in — Ethernet MAC for RoCEv2 AH */
+	__u8  _pad2[2];		/* padding */
+	__u32 status;		/* out — 0 on success */
+	__u32 _pad3;		/* padding */
+};
+
+/*
+ * Remote RDMA transfer parameters: passed to IOCTL_RDMA_REMOTE_SEND
+ * and IOCTL_RDMA_REMOTE_RECV.
+ *
+ * REMOTE_SEND: post SEND on qp_peer, poll cq_peer for completion.
+ * REMOTE_RECV: post RECV on qp_peer, poll cq_peer for completion
+ *   (must be posted BEFORE the remote side sends — RC QP semantics).
+ */
+struct dmaplane_rdma_remote_xfer_params {
+	__u32 mr_id;		/* in  — MR to send from / receive into */
+	__u32 size;		/* in  — bytes to transfer */
+	__u64 elapsed_ns;	/* out — operation latency in nanoseconds */
+	__u64 throughput_mbps;	/* out — throughput in MB/s */
+	__u32 status;		/* out — 0 on success */
+	__u32 _pad;		/* padding */
+};
+
+/* Phase 8 ioctl commands: peer RDMA 0x90–0x94 */
+
+/* Create peer QP + CQ; returns local QP/GID/MAC for TCP exchange. */
+#define DMAPLANE_IOCTL_RDMA_INIT_PEER \
+	_IOR(DMAPLANE_IOC_MAGIC, 0x90, struct dmaplane_rdma_peer_info)
+
+/* Connect peer QP using remote metadata from TCP exchange. */
+#define DMAPLANE_IOCTL_RDMA_CONNECT_PEER \
+	_IOW(DMAPLANE_IOC_MAGIC, 0x91, struct dmaplane_rdma_peer_info)
+
+/* Post SEND on peer QP from a local MR. */
+#define DMAPLANE_IOCTL_RDMA_REMOTE_SEND \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x92, struct dmaplane_rdma_remote_xfer_params)
+
+/* Post RECV on peer QP into a local MR. */
+#define DMAPLANE_IOCTL_RDMA_REMOTE_RECV \
+	_IOWR(DMAPLANE_IOC_MAGIC, 0x93, struct dmaplane_rdma_remote_xfer_params)
+
+/* Destroy peer QP and CQ. */
+#define DMAPLANE_IOCTL_RDMA_DESTROY_PEER \
+	_IO(DMAPLANE_IOC_MAGIC, 0x94)
+
 #endif /* _DMAPLANE_UAPI_H */

@@ -39,6 +39,13 @@
 #include <rdma/ib_verbs.h>
 #include "dmaplane_histogram.h"
 
+/* ── Phase 8: GPU buffer constants ──────────────────────── */
+
+#ifdef CONFIG_DMAPLANE_GPU
+#define DMAPLANE_MAX_GPU_BUFFERS	16
+struct dmaplane_gpu_buffer;	/* Forward declaration — defined in gpu_p2p.h */
+#endif
+
 /* ── Phase 2: Buffer constants ──────────────────────────── */
 
 #define DMAPLANE_MAX_BUFFERS	64
@@ -394,6 +401,14 @@ struct dmaplane_rdma_ctx {
 	union ib_gid gid;		/* Global Identifier (IPv6 format) */
 
 	bool initialized;		/* Loopback pair is live */
+
+	/* Phase 8: Cross-machine peer QP — shares PD with loopback pair.
+	 * Created by IOCTL_RDMA_INIT_PEER, connected via TCP metadata
+	 * exchange + IOCTL_RDMA_CONNECT_PEER.  Independent of the
+	 * loopback pair — both can be active simultaneously. */
+	struct ib_cq *cq_peer;		/* Peer QP's completion queue */
+	struct ib_qp *qp_peer;		/* Third QP for remote machine */
+	bool peer_connected;		/* Peer QP is connected (RTS state) */
 };
 
 /*
@@ -540,6 +555,39 @@ struct dmaplane_dev {
 	 * Read via IOCTL_GET_HISTOGRAM or debugfs /dmaplane/histogram.
 	 */
 	struct dmaplane_histogram rdma_hist;
+
+	/* ── Phase 8: GPU memory integration ── */
+
+#ifdef CONFIG_DMAPLANE_GPU
+	/*
+	 * GPU P2P buffers — pinned GPU VRAM via nvidia_p2p_get_pages.
+	 * Fixed-size array of 16 slots (same pattern as host buffers[64]).
+	 * Allocated via kcalloc in module init, freed in module exit.
+	 *
+	 * gpu_buf_lock: protects gpu_buffers[] — slot allocation, lookup,
+	 *   and deallocation.  Also held during pin/unpin operations.
+	 *   Ordering: independent of rdma_sem and buf_lock.  Never nested
+	 *   with buf_lock (DMA functions acquire them sequentially, not nested).
+	 */
+	struct dmaplane_gpu_buffer *gpu_buffers;
+	struct mutex gpu_buf_lock;
+	__u32 next_gpu_buf_id;		/* Monotonic, wraps to 1 (skips 0) */
+#endif
+
+	/*
+	 * GPU statistics — always present, even without CONFIG_DMAPLANE_GPU.
+	 * Reported via debugfs /dmaplane/gpu and IOCTL_GET_GPU_STATS.
+	 * All zeros if GPU support is not compiled in or NVIDIA driver
+	 * is not loaded.
+	 */
+	struct {
+		atomic64_t pins_total;
+		atomic64_t unpins_total;
+		atomic64_t callbacks_fired;
+		atomic64_t dma_h2g_bytes;
+		atomic64_t dma_g2h_bytes;
+		atomic64_t gpu_mrs_registered;
+	} gpu_stats;
 };
 
 /*

@@ -166,6 +166,59 @@ TRACE_EVENT(dmaplane_flow_stall,
 		__entry->credits, __entry->in_flight, __entry->stall_ns)
 );
 
+/*
+ * dmaplane_gpu_pin — fires on successful GPU VRAM pin.
+ * Records handle, GPU VA, size, page count, contiguity, and pin duration.
+ */
+TRACE_EVENT(dmaplane_gpu_pin,
+	TP_PROTO(unsigned int handle, __u64 gpu_va, __u64 size,
+		 unsigned int num_pages, int contiguous, __u64 duration_ns),
+	TP_ARGS(handle, gpu_va, size, num_pages, contiguous, duration_ns),
+	TP_STRUCT__entry(
+		__field(unsigned int, handle)
+		__field(__u64, gpu_va)
+		__field(__u64, size)
+		__field(unsigned int, num_pages)
+		__field(int, contiguous)
+		__field(__u64, duration_ns)
+	),
+	TP_fast_assign(
+		__entry->handle = handle;
+		__entry->gpu_va = gpu_va;
+		__entry->size = size;
+		__entry->num_pages = num_pages;
+		__entry->contiguous = contiguous;
+		__entry->duration_ns = duration_ns;
+	),
+	TP_printk("handle=%u va=0x%llx size=%llu pages=%u contig=%d dur_ns=%llu",
+		__entry->handle, __entry->gpu_va, __entry->size,
+		__entry->num_pages, __entry->contiguous, __entry->duration_ns)
+);
+
+/*
+ * dmaplane_gpu_dma — fires on each GPU↔host DMA transfer.
+ * dir is "h2g" (host→GPU memcpy_toio) or "g2h" (GPU→host memcpy_fromio).
+ */
+TRACE_EVENT(dmaplane_gpu_dma,
+	TP_PROTO(const char *dir, __u64 size, __u64 elapsed_ns, __u64 mbps),
+	TP_ARGS(dir, size, elapsed_ns, mbps),
+	TP_STRUCT__entry(
+		__string(dir, dir)
+		__field(__u64, size)
+		__field(__u64, elapsed_ns)
+		__field(__u64, mbps)
+	),
+	TP_fast_assign(
+		__assign_str(dir, dir);	/* kernel 6.5: two-arg form required */
+		__entry->size = size;
+		__entry->elapsed_ns = elapsed_ns;
+		__entry->mbps = mbps;
+	),
+	TP_printk("dir=%s size=%llu elapsed_ns=%llu mbps=%llu",
+		__get_str(dir), __entry->size, __entry->elapsed_ns,
+		__entry->mbps)
+);
+
 #endif /* _DMAPLANE_TRACE_H */
 
 /* This part must be outside the header guard */

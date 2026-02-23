@@ -10,8 +10,10 @@ tests:
 
 examples:
 	$(MAKE) -C examples/misc
+	-$(MAKE) -C examples/gpu_rdma 2>/dev/null || true
 
 clean:
 	$(MAKE) -C driver clean
 	$(MAKE) -C tests clean
 	$(MAKE) -C examples/misc clean
+	-$(MAKE) -C examples/gpu_rdma clean 2>/dev/null || true

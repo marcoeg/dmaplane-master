@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 7 — Instrumentation & Microarchitectural Awareness
+## Current State: Phase 8 — GPU Memory Integration
 
 ## Licensing
 
@@ -484,7 +484,7 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 
 **Shared utility refactoring**: `flush_cq` (drain stale CQ completions) and `cmp_u64` (comparator for `sort()` P99) moved from `static` in `benchmark.c` to `EXPORT_SYMBOL_GPL` in `rdma_engine.c` as `rdma_engine_flush_cq` and `rdma_engine_cmp_u64`. Both `benchmark.c` and `flow_control.c` use the shared versions.
 
-**Ioctl numbering**: Phase 6 uses 0x60–0x63, Phase 7 uses 0x70. GPU ioctls (Phase 8) will use 0x80+ (WRITEIMM range). Peer QP ioctls deferred to 0x71–0x79.
+**Ioctl numbering**: Phase 6 uses 0x60–0x63, Phase 7 uses 0x70, Phase 8 GPU uses 0x80–0x87, Phase 8 peer RDMA uses 0x90–0x94.
 
 ### Phase 7: Instrumentation & Microarchitectural Awareness
 
@@ -501,3 +501,49 @@ Allocates page-backed buffers from 4 KB to 64 MB (powers of 2), times the full c
 **Cacheline alignment verification**: `BUILD_BUG_ON(offsetof(struct dmaplane_ring, head) % SMP_CACHE_BYTES != 0)` and same for `tail` — compile-time assertion that `____cacheline_aligned_in_smp` annotations produce separate cache lines. Already present from Phase 1; Phase 7 verifies and documents.
 
 **Test:** `tests/test_phase7_instrumentation.c` — 8 tests: (1) debugfs directory exists and stats readable, (2) debugfs stats match ioctl GET_BUF_STATS, (3) debugfs buffer listing shows 3 active buffers, (4) debugfs RDMA state shows "initialized: yes", (5) histogram collects ≥1000 samples from pingpong with valid P50/P99/P999, (6) histogram reset clears count to 0, (7) histogram after 5s sustained streaming shows thousands of samples with P50 in rxe range, (8) all 6 tracepoints appear in `/sys/kernel/debug/tracing/available_events`. Tests SKIP (not FAIL) on debugfs access errors. Explicit cleanup: deregister MR, destroy buffer, teardown RDMA.
+
+### Phase 8: GPU Memory Integration
+
+**Files:** `driver/gpu_p2p.h` (~390 lines, GPU buffer struct, NVIDIA P2P function typedefs, API declarations), `driver/gpu_p2p.c` (~1380 lines, pin/unpin, SG table builder, BAR DMA with page-walking memcpy, benchmark, GPU MR registration, GPU loopback, NVIDIA symbol init/exit). Modified: `include/dmaplane_uapi.h` (+~160 lines: 7 GPU structs, 8 GPU ioctls 0x80–0x87, 2 peer RDMA structs, 5 peer RDMA ioctls 0x90–0x94), `driver/dmaplane.h` (GPU buffer array/lock/stats in `dmaplane_dev`, peer QP in `dmaplane_rdma_ctx`), `driver/main.c` (8 GPU + 5 peer RDMA ioctl handlers, GPU init/exit in module lifecycle, `#ifndef` -ENODEV fallback), `driver/rdma_engine.h` (5 peer QP function declarations), `driver/rdma_engine.c` (~300 lines: peer QP init/connect/destroy, remote send/recv, teardown_peer safety net in rdma_engine_teardown), `driver/Makefile` (conditional `gpu_p2p.o` with NVIDIA header detection), `driver/dmaplane_trace.h` (2 GPU tracepoints), `driver/dmaplane_debugfs.c` (GPU debugfs file).
+
+**Conditional compilation**: `CONFIG_DMAPLANE_GPU` defined by `driver/Makefile` when `/usr/src/nvidia-*/nvidia/nv-p2p.h` is found. `gpu_p2p.o` only built with GPU headers. Without GPU: all GPU ioctls return `-ENODEV` (not `-ENOTTY`). GPU stats atomics always present (zeros without GPU).
+
+**Runtime symbol resolution**: `nvidia_p2p_get_pages`, `nvidia_p2p_put_pages`, `nvidia_p2p_free_page_table` resolved via `symbol_get()` at module load (`dmaplane_gpu_init`), released via `symbol_put()` at module unload (`dmaplane_gpu_exit`). Avoids static module dependency on proprietary `nvidia.ko` — kernel 6.5+ refuses GPL modules that statically link proprietary symbols. Function pointers stored as `nv_p2p_get_pages_fn_t` etc. with explicit casts from `symbol_get()` return.
+
+**GPU buffer lifecycle** (`struct dmaplane_gpu_buffer`): `id` (monotonic handle), `gpu_va`/`size` (CUDA VA, 64KB-aligned), `page_table` (NVIDIA opaque, `nvidia_p2p_page_table_t`), `sgt` (scatterlist from BAR addresses), `bar_pages[]` (per-page `void __iomem *` array from individual `ioremap_wc` calls), `rdma_vaddr` (optional contiguous WC mapping spanning all pages — only created if BAR pages are physically contiguous), `gpu_revoked` (`atomic_t`, set by unpin callback), `revoke_done` (completion for synchronization). 16 slots in `gpu_buffers[]` protected by `gpu_buf_lock` mutex.
+
+**Per-page ioremap pattern**: BAR pages are NOT guaranteed contiguous. Each `page_table->pages[i]->physical_address` is ioremap_wc'd individually into `bar_pages[i]`. DMA functions walk the array with 64KB boundary crossing arithmetic. Separate contiguity check + optional single `ioremap_wc` for `rdma_vaddr` (rxe needs contiguous kernel VA for memcpy in send path).
+
+**Unpin callback contract**: `dmaplane_gpu_unpin_callback` runs in NVIDIA's context with NVIDIA locks held. MUST NOT: take any dmaplane lock, call `nvidia_p2p_put_pages` (deadlock), call `printk` (may sleep). MUST: `atomic_set(&gpu_buf->gpu_revoked, 1)`, `complete_all(&gpu_buf->revoke_done)`, return immediately. Cleanup diverges: normal → `put_pages`, revoked → `free_page_table`.
+
+**GPU MR registration** (`dmaplane_gpu_register_mr`): Creates a SEPARATE sg_table (not shared with `gpu_buf->sgt` — deregister path frees MR's sgt). Sets `sge_addr = (u64)(uintptr_t)gpu_buf->rdma_vaddr` (contiguous WC mapping for rxe memcpy). Uses `pd->local_dma_lkey` (no fast-reg MR). `buf_id = 0` to distinguish from host MRs. Goes into shared `mrs[]` array — existing `rdma_engine_deregister_mr` handles cleanup. Requires `rdma_vaddr != NULL` (contiguous BAR pages).
+
+**Peer QP** (`qp_peer`, `cq_peer` in `dmaplane_rdma_ctx`): Third QP for cross-machine RDMA. Shares PD with loopback pair. Created by `rdma_engine_init_peer` (CQ + QP + INIT transition), connected by `rdma_engine_connect_peer` (RTR + RTS with remote metadata). `remote_send`/`remote_recv` post WRs on `qp_peer`, poll `cq_peer`. DMAC from `rdma_read_gid_attr_ndev_rcu` for RoCEv2 Ethernet framing. `rdma_engine_teardown_peer` called as safety net from `rdma_engine_teardown`.
+
+**GPU tracepoints** (2 events): `dmaplane_gpu_pin` (handle, gpu_va, size, num_pages, contiguous, duration_ns), `dmaplane_gpu_dma` (dir string "h2g"/"g2h", size, elapsed_ns, mbps). Kernel 6.5 two-arg `__assign_str`.
+
+**GPU debugfs** (`/sys/kernel/debug/dmaplane/gpu`): Shows symbol resolution status, iterates `gpu_buffers[]` under `gpu_buf_lock` listing pinned regions (handle, VA, size, pages, RDMA availability, revocation status), prints `gpu_stats` atomics.
+
+**GPU stats** (6 `atomic64_t` counters in `dmaplane_dev.gpu_stats`): `pins_total`, `unpins_total`, `callbacks_fired`, `dma_h2g_bytes`, `dma_g2h_bytes`, `gpu_mrs_registered`. Always present even without `CONFIG_DMAPLANE_GPU`. Readable via `IOCTL_GET_GPU_STATS` (0x87) and debugfs.
+
+**Ioctl table** (Phase 8 additions):
+
+| Ioctl | Number | Struct | Handler |
+|-------|--------|--------|---------|
+| GPU_PIN | 0x80 | `dmaplane_gpu_pin_params` | `dmaplane_gpu_pin` |
+| GPU_UNPIN | 0x81 | `dmaplane_gpu_unpin_params` | `dmaplane_gpu_unpin` |
+| GPU_DMA_TO_HOST | 0x82 | `dmaplane_gpu_dma_params` | `dmaplane_gpu_dma_to_host` |
+| GPU_DMA_FROM_HOST | 0x83 | `dmaplane_gpu_dma_params` | `dmaplane_gpu_dma_from_host` |
+| GPU_BENCH | 0x84 | `dmaplane_gpu_bench_params` | `dmaplane_gpu_benchmark` |
+| GPU_REGISTER_MR | 0x85 | `dmaplane_gpu_mr_params` | `dmaplane_gpu_register_mr` |
+| GPU_LOOPBACK | 0x86 | `dmaplane_gpu_loopback_params` | `benchmark_gpu_loopback` |
+| GET_GPU_STATS | 0x87 | `dmaplane_gpu_stats` | inline in main.c |
+| RDMA_INIT_PEER | 0x90 | `dmaplane_rdma_peer_info` | `rdma_engine_init_peer` |
+| RDMA_CONNECT_PEER | 0x91 | `dmaplane_rdma_peer_info` | `rdma_engine_connect_peer` |
+| RDMA_REMOTE_SEND | 0x92 | `dmaplane_rdma_remote_xfer_params` | `rdma_engine_remote_send` |
+| RDMA_REMOTE_RECV | 0x93 | `dmaplane_rdma_remote_xfer_params` | `rdma_engine_remote_recv` |
+| RDMA_DESTROY_PEER | 0x94 | (none) | `rdma_engine_teardown_peer` |
+
+**Test:** `tests/test_phase8_gpu.c` — 7 tests, links `-lcuda -lcudart -lm`, conditional build in Makefile (skips if CUDA not available): (1) Pin/Unpin lifecycle at 3 sizes (64KB, 1MB, 16MB), verify handle/pages/bar1_consumed, (2) H2G data integrity — 0xDEADBEEF pattern, verify via `cudaMemcpy D→H` readback, (3) G2H data integrity — `cudaMemset 0xAB`, `GPU_DMA_TO_HOST`, verify host buffer, (4) BAR throughput — `GPU_BENCH` at 5 sizes, compare with `cudaMemcpy` side-by-side, (5) Callback safety — `cudaFree` while pinned, verify DMA returns `-ENODEV`, unpin succeeds cleanly, (6) Alignment validation — non-64KB-aligned VA/size/zero rejected, (7) GPU RDMA loopback — `cudaMemset 0xCD`, pin, register GPU MR + host MR, `GPU_LOOPBACK`, verify host buffer matches (skips if no rxe). Cleanup order: deregister MRs → teardown RDMA → unpin GPU → cudaFree → free host buffer.
+
+**Examples:** `examples/gpu_rdma/gpu_sender.c` (~290 lines, Machine A: cudaMalloc + sinf gradient, GPU_PIN, GPU_REGISTER_MR, RDMA_INIT_PEER, TCP exchange, RDMA_CONNECT_PEER, RDMA_REMOTE_SEND), `examples/gpu_rdma/gpu_receiver.c` (~280 lines, Machine B: CREATE_BUFFER, REGISTER_MR, RDMA_INIT_PEER, TCP exchange, RDMA_CONNECT_PEER, RDMA_REMOTE_RECV, mmap + verify gradient). No GPU needed on receiver. `examples/misc/trace_explorer.c` also demonstrates GPU tracepoint capture.

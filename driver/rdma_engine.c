@@ -652,6 +652,10 @@ void rdma_engine_teardown(struct dmaplane_dev *edev)
 	if (!ctx->initialized)
 		return;
 
+	/* Step 0: Tear down peer QP if still active — safety net in case
+	 * userspace calls TEARDOWN_RDMA without explicit DESTROY_PEER. */
+	rdma_engine_teardown_peer(edev);
+
 	/* Step 1: Move QPs to error state — flushes outstanding WRs */
 	if (ctx->qp_b)
 		ib_modify_qp(ctx->qp_b, &attr, IB_QP_STATE);
@@ -1037,3 +1041,403 @@ int rdma_engine_cmp_u64(const void *a, const void *b)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(rdma_engine_cmp_u64);
+
+/* ====================================================================
+ * Phase 8: Cross-machine peer QP
+ * ====================================================================
+ *
+ * These functions manage a third QP (qp_peer) that connects to a remote
+ * machine instead of looping back locally.  The loopback pair (qp_a/qp_b)
+ * remains intact for benchmarking.  The peer QP shares the same PD and
+ * GID established by rdma_engine_setup().
+ *
+ * Lifecycle: INIT_PEER → CONNECT_PEER → REMOTE_SEND / REMOTE_RECV
+ * Teardown:  rdma_engine_teardown_peer() or automatically via
+ *            rdma_engine_teardown() safety net.
+ */
+
+/*
+ * rdma_engine_teardown_peer — Destroy the cross-machine QP and CQ.
+ *
+ * Follows the same protocol as loopback teardown (rdma_engine_teardown):
+ *   1. Move qp_peer to IB_QPS_ERR — flushes all outstanding WRs so
+ *      the RDMA subsystem releases references to our CQE/SGE memory.
+ *   2. Destroy qp_peer before cq_peer (reverse creation order) to
+ *      avoid dangling QP→CQ references.
+ *
+ * Safe to call multiple times: the NULL/false checks make it idempotent.
+ * Also called as a safety net from rdma_engine_teardown() in case
+ * userspace calls TEARDOWN_RDMA without explicitly cleaning up the peer.
+ *
+ * Caller must hold rdma_sem write lock.
+ */
+void rdma_engine_teardown_peer(struct dmaplane_dev *edev)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct ib_qp_attr attr = { .qp_state = IB_QPS_ERR };
+
+	if (!ctx->peer_connected && !ctx->qp_peer)
+		return;
+
+	/* Flush outstanding WRs by moving QP to error state */
+	if (ctx->qp_peer)
+		ib_modify_qp(ctx->qp_peer, &attr, IB_QP_STATE);
+
+	/* Destroy in reverse creation order: QP before CQ */
+	if (ctx->qp_peer) {
+		ib_destroy_qp(ctx->qp_peer);
+		ctx->qp_peer = NULL;
+	}
+	if (ctx->cq_peer) {
+		ib_free_cq(ctx->cq_peer);
+		ctx->cq_peer = NULL;
+	}
+	ctx->peer_connected = false;
+	pr_info("peer RDMA teardown complete\n");
+}
+EXPORT_SYMBOL_GPL(rdma_engine_teardown_peer);
+
+/*
+ * rdma_engine_init_peer — Create a QP for cross-machine RDMA.
+ *
+ * Prerequisite: rdma_engine_setup() must have been called first to
+ * establish the PD, GID, and IB device reference.  This function reuses
+ * those shared resources to create a third QP (qp_peer) alongside the
+ * existing loopback pair (qp_a/qp_b).
+ *
+ * Resource creation order:
+ *   1. cq_peer — IB_POLL_DIRECT CQ for deterministic busy-polling
+ *   2. qp_peer — RC QP bound to cq_peer for both send and recv CQs
+ *   3. Transition qp_peer to INIT via qp_to_init()
+ *
+ * Output: fills the info struct with local connection metadata
+ * (QP number, LID, GID, DMAC) that userspace sends to the remote
+ * machine over TCP.  The remote machine passes this metadata to its
+ * own CONNECT_PEER ioctl to complete the QP handshake.
+ *
+ * DMAC extraction: RoCEv2 requires the destination MAC in the Address
+ * Handle for Ethernet framing.  Each machine exports its own MAC here;
+ * the remote side places it in ah_attr.roce.dmac during RTR transition.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_init_peer(struct dmaplane_dev *edev,
+			  struct dmaplane_rdma_peer_info *info)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct ib_qp_init_attr qp_init;
+	const struct ib_gid_attr *sgid_attr;
+	struct net_device *ndev;
+	int ret;
+
+	if (!ctx->initialized)
+		return -EINVAL;
+
+	if (ctx->qp_peer) {
+		pr_warn("peer QP already initialized\n");
+		return -EBUSY;
+	}
+
+	/* Create peer CQ — same IB_POLL_DIRECT config as loopback CQs */
+	ctx->cq_peer = ib_alloc_cq(ctx->ib_dev, NULL, 128,
+				    0, IB_POLL_DIRECT);
+	if (IS_ERR(ctx->cq_peer)) {
+		ret = PTR_ERR(ctx->cq_peer);
+		pr_err("ib_alloc_cq (peer) failed: %d\n", ret);
+		ctx->cq_peer = NULL;
+		return ret;
+	}
+
+	/* Create peer QP — RC, signal all WRs, bound to cq_peer */
+	memset(&qp_init, 0, sizeof(qp_init));
+	qp_init.send_cq = ctx->cq_peer;
+	qp_init.recv_cq = ctx->cq_peer;
+	qp_init.qp_type = IB_QPT_RC;
+	qp_init.sq_sig_type = IB_SIGNAL_ALL_WR;
+	qp_init.cap.max_send_wr = 64;
+	qp_init.cap.max_recv_wr = 64;
+	qp_init.cap.max_send_sge = 1;
+	qp_init.cap.max_recv_sge = 1;
+
+	ctx->qp_peer = ib_create_qp(ctx->pd, &qp_init);
+	if (IS_ERR(ctx->qp_peer)) {
+		ret = PTR_ERR(ctx->qp_peer);
+		pr_err("ib_create_qp (peer) failed: %d\n", ret);
+		ctx->qp_peer = NULL;
+		goto err_free_cq;
+	}
+
+	/* Transition to INIT state */
+	ret = qp_to_init(ctx->qp_peer, ctx->port);
+	if (ret) {
+		pr_err("peer qp_to_init failed: %d\n", ret);
+		goto err_destroy_qp;
+	}
+
+	/* Fill output struct with local connection metadata */
+	memset(info, 0, sizeof(*info));
+	info->qp_num = ctx->qp_peer->qp_num;
+	info->lid = ctx->lid;
+	memcpy(info->gid, ctx->gid.raw, 16);
+
+	/* Get local DMAC from net device — same pattern as
+	 * connect_loopback_qps().  Each machine fills its own MAC;
+	 * the remote side uses it in ah_attr.roce.dmac during RTR. */
+	sgid_attr = rdma_get_gid_attr(ctx->ib_dev, ctx->port, ctx->gid_index);
+	if (IS_ERR(sgid_attr)) {
+		ret = PTR_ERR(sgid_attr);
+		pr_err("rdma_get_gid_attr failed: %d\n", ret);
+		goto err_destroy_qp;
+	}
+
+	rcu_read_lock();
+	ndev = rdma_read_gid_attr_ndev_rcu(sgid_attr);
+	if (!IS_ERR(ndev))
+		memcpy(info->mac, ndev->dev_addr, ETH_ALEN);
+	rcu_read_unlock();
+	rdma_put_gid_attr(sgid_attr);
+
+	info->status = 0;
+
+	pr_info("peer QP initialized (qp_num=%u, gid=%pI6c)\n",
+		info->qp_num, info->gid);
+	return 0;
+
+err_destroy_qp:
+	ib_destroy_qp(ctx->qp_peer);
+	ctx->qp_peer = NULL;
+err_free_cq:
+	ib_free_cq(ctx->cq_peer);
+	ctx->cq_peer = NULL;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_init_peer);
+
+/*
+ * rdma_engine_connect_peer — Connect local peer QP to remote machine.
+ *
+ * Completes the QP state machine transitions:
+ *   INIT → RTR (Ready-to-Receive): sets the destination QP number,
+ *     GID, DMAC, and path MTU.  After RTR, the QP can receive packets
+ *     from the remote peer.
+ *   RTR → RTS (Ready-to-Send): sets the send PSN and retry parameters.
+ *     After RTS, the QP can both send and receive.
+ *
+ * The critical difference from loopback: qp_to_rtr() receives the
+ * REMOTE machine's QP number, GID, and DMAC (obtained via TCP exchange)
+ * instead of the local loopback peer's values.  The remote->mac is
+ * placed into ah_attr.roce.dmac so rxe constructs Ethernet frames with
+ * the correct destination MAC.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_connect_peer(struct dmaplane_dev *edev,
+			     struct dmaplane_rdma_peer_info *remote)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	const struct ib_gid_attr *sgid_attr;
+	int ret;
+
+	if (!ctx->qp_peer)
+		return -EINVAL;
+
+	sgid_attr = rdma_get_gid_attr(ctx->ib_dev, ctx->port, ctx->gid_index);
+	if (IS_ERR(sgid_attr))
+		return PTR_ERR(sgid_attr);
+
+	/* INIT → RTR: remote machine's QP num, GID, and DMAC */
+	ret = qp_to_rtr(ctx->qp_peer, ctx->port, remote->qp_num,
+			remote->lid, (union ib_gid *)remote->gid,
+			ctx->gid_index, sgid_attr, remote->mac);
+	if (ret) {
+		pr_err("peer qp_to_rtr failed: %d\n", ret);
+		rdma_put_gid_attr(sgid_attr);
+		return ret;
+	}
+
+	/* RTR → RTS */
+	ret = qp_to_rts(ctx->qp_peer);
+	rdma_put_gid_attr(sgid_attr);
+	if (ret) {
+		pr_err("peer qp_to_rts failed: %d\n", ret);
+		return ret;
+	}
+
+	ctx->peer_connected = true;
+	remote->status = 0;
+	pr_info("peer QP connected (remote qp_num=%u)\n", remote->qp_num);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_connect_peer);
+
+/*
+ * rdma_engine_remote_send — Post a send on the peer QP and wait.
+ *
+ * Data flow:
+ *   1. MR lookup: finds the MR in the shared mrs[] array.  The MR can
+ *      be host-backed (sge_addr = vmap'd kernel VA) or GPU-backed
+ *      (sge_addr = contiguous WC BAR mapping).  Both use the same
+ *      ID namespace; this function is agnostic to the backing type.
+ *   2. Post send: ib_post_send() on qp_peer.  rxe reads from sge_addr
+ *      via memcpy; for GPU-backed MRs this becomes memcpy from the WC
+ *      BAR mapping (PCIe reads from GPU VRAM).
+ *   3. rxe fragments the data into UDP packets and sends them out.
+ *
+ * Timeout: 10s.  The remote receiver should already have its recv posted.
+ *
+ * MR snapshot under lock: struct is copied by value so a concurrent
+ * deregister can't invalidate the local copy during the work request.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_remote_send(struct dmaplane_dev *edev,
+			    struct dmaplane_rdma_remote_xfer_params *params)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct dmaplane_mr_entry mr_copy;
+	struct poll_cq_wait send_wait;
+	struct ib_wc wc;
+	ktime_t start;
+	int ret, rc;
+
+	if (!ctx->peer_connected)
+		return -EINVAL;
+
+	/* Snapshot MR under lock */
+	mutex_lock(&edev->mr_lock);
+	{
+		struct dmaplane_mr_entry *mr;
+
+		mr = dmabuf_rdma_find_mr(edev, params->mr_id);
+		if (!mr) {
+			mutex_unlock(&edev->mr_lock);
+			return -ENOENT;
+		}
+		mr_copy = *mr;
+	}
+	mutex_unlock(&edev->mr_lock);
+
+	start = ktime_get();
+
+	ret = rdma_engine_post_send(edev, ctx->qp_peer, &mr_copy,
+				    params->size, &send_wait);
+	if (ret)
+		return ret;
+
+	/* Poll peer CQ — 10s timeout */
+	rc = rdma_engine_poll_cq(ctx->cq_peer, &wc, 10000);
+	if (rc <= 0) {
+		pr_err("remote send %s\n",
+		       rc == 0 ? "timed out" : "poll failed");
+		params->status = rc == 0 ? 1 : (__u32)(-rc);
+		return rc == 0 ? -ETIMEDOUT : rc;
+	}
+	if (wc.status != IB_WC_SUCCESS) {
+		pr_err("remote send completion error: %d\n", wc.status);
+		params->status = wc.status;
+		atomic64_inc(&edev->stats.completion_errors);
+		return -EIO;
+	}
+
+	atomic64_inc(&edev->stats.completions_polled);
+	atomic64_add(params->size, &edev->stats.bytes_sent);
+
+	params->elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), start));
+	if (params->elapsed_ns > 0)
+		params->throughput_mbps = (u64)params->size * 1000 /
+					  params->elapsed_ns;
+	else
+		params->throughput_mbps = 0;
+	params->status = 0;
+
+	pr_info("remote send OK — %u bytes, %llu ns\n",
+		params->size, (unsigned long long)params->elapsed_ns);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_remote_send);
+
+/*
+ * rdma_engine_remote_recv — Post a recv on the peer QP and wait.
+ *
+ * Data flow:
+ *   1. MR lookup: finds the MR (host or GPU-backed).  sge_addr tells
+ *      rxe where to write incoming data.
+ *   2. Post recv: ib_post_recv() on qp_peer.  SGE length must be >=
+ *      the sender's send size.
+ *   3. Poll CQ: busy-polls with usleep_range(50,200) and cond_resched()
+ *      for up to 30 seconds.
+ *   4. On completion, wc.byte_len = actual received bytes.
+ *
+ * The 30s timeout is deliberately long: this ioctl blocks while waiting
+ * for the remote sender.  The receiver must call this BEFORE the sender.
+ *
+ * After successful recv, userspace can mmap the buffer to read the data
+ * zero-copy (same physical pages rxe wrote into).
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_remote_recv(struct dmaplane_dev *edev,
+			    struct dmaplane_rdma_remote_xfer_params *params)
+{
+	struct dmaplane_rdma_ctx *ctx = &edev->rdma;
+	struct dmaplane_mr_entry mr_copy;
+	struct poll_cq_wait recv_wait;
+	struct ib_wc wc;
+	ktime_t start;
+	int ret, rc;
+
+	if (!ctx->peer_connected)
+		return -EINVAL;
+
+	/* Snapshot MR under lock */
+	mutex_lock(&edev->mr_lock);
+	{
+		struct dmaplane_mr_entry *mr;
+
+		mr = dmabuf_rdma_find_mr(edev, params->mr_id);
+		if (!mr) {
+			mutex_unlock(&edev->mr_lock);
+			return -ENOENT;
+		}
+		mr_copy = *mr;
+	}
+	mutex_unlock(&edev->mr_lock);
+
+	start = ktime_get();
+
+	ret = rdma_engine_post_recv(edev, ctx->qp_peer, &mr_copy,
+				    params->size, &recv_wait);
+	if (ret)
+		return ret;
+
+	/* Poll peer CQ — 30s timeout (waiting for remote sender) */
+	rc = rdma_engine_poll_cq(ctx->cq_peer, &wc, 30000);
+	if (rc <= 0) {
+		pr_err("remote recv %s\n",
+		       rc == 0 ? "timed out" : "poll failed");
+		params->status = rc == 0 ? 1 : (__u32)(-rc);
+		return rc == 0 ? -ETIMEDOUT : rc;
+	}
+	if (wc.status != IB_WC_SUCCESS) {
+		pr_err("remote recv completion error: %d\n", wc.status);
+		params->status = wc.status;
+		atomic64_inc(&edev->stats.completion_errors);
+		return -EIO;
+	}
+
+	atomic64_inc(&edev->stats.completions_polled);
+	atomic64_add(wc.byte_len, &edev->stats.bytes_received);
+
+	params->elapsed_ns = ktime_to_ns(ktime_sub(ktime_get(), start));
+	if (params->elapsed_ns > 0)
+		params->throughput_mbps = (u64)wc.byte_len * 1000 /
+					  params->elapsed_ns;
+	else
+		params->throughput_mbps = 0;
+	params->status = 0;
+
+	pr_info("remote recv OK — %u bytes, %llu ns\n",
+		wc.byte_len, (unsigned long long)params->elapsed_ns);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rdma_engine_remote_recv);

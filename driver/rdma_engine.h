@@ -73,4 +73,57 @@ int rdma_engine_flush_cq(struct ib_cq *cq);
  */
 int rdma_engine_cmp_u64(const void *a, const void *b);
 
+/* ── Phase 8: Cross-machine peer QP management ── */
+
+/*
+ * rdma_engine_init_peer() — Create a third QP for cross-machine RDMA.
+ *
+ * Creates cq_peer + qp_peer sharing the existing PD from setup().
+ * Transitions qp_peer to INIT state.  Fills info with local QP number,
+ * GID, and MAC for TCP metadata exchange with the remote machine.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_init_peer(struct dmaplane_dev *edev,
+			  struct dmaplane_rdma_peer_info *info);
+
+/*
+ * rdma_engine_connect_peer() — Connect peer QP using remote metadata.
+ *
+ * Completes INIT → RTR → RTS transitions using the remote machine's
+ * QP number, GID, and DMAC (received via TCP).  Sets peer_connected.
+ *
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_connect_peer(struct dmaplane_dev *edev,
+			     struct dmaplane_rdma_peer_info *remote);
+
+/*
+ * rdma_engine_remote_send() — Post SEND on peer QP, wait for completion.
+ *
+ * Sends from a local MR (host or GPU-backed) via qp_peer.
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_remote_send(struct dmaplane_dev *edev,
+			    struct dmaplane_rdma_remote_xfer_params *params);
+
+/*
+ * rdma_engine_remote_recv() — Post RECV on peer QP, wait for completion.
+ *
+ * Receives into a local MR via qp_peer.  30s timeout — must be called
+ * BEFORE the remote sender posts its SEND (RC QP semantics).
+ * Caller must hold rdma_sem read lock.
+ */
+int rdma_engine_remote_recv(struct dmaplane_dev *edev,
+			    struct dmaplane_rdma_remote_xfer_params *params);
+
+/*
+ * rdma_engine_teardown_peer() — Destroy peer QP and CQ.
+ *
+ * Moves qp_peer to ERR state (flushes WRs), destroys QP then CQ
+ * in reverse creation order.  Idempotent.
+ * Caller must hold rdma_sem write lock.
+ */
+void rdma_engine_teardown_peer(struct dmaplane_dev *edev);
+
 #endif /* _RDMA_ENGINE_H */

@@ -3,12 +3,13 @@
  * dmaplane_debugfs.c — debugfs interface for live driver inspection
  * Copyright (c) 2026 Graziano Labs Corp.
  *
- * Creates /sys/kernel/debug/dmaplane/ with 5 read-only files:
+ * Creates /sys/kernel/debug/dmaplane/ with 6 read-only files:
  *   stats     — all device-level atomic counters
  *   buffers   — list of active DMA buffers
  *   rdma      — RDMA context state and MR list
  *   flow      — flow control configuration and state
  *   histogram — latency histogram with percentiles
+ *   gpu       — GPU P2P state and statistics (Phase 8)
  *
  * All files use seq_file for output.  debugfs is a debugging aid
  * with no ABI stability guarantees — format may change between
@@ -31,6 +32,9 @@
 #include <linux/seq_file.h>
 #include "dmaplane.h"
 #include "dmaplane_histogram.h"
+#ifdef CONFIG_DMAPLANE_GPU
+#include "gpu_p2p.h"
+#endif
 
 static struct dentry *dmaplane_debugfs_root;
 
@@ -268,6 +272,60 @@ static int dmaplane_histogram_show(struct seq_file *s, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(dmaplane_histogram);
 
+/* ── gpu: GPU P2P state and statistics ─────────────────────── */
+
+static int dmaplane_gpu_show(struct seq_file *s, void *unused)
+{
+	struct dmaplane_dev *dev = s->private;
+
+	seq_puts(s, "=== gpu state ===\n");
+
+#ifdef CONFIG_DMAPLANE_GPU
+	{
+		int i, pinned = 0;
+
+		seq_puts(s, "symbols: resolved\n");
+
+		mutex_lock(&dev->gpu_buf_lock);
+		for (i = 0; i < DMAPLANE_MAX_GPU_BUFFERS; i++) {
+			if (dev->gpu_buffers[i].in_use)
+				pinned++;
+		}
+		seq_printf(s, "pinned_buffers: %d\n", pinned);
+
+		for (i = 0; i < DMAPLANE_MAX_GPU_BUFFERS; i++) {
+			struct dmaplane_gpu_buffer *gb = &dev->gpu_buffers[i];
+
+			if (!gb->in_use)
+				continue;
+
+			seq_printf(s, "  handle=%-3u va=0x%016llx size=%-10llu pages=%-4d "
+				   "rdma=%s revoked=%s\n",
+				   gb->id, gb->gpu_va, gb->size,
+				   gb->num_pages,
+				   gb->rdma_vaddr ? "yes" : "no",
+				   atomic_read(&gb->gpu_revoked) ? "yes" : "no");
+		}
+		mutex_unlock(&dev->gpu_buf_lock);
+	}
+#else
+	seq_puts(s, "symbols: not compiled (CONFIG_DMAPLANE_GPU=n)\n");
+#endif
+
+	seq_puts(s, "stats:\n");
+	seq_printf(s, "  pins=%lld unpins=%lld callbacks=%lld\n",
+		   atomic64_read(&dev->gpu_stats.pins_total),
+		   atomic64_read(&dev->gpu_stats.unpins_total),
+		   atomic64_read(&dev->gpu_stats.callbacks_fired));
+	seq_printf(s, "  h2g_bytes=%lld g2h_bytes=%lld gpu_mrs_reg=%lld\n",
+		   atomic64_read(&dev->gpu_stats.dma_h2g_bytes),
+		   atomic64_read(&dev->gpu_stats.dma_g2h_bytes),
+		   atomic64_read(&dev->gpu_stats.gpu_mrs_registered));
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(dmaplane_gpu);
+
 /* ── Lifecycle ────────────────────────────────────────────── */
 
 /*
@@ -297,6 +355,8 @@ int dmaplane_debugfs_init(struct dmaplane_dev *dev)
 			    &dmaplane_flow_fops);
 	debugfs_create_file("histogram", 0444, dmaplane_debugfs_root, dev,
 			    &dmaplane_histogram_fops);
+	debugfs_create_file("gpu", 0444, dmaplane_debugfs_root, dev,
+			    &dmaplane_gpu_fops);
 
 	pr_debug("debugfs interface created at /sys/kernel/debug/dmaplane/\n");
 

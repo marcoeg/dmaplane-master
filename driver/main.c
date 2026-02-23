@@ -91,6 +91,9 @@
 #include "dmaplane_trace.h"
 #include "dmaplane_debugfs.h"
 #include "dmaplane_histogram.h"
+#ifdef CONFIG_DMAPLANE_GPU
+#include "gpu_p2p.h"
+#endif
 
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("Graziano Labs Corp.");
@@ -1659,6 +1662,7 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 			    unsigned long arg)
 {
 	struct dmaplane_file_ctx *ctx = filp->private_data;
+	long ret;
 
 	switch (cmd) {
 	/* Phase 1: Channel operations */
@@ -1724,6 +1728,206 @@ static long dmaplane_ioctl(struct file *filp, unsigned int cmd,
 	/* Phase 7: Instrumentation */
 	case DMAPLANE_IOCTL_GET_HISTOGRAM:
 		return dmaplane_ioctl_get_histogram(ctx, arg);
+
+	/* Phase 8: GPU P2P */
+#ifdef CONFIG_DMAPLANE_GPU
+	case DMAPLANE_IOCTL_GPU_PIN: {
+		struct dmaplane_gpu_pin_params p;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		ret = dmaplane_gpu_pin(dma_dev, p.gpu_va, p.size,
+				       &p.handle, &p.gpu_numa_node,
+				       &p.num_pages, &p.bar1_consumed);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p))) {
+			dmaplane_gpu_unpin(dma_dev, p.handle);
+			return -EFAULT;
+		}
+		return 0;
+	}
+	case DMAPLANE_IOCTL_GPU_UNPIN: {
+		struct dmaplane_gpu_unpin_params p;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		return dmaplane_gpu_unpin(dma_dev, p.handle);
+	}
+	case DMAPLANE_IOCTL_GPU_DMA_TO_HOST: {
+		struct dmaplane_gpu_dma_params p;
+		long ret;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		ret = dmaplane_gpu_dma_to_host(dma_dev, p.gpu_handle,
+					       p.host_handle, p.offset,
+					       p.size, &p.elapsed_ns);
+		if (ret)
+			return ret;
+		if (p.elapsed_ns > 0)
+			p.throughput_mbps = div64_u64(p.size * 1000ULL,
+						      p.elapsed_ns);
+		else
+			p.throughput_mbps = 0;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_GPU_DMA_FROM_HOST: {
+		struct dmaplane_gpu_dma_params p;
+		long ret;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		ret = dmaplane_gpu_dma_from_host(dma_dev, p.host_handle,
+						 p.gpu_handle, p.offset,
+						 p.size, &p.elapsed_ns);
+		if (ret)
+			return ret;
+		if (p.elapsed_ns > 0)
+			p.throughput_mbps = div64_u64(p.size * 1000ULL,
+						      p.elapsed_ns);
+		else
+			p.throughput_mbps = 0;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_GPU_BENCH: {
+		struct dmaplane_gpu_bench_params p;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		ret = dmaplane_gpu_benchmark(dma_dev, p.gpu_handle,
+					     p.host_handle, p.iterations,
+					     &p.h2g_bandwidth_mbps,
+					     &p.g2h_bandwidth_mbps);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_GPU_REGISTER_MR: {
+		struct dmaplane_gpu_mr_params p;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = dmaplane_gpu_register_mr(dma_dev, &p);
+		up_read(&dma_dev->rdma_sem);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p))) {
+			rdma_engine_deregister_mr(dma_dev, p.mr_id);
+			return -EFAULT;
+		}
+		return 0;
+	}
+	case DMAPLANE_IOCTL_GPU_LOOPBACK: {
+		struct dmaplane_gpu_loopback_params p;
+
+		if (copy_from_user(&p, (void __user *)arg, sizeof(p)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = benchmark_gpu_loopback(dma_dev, &p);
+		up_read(&dma_dev->rdma_sem);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &p, sizeof(p)))
+			return -EFAULT;
+		return 0;
+	}
+#endif /* CONFIG_DMAPLANE_GPU */
+
+#ifndef CONFIG_DMAPLANE_GPU
+	/* GPU support not compiled — return -ENODEV (not -ENOTTY)
+	 * so userspace can distinguish "no GPU" from "bad ioctl". */
+	case DMAPLANE_IOCTL_GPU_PIN:
+	case DMAPLANE_IOCTL_GPU_UNPIN:
+	case DMAPLANE_IOCTL_GPU_DMA_TO_HOST:
+	case DMAPLANE_IOCTL_GPU_DMA_FROM_HOST:
+	case DMAPLANE_IOCTL_GPU_BENCH:
+	case DMAPLANE_IOCTL_GPU_REGISTER_MR:
+	case DMAPLANE_IOCTL_GPU_LOOPBACK:
+		return -ENODEV;
+#endif
+
+	case DMAPLANE_IOCTL_GET_GPU_STATS: {
+		struct dmaplane_gpu_stats gs;
+
+		gs.pins_total = atomic64_read(&dma_dev->gpu_stats.pins_total);
+		gs.unpins_total = atomic64_read(&dma_dev->gpu_stats.unpins_total);
+		gs.callbacks_fired = atomic64_read(&dma_dev->gpu_stats.callbacks_fired);
+		gs.dma_h2g_bytes = atomic64_read(&dma_dev->gpu_stats.dma_h2g_bytes);
+		gs.dma_g2h_bytes = atomic64_read(&dma_dev->gpu_stats.dma_g2h_bytes);
+		gs.gpu_mrs_registered = atomic64_read(&dma_dev->gpu_stats.gpu_mrs_registered);
+		if (copy_to_user((void __user *)arg, &gs, sizeof(gs)))
+			return -EFAULT;
+		return 0;
+	}
+
+	/* Phase 8: Peer RDMA (cross-machine) */
+	case DMAPLANE_IOCTL_RDMA_INIT_PEER: {
+		struct dmaplane_rdma_peer_info pi;
+
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_init_peer(dma_dev, &pi);
+		up_read(&dma_dev->rdma_sem);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &pi, sizeof(pi)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_RDMA_CONNECT_PEER: {
+		struct dmaplane_rdma_peer_info pi;
+
+		if (copy_from_user(&pi, (void __user *)arg, sizeof(pi)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_connect_peer(dma_dev, &pi);
+		up_read(&dma_dev->rdma_sem);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &pi, sizeof(pi)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_RDMA_REMOTE_SEND: {
+		struct dmaplane_rdma_remote_xfer_params xp;
+
+		if (copy_from_user(&xp, (void __user *)arg, sizeof(xp)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_remote_send(dma_dev, &xp);
+		up_read(&dma_dev->rdma_sem);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &xp, sizeof(xp)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_RDMA_REMOTE_RECV: {
+		struct dmaplane_rdma_remote_xfer_params xp;
+
+		if (copy_from_user(&xp, (void __user *)arg, sizeof(xp)))
+			return -EFAULT;
+		down_read(&dma_dev->rdma_sem);
+		ret = rdma_engine_remote_recv(dma_dev, &xp);
+		up_read(&dma_dev->rdma_sem);
+		if (ret)
+			return ret;
+		if (copy_to_user((void __user *)arg, &xp, sizeof(xp)))
+			return -EFAULT;
+		return 0;
+	}
+	case DMAPLANE_IOCTL_RDMA_DESTROY_PEER:
+		down_write(&dma_dev->rdma_sem);
+		rdma_engine_teardown_peer(dma_dev);
+		up_write(&dma_dev->rdma_sem);
+		return 0;
 
 	default:
 		return -ENOTTY;
@@ -1829,6 +2033,14 @@ static int __init dmaplane_init(void)
 	BUILD_BUG_ON(offsetof(struct dmaplane_ring, head) % SMP_CACHE_BYTES != 0);
 	BUILD_BUG_ON(offsetof(struct dmaplane_ring, tail) % SMP_CACHE_BYTES != 0);
 
+	/* Phase 8: GPU stats init (always, even without GPU support) */
+	atomic64_set(&dma_dev->gpu_stats.pins_total, 0);
+	atomic64_set(&dma_dev->gpu_stats.unpins_total, 0);
+	atomic64_set(&dma_dev->gpu_stats.callbacks_fired, 0);
+	atomic64_set(&dma_dev->gpu_stats.dma_h2g_bytes, 0);
+	atomic64_set(&dma_dev->gpu_stats.dma_g2h_bytes, 0);
+	atomic64_set(&dma_dev->gpu_stats.gpu_mrs_registered, 0);
+
 	/*
 	 * Create platform device for DMA operations.
 	 *
@@ -1904,6 +2116,27 @@ static int __init dmaplane_init(void)
 
 	/* Phase 7: debugfs — non-fatal on failure */
 	dmaplane_debugfs_init(dma_dev);
+
+#ifdef CONFIG_DMAPLANE_GPU
+	/* Phase 8: GPU subsystem init — allocate tracking array and
+	 * resolve NVIDIA P2P symbols.  Non-fatal on failure — module
+	 * operates without GPU if nvidia.ko is not loaded. */
+	dma_dev->gpu_buffers = kcalloc(DMAPLANE_MAX_GPU_BUFFERS,
+				       sizeof(struct dmaplane_gpu_buffer),
+				       GFP_KERNEL);
+	if (!dma_dev->gpu_buffers) {
+		pr_warn("GPU buffer array allocation failed — GPU support disabled\n");
+	} else {
+		mutex_init(&dma_dev->gpu_buf_lock);
+		dma_dev->next_gpu_buf_id = 1;
+		ret = dmaplane_gpu_init();
+		if (ret) {
+			pr_info("GPU P2P symbols not available — GPU support disabled\n");
+			kfree(dma_dev->gpu_buffers);
+			dma_dev->gpu_buffers = NULL;
+		}
+	}
+#endif
 
 	pr_info("module loaded (major %d)\n", MAJOR(dma_dev->devno));
 
@@ -1996,6 +2229,21 @@ static void __exit dmaplane_exit(void)
 	for (i = 0; i < DMAPLANE_MAX_MRS; i++)
 		dma_dev->mrs[i].in_use = false;
 	up_write(&dma_dev->rdma_sem);
+
+#ifdef CONFIG_DMAPLANE_GPU
+	/* Phase 8: GPU cleanup — unpin all remaining buffers, then
+	 * release NVIDIA symbol references.  Must unpin BEFORE
+	 * symbol_put — otherwise put_pages pointer is invalid. */
+	if (dma_dev->gpu_buffers) {
+		for (i = 0; i < DMAPLANE_MAX_GPU_BUFFERS; i++) {
+			if (dma_dev->gpu_buffers[i].in_use)
+				dmaplane_gpu_unpin(dma_dev,
+						   dma_dev->gpu_buffers[i].id);
+		}
+		kfree(dma_dev->gpu_buffers);
+	}
+	dmaplane_gpu_exit();
+#endif
 
 	/* 4. Free remaining buffers — warn on leaked exports/mmaps */
 	for (i = 0; i < DMAPLANE_MAX_BUFFERS; i++) {
