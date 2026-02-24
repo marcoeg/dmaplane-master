@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  dmaplane Phase 9C/D — Two-instance disaggregated inference demo.
+  2× g5.xlarge (A10G) from Phase 9B AMI. Everything pre-built.
+  UserData: load driver, configure rxe, signal ready. You run tests via SSH.
+
+Parameters:
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet in vpc-0eba669e962960152 (us-west-2a)
+    Default: subnet-0fe4b39afc43c4fb2
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for SSH access
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Phase 9B validated AMI (dmaplane + TinyLlama pre-built)
+    Default: ami-0960d74ca58008230
+
+Resources:
+  PlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+      GroupName: dmaplane-phase9cd-pg
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: dmaplane Phase 9C/D - SSH + inter-instance RDMA
+      VpcId: vpc-0eba669e962960152
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: dmaplane-phase9cd-sg
+
+  # Allow all traffic between instances in same SG
+  SGSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: -1
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  PrefillInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: g5.xlarge
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      PlacementGroupName: !Ref PlacementGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Iops: 6000
+      Tags:
+        - Key: Name
+          Value: dmaplane-prefill
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/dmaplane-setup.log 2>&1
+
+          echo "=========================================="
+          echo "dmaplane Phase 9C/D — PREFILL (Machine A)"
+          echo "Started: $(date -u)"
+          echo "=========================================="
+
+          # —— Wait for GPU driver ——
+          echo "[1/5] Waiting for GPU driver..."
+          for i in $(seq 1 60); do
+            if nvidia-smi &>/dev/null; then
+              echo "  GPU ready after ${!i}s"
+              break
+            fi
+            sleep 5
+          done
+          nvidia-smi || { echo "FATAL: GPU not available"; exit 1; }
+
+          # —— Configure soft-RoCE ——
+          echo "[2/5] Configuring soft-RoCE..."
+          modprobe rdma_rxe 2>/dev/null || true
+          PRIMARY_IF=$(ip -o link show up | grep -v lo | head -1 | awk -F: '{print $2}' | tr -d ' ')
+          RXE_DEV="rxe_${!PRIMARY_IF}"
+          if [ ! -d "/sys/class/infiniband/${!RXE_DEV}" ]; then
+            rdma link add "${!RXE_DEV}" type rxe netdev "${!PRIMARY_IF}" 2>/dev/null || true
+          fi
+          echo "  ${!RXE_DEV} on ${!PRIMARY_IF}"
+          rdma link show 2>/dev/null || true
+
+          # —— Pull latest code ——
+          echo "[3/5] Pulling latest dmaplane code..."
+          cd /home/ubuntu/dmaplane
+          git pull origin main 2>&1 | tail -5
+          echo "  git pull: OK"
+
+          # —— Build driver + tools ——
+          echo "[4/5] Building driver + kvcache tools..."
+          cd /home/ubuntu/dmaplane/driver
+          make clean && make 2>&1 | tail -3
+          insmod dmaplane.ko
+          dmesg | grep dmaplane | tail -5
+          echo "  Driver: OK"
+
+          cd /home/ubuntu/dmaplane/tests
+          make clean && make 2>&1 | tail -3
+          echo "  Tests: OK"
+
+          cd /home/ubuntu/dmaplane/examples/kvcache
+          make clean && make 2>&1 | tail -3
+          echo "  KVCache tools: OK"
+
+          # —— Smoke test ——
+          echo "[5/5] Smoke test..."
+          cd /home/ubuntu/dmaplane/examples/kvcache
+          ./kvcache_sender --loopback --layers 2 --chunks-per-layer 1 --verify 2>&1 | tail -5
+          echo ""
+
+          PRIVATE_IP=$(hostname -I | awk '{print $1}')
+          echo "=========================================="
+          echo "PREFILL ready."
+          echo "  Private IP: ${!PRIVATE_IP}"
+          echo "  Role: sender (Machine A)"
+          echo ""
+          echo "Usage:"
+          echo "  # Host-backed peer transfer:"
+          echo "  sudo ./kvcache_sender --peer <DECODE_IP> --port 9876 --verify"
+          echo ""
+          echo "  # GPU-backed peer transfer:"
+          echo "  sudo ./kvcache_sender --peer <DECODE_IP> --port 9876 --gpu --verify"
+          echo ""
+          echo "  # Full 128-chunk sweep:"
+          echo "  sudo ./kvcache_sender --peer <DECODE_IP> --port 9876 --verify \\"
+          echo "    --layers 32 --chunks-per-layer 4 --chunk-size 1048576"
+          echo ""
+          echo "  # Credit pressure test:"
+          echo "  sudo ./kvcache_sender --peer <DECODE_IP> --port 9876 --verify \\"
+          echo "    --credit-window 2 --layers 8"
+          echo "=========================================="
+
+          touch /home/ubuntu/READY
+          chown -R ubuntu:ubuntu /home/ubuntu/dmaplane
+
+  DecodeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: g5.xlarge
+      ImageId: !Ref AmiId
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      PlacementGroupName: !Ref PlacementGroup
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Iops: 6000
+      Tags:
+        - Key: Name
+          Value: dmaplane-decode
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/dmaplane-setup.log 2>&1
+
+          echo "=========================================="
+          echo "dmaplane Phase 9C/D — DECODE (Machine B)"
+          echo "Started: $(date -u)"
+          echo "=========================================="
+
+          # —— Wait for GPU driver ——
+          echo "[1/5] Waiting for GPU driver..."
+          for i in $(seq 1 60); do
+            if nvidia-smi &>/dev/null; then
+              echo "  GPU ready after ${!i}s"
+              break
+            fi
+            sleep 5
+          done
+          nvidia-smi || { echo "FATAL: GPU not available"; exit 1; }
+
+          # —— Configure soft-RoCE ——
+          echo "[2/5] Configuring soft-RoCE..."
+          modprobe rdma_rxe 2>/dev/null || true
+          PRIMARY_IF=$(ip -o link show up | grep -v lo | head -1 | awk -F: '{print $2}' | tr -d ' ')
+          RXE_DEV="rxe_${!PRIMARY_IF}"
+          if [ ! -d "/sys/class/infiniband/${!RXE_DEV}" ]; then
+            rdma link add "${!RXE_DEV}" type rxe netdev "${!PRIMARY_IF}" 2>/dev/null || true
+          fi
+          echo "  ${!RXE_DEV} on ${!PRIMARY_IF}"
+          rdma link show 2>/dev/null || true
+
+          # —— Pull latest code ——
+          echo "[3/5] Pulling latest dmaplane code..."
+          cd /home/ubuntu/dmaplane
+          git pull origin main 2>&1 | tail -5
+          echo "  git pull: OK"
+
+          # —— Build driver + tools ——
+          echo "[4/5] Building driver + kvcache tools..."
+          cd /home/ubuntu/dmaplane/driver
+          make clean && make 2>&1 | tail -3
+          insmod dmaplane.ko
+          dmesg | grep dmaplane | tail -5
+          echo "  Driver: OK"
+
+          cd /home/ubuntu/dmaplane/tests
+          make clean && make 2>&1 | tail -3
+          echo "  Tests: OK"
+
+          cd /home/ubuntu/dmaplane/examples/kvcache
+          make clean && make 2>&1 | tail -3
+          echo "  KVCache tools: OK"
+
+          # —— Smoke test ——
+          echo "[5/5] Smoke test..."
+          cd /home/ubuntu/dmaplane/examples/kvcache
+          ./kvcache_sender --loopback --layers 2 --chunks-per-layer 1 --verify 2>&1 | tail -5
+          echo ""
+
+          PRIVATE_IP=$(hostname -I | awk '{print $1}')
+          echo "=========================================="
+          echo "DECODE ready."
+          echo "  Private IP: ${!PRIVATE_IP}"
+          echo "  Role: receiver (Machine B)"
+          echo ""
+          echo "Usage:"
+          echo "  # Start receiver (run FIRST, before sender):"
+          echo "  sudo ./kvcache_receiver --port 9876 --verify"
+          echo ""
+          echo "  # GPU-backed receiver:"
+          echo "  sudo ./kvcache_receiver --port 9876 --gpu --verify"
+          echo "=========================================="
+
+          touch /home/ubuntu/READY
+          chown -R ubuntu:ubuntu /home/ubuntu/dmaplane
+
+  PrefillEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: dmaplane-prefill-eip
+
+  DecodeEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: dmaplane-decode-eip
+
+  PrefillEIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref PrefillInstance
+      AllocationId: !GetAtt PrefillEIP.AllocationId
+
+  DecodeEIPAssoc:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref DecodeInstance
+      AllocationId: !GetAtt DecodeEIP.AllocationId
+
+Outputs:
+  PrefillPublicIP:
+    Value: !Ref PrefillEIP
+    Description: SSH to prefill (sender) instance
+  DecodePublicIP:
+    Value: !Ref DecodeEIP
+    Description: SSH to decode (receiver) instance
+  PrefillPrivateIP:
+    Value: !GetAtt PrefillInstance.PrivateIp
+    Description: Prefill private IP (use for --peer on sender)
+  DecodePrivateIP:
+    Value: !GetAtt DecodeInstance.PrivateIp
+    Description: Decode private IP (use for --peer on sender)
+  PrefillInstanceId:
+    Value: !Ref PrefillInstance
+  DecodeInstanceId:
+    Value: !Ref DecodeInstance
+  TestPlan:
+    Value: !Sub |
+      === Phase 9C Test Plan ===
+
+      1. SSH into both instances:
+         ssh -i <key>.pem ubuntu@${PrefillEIP}   # prefill (sender)
+         ssh -i <key>.pem ubuntu@${DecodeEIP}     # decode (receiver)
+
+      2. Wait for ready:
+         while [ ! -f ~/READY ]; do sleep 5; echo "waiting..."; done
+
+      3. Network baseline (from prefill):
+         ping -c 5 ${DecodeInstance.PrivateIp}
+         iperf3 -c ${DecodeInstance.PrivateIp}   # (run iperf3 -s on decode first)
+
+      4. Host-backed peer transfer (start receiver FIRST):
+         [decode]  cd ~/dmaplane/examples/kvcache && sudo ./kvcache_receiver --port 9876 --verify
+         [prefill] cd ~/dmaplane/examples/kvcache && sudo ./kvcache_sender --peer ${DecodeInstance.PrivateIp} --port 9876 --verify
+
+      5. Full 128-chunk transfer:
+         [decode]  sudo ./kvcache_receiver --port 9876 --verify
+         [prefill] sudo ./kvcache_sender --peer ${DecodeInstance.PrivateIp} --port 9876 --verify --layers 32 --chunks-per-layer 4
+
+      6. GPU-backed transfer:
+         [decode]  sudo ./kvcache_receiver --port 9876 --gpu --verify
+         [prefill] sudo ./kvcache_sender --peer ${DecodeInstance.PrivateIp} --port 9876 --gpu --verify
+
+      7. Credit pressure (window=2):
+         [decode]  sudo ./kvcache_receiver --port 9876 --verify
+         [prefill] sudo ./kvcache_sender --peer ${DecodeInstance.PrivateIp} --port 9876 --verify --credit-window 2 --layers 8
+
+      8. Stress: 10× consecutive transfers:
+         for i in $(seq 1 10); do
+           [decode]  sudo ./kvcache_receiver --port 9876 --verify
+           [prefill] sudo ./kvcache_sender --peer ${DecodeInstance.PrivateIp} --port 9876 --verify
+         done
+
+      9. Chunk size sweep:
+         for sz in 262144 1048576 4194304; do
+           [decode]  sudo ./kvcache_receiver --port 9876 --verify
+           [prefill] sudo ./kvcache_sender --peer ${DecodeInstance.PrivateIp} --port 9876 --verify --chunk-size $sz
+         done
+
+      === Phase 9D: Disaggregated Inference ===
+
+      10. TinyLlama end-to-end (start decode FIRST):
+          [decode]  cd ~/dmaplane/examples/kvcache && sudo python3 decode_server.py --peer ${PrefillInstance.PrivateIp} --port 9876
+          [prefill] cd ~/dmaplane/examples/kvcache && sudo python3 prefill_server.py --port 9876
+
+      11. With custom chunk size:
+          [decode]  sudo python3 decode_server.py --peer ${PrefillInstance.PrivateIp} --port 9876
+          [prefill] sudo python3 prefill_server.py --port 9876 --chunk-size 4194304 --credit-window 32
+
+      === Tear down ===
+      aws cloudformation delete-stack --stack-name dmaplane-phase9cd --region us-west-2

@@ -241,6 +241,7 @@ def main():
             t_xfer = time.monotonic()
             credits = args.credit_window
             stalls = 0
+            credits_received = 0
 
             for i in range(num_chunks):
                 # Credit management
@@ -248,6 +249,7 @@ def main():
                     # Block for at least 1 credit
                     tcp_recv_all(conn, 1)
                     credits += 1
+                    credits_received += 1
                     stalls += 1
                     # Drain any extras non-blocking
                     conn.setblocking(False)
@@ -255,6 +257,7 @@ def main():
                         extra = conn.recv(64)
                         if extra:
                             credits += len(extra)
+                            credits_received += len(extra)
                     except BlockingIOError:
                         pass
                     conn.setblocking(True)
@@ -265,6 +268,7 @@ def main():
                         extra = conn.recv(64)
                         if extra:
                             credits += len(extra)
+                            credits_received += len(extra)
                     except BlockingIOError:
                         pass
                     conn.setblocking(True)
@@ -283,8 +287,12 @@ def main():
                          remote_addr, remote_rkey,
                          4, KVCACHE_SENTINEL, use_peer_qp=1)
 
-            # Wait for "done" ack
-            tcp_recv_all(conn, 1)
+            # Decode sends exactly num_chunks credit bytes + 1 done byte.
+            # Some credits were already consumed during the WRITEIMM loop.
+            # Read whatever remains in one blocking call.
+            remaining = (num_chunks - credits_received) + 1
+            if remaining > 0:
+                tcp_recv_all(conn, remaining)
 
             xfer_ms = (time.monotonic() - t_xfer) * 1000
             throughput = (packed_bytes / 1024 / 1024) / (xfer_ms / 1000) \

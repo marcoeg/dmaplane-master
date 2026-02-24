@@ -81,6 +81,7 @@ static int scan_gid_table(struct dmaplane_rdma_ctx *ctx)
 	int idx, ret;
 	bool found = false;
 	int last_linklocal = -1;
+	int first_v4mapped = -1;
 
 	for (idx = 0; idx < 16; idx++) {
 		attr = rdma_get_gid_attr(ctx->ib_dev, ctx->port, idx);
@@ -95,22 +96,25 @@ static int scan_gid_table(struct dmaplane_rdma_ctx *ctx)
 		 * (empirically the real interface address on Ubuntu
 		 * with stable-privacy addressing) */
 		if (attr->gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP &&
-		    !ipv6_addr_any((struct in6_addr *)attr->gid.raw) &&
-		    ipv6_addr_type((struct in6_addr *)attr->gid.raw) &
-				   IPV6_ADDR_LINKLOCAL) {
-			last_linklocal = idx;
+		    !ipv6_addr_any((struct in6_addr *)attr->gid.raw)) {
+			int atype = ipv6_addr_type((struct in6_addr *)attr->gid.raw);
+			if ((atype & IPV6_ADDR_MAPPED) && first_v4mapped < 0)
+				first_v4mapped = idx;
+			if (atype & IPV6_ADDR_LINKLOCAL)
+				last_linklocal = idx;
 		}
 
 		rdma_put_gid_attr(attr);
 	}
 
-	/* Prefer the last link-local GID (the real interface address) */
-	if (last_linklocal >= 0) {
+	/* Prefer IPv4-mapped GID[1] (routable on EC2), fall back to link-local */
+	int preferred = (first_v4mapped >= 0) ? first_v4mapped : last_linklocal;
+	if (preferred >= 0) {
 		attr = rdma_get_gid_attr(ctx->ib_dev, ctx->port,
-					 last_linklocal);
+					 preferred);
 		if (!IS_ERR(attr)) {
 			ctx->gid = attr->gid;
-			ctx->gid_index = last_linklocal;
+			ctx->gid_index = preferred;
 			found = true;
 			rdma_put_gid_attr(attr);
 		}
