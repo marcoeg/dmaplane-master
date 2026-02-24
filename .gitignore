@@ -61,3 +61,7 @@ tests/test_phase*
 # Compiled example binaries (exclude source files)
 examples/misc/dma_explorer
 examples/misc/dma_sweep
+*.diff
+examples/gpu_rdma/gpu_receiver
+examples/gpu_rdma/gpu_sender
+examples/misc/trace_explorer

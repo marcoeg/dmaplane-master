@@ -1,6 +1,6 @@
 # dmaplane
 
-A Linux kernel module for learning the host-side data path between AI frameworks (PyTorch, NCCL) and hardware (GPUs, NICs, DRAM). dmaplane exposes a character device (`/dev/dmaplane`) controlled via ioctl, implementing the buffer orchestration layer that sits beneath transport libraries — DMA allocation, NUMA-aware placement, RDMA memory registration, dma-buf zero-copy sharing, GPU BAR pinning, and credit-based flow control. The project builds cumulatively across nine phases, each targeting a specific kernel subsystem.
+A Linux kernel module for learning the host-side data path between AI frameworks (PyTorch, NCCL) and hardware (GPUs, NICs, DRAM). dmaplane exposes a character device (`/dev/dmaplane`) controlled via ioctl, implementing the buffer orchestration layer that sits beneath transport libraries — DMA allocation, NUMA-aware placement, RDMA memory registration, dma-buf zero-copy sharing, GPU BAR pinning, credit-based flow control, and disaggregated KVCache transfer. The project builds cumulatively across nine phases, each targeting a specific kernel subsystem.
 
 ## Phase Index
 
@@ -10,11 +10,13 @@ A Linux kernel module for learning the host-side data path between AI frameworks
 | 2 | Complete | DMA memory allocation |
 | 3 | Complete | dma-buf export & zero-copy sharing |
 | 4 | Complete | RDMA engine |
-| 5 | **Current** | NUMA, topology & optimization |
-| 6 | Planned | Backpressure & flow control |
-| 7 | Planned | Instrumentation & latency measurement |
-| 8 | Planned | GPU memory integration |
-| 9 | Planned | Disaggregated inference demo |
+| 5 | Complete | NUMA, topology & optimization |
+| 6 | Complete | Backpressure & flow control |
+| 7 | Complete | Instrumentation & latency measurement |
+| 8 | Complete | GPU memory integration |
+| 9A | Complete | WRITEIMM kernel verbs + KVCache pipeline |
+| 9C | Complete | Two-machine KVCache sender/receiver |
+| 9D | Complete | Disaggregated inference servers |
 
 ## Build & Test
 
@@ -22,29 +24,32 @@ A Linux kernel module for learning the host-side data path between AI frameworks
 # Build the kernel module and test programs
 make
 
-# Load the module
+# Load the module (requires Soft-RoCE for RDMA tests)
+bash scripts/setup_rxe.sh            # configure Soft-RoCE (once)
 sudo insmod driver/dmaplane.ko
 ls -la /dev/dmaplane
 dmesg | tail -5
 
-# Run Phase 1 tests (regression)
+# Run tests (Phases 1-8)
 sudo ./tests/test_phase1_driver
-
-# Run Phase 2 tests
 sudo ./tests/test_phase2_dma
-
-# Run Phase 3 tests
 sudo ./tests/test_phase3_dmabuf
-
-# Run Phase 4 tests (requires Soft-RoCE: bash scripts/setup_rxe.sh)
-sudo ./tests/test_phase4_rdma
-
-# Run Phase 5 tests
+sudo ./tests/test_phase4_rdma         # requires Soft-RoCE
 sudo ./tests/test_phase5_numa
+sudo ./tests/test_phase6_backpressure # requires Soft-RoCE
+sudo ./tests/test_phase7_instrumentation
+sudo ./tests/test_phase8_gpu          # requires NVIDIA GPU
 
-# Run Phase 2 examples
+# Run Phase 9 KVCache tests
+sudo ./examples/kvcache/kvcache_sender --loopback --verify
+python3 examples/kvcache/dmaplane_py.py
+sudo python3 examples/kvcache/test_dmaplane_py.py
+sudo python3 examples/kvcache/test_kvcache_local.py  # requires CUDA + PyTorch
+
+# Run examples
 sudo ./examples/misc/dma_explorer
 sudo ./examples/misc/dma_sweep
+sudo ./examples/misc/trace_explorer   # Phase 7 tracing
 
 # Unload the module
 sudo rmmod dmaplane
@@ -60,42 +65,46 @@ dmaplane-master/
 ├── LICENSE                    # GPL-2.0
 ├── Makefile                   # Top-level: delegates to driver/ and tests/
 ├── driver/                    # Kernel module source (single dmaplane.ko)
-│   ├── dmaplane.h             # Kernel-internal header: structs, constants
-│   ├── dmabuf_rdma.h          # Buffer subsystem API declarations
-│   ├── dmabuf_rdma.c          # Buffer allocation: coherent + page-backed
-│   ├── dmabuf_export.h        # dma-buf exporter API declarations
-│   ├── dmabuf_export.c        # dma-buf export: dma_buf_ops, SG table, selftest
-│   ├── rdma_engine.h          # RDMA engine API declarations
-│   ├── rdma_engine.c          # RDMA setup/teardown, MR registration, post/poll
-│   ├── benchmark.h            # RDMA benchmark API declarations
-│   ├── benchmark.c            # Loopback, ping-pong, streaming benchmarks
-│   ├── numa_topology.h        # NUMA topology API declarations
-│   ├── numa_topology.c        # Topology query, NxN bandwidth benchmark
-│   └── main.c                 # Char device, ioctl dispatch, mmap, module init/exit
-├── include/                   # Userspace-visible headers
+│   ├── dmaplane.h             # Kernel-internal header
+│   ├── dmabuf_rdma.{h,c}      # Buffer allocation: coherent + page-backed
+│   ├── dmabuf_export.{h,c}    # dma-buf export: dma_buf_ops, SG table
+│   ├── rdma_engine.{h,c}      # RDMA setup/teardown, MR, WRITEIMM, peer QP
+│   ├── benchmark.{h,c}        # Loopback, ping-pong, streaming benchmarks
+│   ├── numa_topology.{h,c}    # Topology query, NxN bandwidth benchmark
+│   ├── flow_control.{h,c}     # Credit-based backpressure, sustained streaming
+│   ├── gpu_p2p.{h,c}          # GPU BAR pinning via nvidia_p2p, GPU MR
+│   ├── dmaplane_histogram.{h,c} # Log₂ latency histogram (16 buckets)
+│   ├── dmaplane_debugfs.{h,c} # debugfs counters and stats export
+│   ├── dmaplane_trace.{h,c}   # Tracepoint definitions and event recording
+│   └── main.c                 # Char device, ioctl dispatch, mmap, init/exit
+├── include/
 │   └── dmaplane_uapi.h       # Ioctl numbers, shared structs (kernel ↔ user)
-├── tests/                     # One test per phase
-│   ├── test_phase1_driver.c   # Phase 1: rings, workers, stress test
-│   ├── test_phase2_dma.c      # Phase 2: buffer alloc, mmap, lifecycle
-│   ├── test_phase3_dmabuf.c   # Phase 3: dma-buf export, fd lifecycle, mmap
-│   ├── test_phase4_rdma.c    # Phase 4: RDMA setup, MR, loopback, benchmarks
-│   └── test_phase5_numa.c   # Phase 5: NUMA topology, allocation, benchmark
-├── examples/                  # Progressive demos (populated in later phases)
-│   ├── misc/                  # Standalone demos (Phase 2+)
-│   ├── streamer/              # Weight-streaming TUI (Phase 6)
+├── tests/                     # One C test per phase (1-8)
+│   ├── test_phase1_driver.c   # Rings, workers, stress test
+│   ├── test_phase2_dma.c      # Buffer alloc, mmap, lifecycle
+│   ├── test_phase3_dmabuf.c   # dma-buf export, fd lifecycle
+│   ├── test_phase4_rdma.c     # RDMA setup, MR, loopback, benchmarks
+│   ├── test_phase5_numa.c     # NUMA topology, allocation, benchmark
+│   ├── test_phase6_backpressure.c # Credit exhaustion, sustained streaming
+│   ├── test_phase7_instrumentation.c # Tracepoint, histogram, debugfs
+│   └── test_phase8_gpu.c      # GPU pin/unpin, BAR DMA, GPU MR, loopback
+├── examples/
+│   ├── misc/                  # Standalone demos: dma_explorer, dma_sweep, trace_explorer
+│   ├── gpu_rdma/              # Cross-machine GPU VRAM over RDMA (Phase 8)
+│   ├── kvcache/               # KVCache WRITEIMM pipeline + inference servers (Phase 9)
+│   ├── streamer/              # Weight-streaming TUI (Phase 6, deferred)
 │   ├── netshare/              # Two-machine RDMA (Phase 4+)
-│   └── inference/             # Disaggregated inference (Phase 9)
+│   └── inference/             # → see examples/kvcache/
+├── aws/                       # CloudFormation stacks for EC2 validation
 ├── docs/                      # Blog posts (one per phase)
 │   └── reference/             # Engineering plan, code overview, narrative
-│       ├── MASTER_PLAN.md     # 9-phase engineering plan
-│       ├── CODE_OVERVIEW.md   # Codebase analysis (updated each phase)
-│       └── NARRATIVE_dmaplane_foundation.md  # Project positioning & use cases
-└── scripts/                   # Build and setup automation
+└── scripts/                   # setup_rxe.sh, setup_hugepages.sh
 ```
 
 ## References
 
 - **[Full Engineering Plan](docs/reference/MASTER_PLAN.md)** — 9-phase spec with acceptance criteria and skill KPIs
+- **[Code Overview](docs/reference/CODE_OVERVIEW.md)** — Detailed analysis of every source file, updated each phase
 - **[Project Narrative](docs/reference/NARRATIVE_dmaplane_foundation.md)** — Technical essay on positioning, use cases, and relationship to production systems
 
 ## License
