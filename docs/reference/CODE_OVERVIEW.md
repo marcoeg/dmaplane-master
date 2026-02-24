@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 9A — WRITEIMM KVCache Pipeline
+## Current State: Phase 9C — Two-Machine KVCache Sender/Receiver
 
 ## Licensing
 
@@ -684,3 +684,8 @@ Both sides follow the same cleanup order:
 5. Deregister MR
 6. GPU unpin + cudaFree (sender only, if `--gpu`)
 7. Destroy buffer
+
+#### Test Results
+
+- Loopback regression: all Phase 9A tests **PASS** (unchanged)
+- Peer WRITEIMM 8 chunks (4×2×1MB): 104.0 MB/s, P50=9.5ms, P99=9.8ms, 0 stalls, data integrity **PASS**
