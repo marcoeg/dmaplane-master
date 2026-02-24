@@ -2,7 +2,7 @@
 
 Detailed analysis of every source file in the dmaplane codebase. This document grows with each phase — it describes only what has been implemented so far.
 
-## Current State: Phase 9C — Two-Machine KVCache Sender/Receiver
+## Current State: Phase 9D — Disaggregated Inference Servers
 
 ## Licensing
 
@@ -610,10 +610,12 @@ Key implementation details: `write_imm` uses `struct ib_rdma_wr` (not `ib_send_w
 | `kvcache_common.h` | 853 | Ioctl wrappers (WRITEIMM + peer), TCP helpers, credit tracker, recv helpers, latency stats, bitmap, fill/verify |
 | `kvcache_sender.c` | 1039 | Loopback + peer mode WRITEIMM sender with credit window, GPU path, TCP credit flow |
 | `kvcache_receiver.c` | 526 | Loopback self-test + peer mode receiver with TCP credit flow |
-| `dmaplane_py.py` | 481 | Python struct/fcntl wrapper for all ioctls |
+| `dmaplane_py.py` | 637 | Python struct/fcntl wrapper for all ioctls, peer QP methods, TCP metadata exchange |
 | `test_dmaplane_py.py` | 293 | Python wrapper tests (struct sizes, ioctl round-trips) |
-| `kvcache_inference.py` | 195 | extract/consolidate/reconstruct KVCache helpers |
-| `test_kvcache_local.py` | 472 | End-to-end: TinyLlama prefill → WRITEIMM → decode → verify |
+| `kvcache_inference.py` | 197 | extract/consolidate/reconstruct KVCache helpers |
+| `test_kvcache_local.py` | 475 | End-to-end: TinyLlama prefill → WRITEIMM → decode → verify |
+| `prefill_server.py` | 318 | Disaggregated prefill node: model prefill → consolidate → WRITEIMM to decode node |
+| `decode_server.py` | 325 | Disaggregated decode node: recv WRITEIMM → reconstruct → greedy decode loop |
 | `kvcache_bench.sh` | 84 | Benchmark sweep → CSV |
 | `ec2_setup.sh` | 153 | Automated EC2 setup |
 | `Makefile` | 38 | C build with CUDA detection |
@@ -624,7 +626,7 @@ Key implementation details: `write_imm` uses `struct ib_rdma_wr` (not `ib_send_w
 - WRITEIMM loopback 128 chunks (32×4×1MB): 1201.8 MB/s, 112 credit stalls, data integrity **PASS**
 - WRITEIMM GPU source 128 chunks: 10.3 MB/s (~100ms/chunk BAR reads), data integrity **PASS**
 - WRITEIMM credit-window=2, 8 layers: 1045.2 MB/s, 30 stalls, data integrity **PASS**
-- Python struct validation: 11/11 sizes **OK**, all ioctl numbers match
+- Python struct validation: 13/13 sizes **OK** (11 + peer_info + tcp_metadata), 13 ioctl numbers match
 - Python ioctl round-trips: **7/7 PASSED** (WRITEIMM loopback with imm_data verification)
 - End-to-end disaggregated inference (test_kvcache_local.py): **6/6 PASSED** — KVCache extract+consolidate, as_strided reconstruction, decode token-match, WRITEIMM GPU→host loopback with real KVCache (18.9 MB/s, 135 KB TinyLlama KVCache), GPU alignment+pin, multi-prompt buffer reuse
 
@@ -689,3 +691,79 @@ Both sides follow the same cleanup order:
 
 - Loopback regression: all Phase 9A tests **PASS** (unchanged)
 - Peer WRITEIMM 8 chunks (4×2×1MB): 104.0 MB/s, P50=9.5ms, P99=9.8ms, 0 stalls, data integrity **PASS**
+
+### Phase 9D: Disaggregated Inference Servers
+
+Phase 9D adds two Python servers that perform real LLM inference across two machines: `prefill_server.py` runs the model forward pass and ships the KVCache via dmaplane WRITEIMM, `decode_server.py` receives, reconstructs, and runs autoregressive decoding. No kernel changes.
+
+#### Architecture
+
+```
+Machine A (prefill_server.py)              Machine B (decode_server.py)
+┌────────────────────────┐                ┌────────────────────────┐
+│ 1. Load TinyLlama      │                │ 1. Load TinyLlama      │
+│ 2. SETUP_RDMA          │                │ 2. SETUP_RDMA          │
+│ 3. INIT_PEER           │   TCP meta     │ 3. INIT_PEER           │
+│ 4. TCP listen ─────────│───────────────→│ 4. TCP connect         │
+│ 5. Exchange QP+MR meta │←──────────────→│ 5. Exchange QP+MR meta │
+│ 6. CONNECT_PEER        │                │ 6. CONNECT_PEER        │
+│                        │                │ 7. Pre-post RECVs      │
+│                        │   "ready"      │ 8. Send ready signal   │
+│ 7. Wait for ready ←────│────────────────│                        │
+│                        │                │                        │
+│ === Per prompt loop === │                │ === Per prompt loop === │
+│ 8. Recv prompt (TCP)   │  prompt bytes  │ 8. Send prompt (TCP)   │
+│ 9. Tokenize + prefill  │                │                        │
+│ 10. Extract KVCache    │                │                        │
+│ 11. Consolidate → GPU  │                │                        │
+│ 12. cuda.synchronize() │                │                        │
+│ 13. GPU→CPU→host mmap  │                │                        │
+│ 14. Send manifest JSON │  TCP manifest  │ 9. Recv manifest JSON  │
+│ 15. WRITEIMM chunks    │  RDMA chunks   │ 10. Poll recv CQ       │
+│     (use_peer_qp=1)    │═══════════════→│     Send TCP credits   │
+│ 16. Send sentinel      │  RDMA sentinel │ 11. Detect sentinel    │
+│ 17. Wait for "done"  ←─│────────────────│ 12. Send "done" ack    │
+│                        │                │ 13. Reconstruct KVCache│
+│                        │                │ 14. Greedy decode loop │
+│                        │                │ 15. Stream tokens      │
+└────────────────────────┘                └────────────────────────┘
+```
+
+#### Data Path
+
+**Prefill side**: GPU prefill → `extract_kvcache()` (GPU tensors) → `consolidate_kvcache(layers, gpu_staging)` (GPU copy_) → `torch.cuda.synchronize()` (mandatory fence) → `.cpu().numpy().tobytes()` (GPU→CPU) → `host_mmap[:] = cpu_bytes` (into dmaplane buffer) → WRITEIMM from host MR.
+
+**Decode side**: poll WRITEIMM completions → mmap → `bytearray(host_mmap[:total_bytes])` → `torch.frombuffer().cuda()` → `reconstruct_kvcache_zero_copy()` (as_strided views) → `model.forward(past_key_values=reconstructed)` → greedy argmax.
+
+#### Changes to `dmaplane_py.py` (481 → 637 lines)
+
+| Addition | Description |
+|----------|-------------|
+| `FMT_PEER_INFO` | `=IHH16s6s2sII` — 40-byte struct matching `dmaplane_rdma_peer_info` |
+| `IOCTL_RDMA_INIT_PEER` | `_IOR(0xE4, 0x90, 40)` — create qp_peer + cq_peer |
+| `IOCTL_RDMA_CONNECT_PEER` | `_IOW(0xE4, 0x91, 40)` — INIT→RTR→RTS |
+| `IOCTL_RDMA_DESTROY_PEER` | `_IO(0xE4, 0x94)` — destroy qp_peer + cq_peer |
+| `init_peer()` | Returns local QPN, LID, GID, MAC for TCP exchange |
+| `connect_peer()` | Transitions qp_peer using remote metadata |
+| `destroy_peer()` | Destroys peer QP and CQ |
+| `TCP_METADATA_FMT` | `=16s6sHI4xQIIIIIIQ` — 72-byte struct matching C `struct tcp_metadata` with explicit 4-byte padding for x86_64 alignment |
+| `tcp_send_all()` / `tcp_recv_all()` | Reliable TCP I/O with partial write/read handling |
+| `tcp_pack_metadata()` / `tcp_unpack_metadata()` | Serialize/deserialize tcp_metadata |
+| `tcp_send_metadata()` / `tcp_recv_metadata()` | Pack+send / recv+unpack in one call |
+| `tcp_send_json()` / `tcp_recv_json()` | Length-prefixed JSON exchange for manifest |
+
+#### TCP Protocol (Python servers)
+
+Same binary `tcp_metadata` as C peer mode for interop, plus JSON manifest for Python-specific data:
+
+1. **Binary tcp_metadata** (72 bytes): QP info + MR targeting + config. Sender sends first.
+2. **Ready signal** (1 byte): Decode server → prefill server after pre-posting recvs.
+3. **Per-prompt**: Prompt bytes (4-byte length prefix) → JSON manifest (4-byte length prefix + `{"manifest": [...], "first_token_id": N, "total_bytes": N, "num_chunks": N}`) → WRITEIMM chunks with TCP credit flow → sentinel → "done" ack.
+
+#### Recv WR Lifecycle
+
+Initial: `credit_window + 1` recvs posted. Each data chunk: consume 1 recv, replenish 1, send 1 TCP credit. Sentinel: consume 1 recv, replenish 1 (after "done" ack, before next prompt). This ensures each prompt starts with `credit_window + 1` posted recvs.
+
+#### Cleanup Ordering
+
+Both servers follow: close TCP → `destroy_peer()` → munmap → `deregister_mr()` → `destroy_buffer()` → `teardown_rdma()` → close fd.

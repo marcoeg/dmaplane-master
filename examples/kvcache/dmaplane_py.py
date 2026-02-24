@@ -18,12 +18,15 @@ Struct sizes verified against dmaplane_uapi.h:
   write_imm_params: 48 bytes  =IIQQIIIIQ
   post_recv_params: 16 bytes  =IIII
   poll_recv_params: 32 bytes  =IIIIIIQ
+  peer_info:        40 bytes  =IHH16s6s2sII
 """
 
 import os
 import struct
 import fcntl
 import mmap
+import socket
+import json
 import gc
 
 # ── ioctl encoding (matches <linux/ioctl.h>) ──────────────────────────────
@@ -106,6 +109,10 @@ SZ_POLL_RECV = struct.calcsize(FMT_POLL_RECV)
 FMT_REMOTE_OP = "=IIQIIII"
 SZ_REMOTE_OP = struct.calcsize(FMT_REMOTE_OP)
 
+# struct dmaplane_rdma_peer_info { u32, u16, u16, u8[16], u8[6], u8[2], u32, u32 } = 40
+FMT_PEER_INFO = "=IHH16s6s2sII"
+SZ_PEER_INFO = struct.calcsize(FMT_PEER_INFO)
+
 # ── ioctl command numbers ─────────────────────────────────────────────────
 
 IOCTL_CREATE_BUFFER     = _IOWR(DMAPLANE_MAGIC, 0x05, SZ_BUF_PARAMS)
@@ -121,6 +128,10 @@ IOCTL_DEREGISTER_MR     = _IOW (DMAPLANE_MAGIC, 0x21, 4)
 IOCTL_GPU_PIN           = _IOWR(DMAPLANE_MAGIC, 0x60, SZ_GPU_PIN)
 IOCTL_GPU_UNPIN         = _IOW (DMAPLANE_MAGIC, 0x61, SZ_GPU_UNPIN)
 IOCTL_GPU_REGISTER_MR   = _IOWR(DMAPLANE_MAGIC, 0x65, SZ_GPU_MR)
+
+IOCTL_RDMA_INIT_PEER    = _IOR (DMAPLANE_MAGIC, 0x90, SZ_PEER_INFO)
+IOCTL_RDMA_CONNECT_PEER = _IOW (DMAPLANE_MAGIC, 0x91, SZ_PEER_INFO)
+IOCTL_RDMA_DESTROY_PEER = _IO  (DMAPLANE_MAGIC, 0x94)
 
 IOCTL_RDMA_WRITE_IMM    = _IOWR(DMAPLANE_MAGIC, 0x80, SZ_WRITE_IMM)
 IOCTL_RDMA_POST_RECV    = _IOWR(DMAPLANE_MAGIC, 0x81, SZ_POST_RECV)
@@ -394,6 +405,146 @@ class DmaplaneClient:
             "elapsed_ns": fields[6],
         }
 
+    # ── Peer RDMA (cross-machine QP) ─────────────────────────────────
+
+    def init_peer(self):
+        """Initialize peer QP. Returns local metadata for TCP exchange.
+
+        Creates qp_peer + cq_peer and returns this machine's QPN, LID,
+        GID, and MAC.  Send these to the remote side via TCP, then call
+        connect_peer() with the remote side's metadata.
+        """
+        buf = bytearray(SZ_PEER_INFO)
+        self._ioctl("INIT_PEER", IOCTL_RDMA_INIT_PEER, buf)
+        fields = struct.unpack(FMT_PEER_INFO, buf)
+        return {
+            "qp_num": fields[0],
+            "lid": fields[1],
+            "gid": fields[3],     # 16-byte raw GID
+            "mac": fields[4],     # 6-byte raw MAC
+        }
+
+    def connect_peer(self, qp_num, lid, gid, mac):
+        """Connect peer QP using remote metadata from TCP exchange.
+
+        Transitions qp_peer through INIT→RTR→RTS using the remote
+        side's QPN, LID, GID, and MAC from init_peer().
+        """
+        buf = bytearray(struct.pack(FMT_PEER_INFO,
+                                    qp_num, lid, 0,  # _pad1
+                                    gid, mac, b'\x00\x00',  # _pad2
+                                    0, 0))  # status, _pad3
+        self._ioctl("CONNECT_PEER", IOCTL_RDMA_CONNECT_PEER, buf)
+
+    def destroy_peer(self):
+        """Destroy peer QP and CQ."""
+        fcntl.ioctl(self.fd, IOCTL_RDMA_DESTROY_PEER, 0)
+
+
+# ── TCP metadata exchange (matches C struct tcp_metadata) ─────────────────
+#
+# Binary format for QP/MR/config exchange between Python servers and C
+# binaries.  The 4x padding after qpn (u32) matches the natural alignment
+# hole before mr_addr (u64) in the C struct on x86_64.
+#
+# struct tcp_metadata {
+#     uint8_t  gid[16];           offset  0
+#     uint8_t  mac[6];            offset 16
+#     uint16_t lid;               offset 22
+#     uint32_t qpn;               offset 24
+#     /* 4 bytes implicit pad */  offset 28
+#     uint64_t mr_addr;           offset 32
+#     uint32_t mr_rkey;           offset 40
+#     uint32_t num_layers;        offset 44
+#     uint32_t chunks_per_layer;  offset 48
+#     uint32_t chunk_size;        offset 52
+#     uint32_t credit_window;     offset 56
+#     uint32_t _pad;              offset 60
+#     uint64_t buf_size;          offset 64
+# };  /* total: 72 bytes */
+
+TCP_METADATA_FMT = "=16s6sHI4xQIIIIIIQ"
+TCP_METADATA_SZ = struct.calcsize(TCP_METADATA_FMT)  # 72
+
+
+def tcp_send_all(sock, data):
+    """Send all bytes, handling partial writes."""
+    mv = memoryview(data)
+    total = 0
+    while total < len(data):
+        sent = sock.send(mv[total:])
+        if sent == 0:
+            raise ConnectionError("TCP connection closed")
+        total += sent
+
+
+def tcp_recv_all(sock, nbytes):
+    """Receive exactly nbytes, handling partial reads."""
+    chunks = []
+    received = 0
+    while received < nbytes:
+        chunk = sock.recv(nbytes - received)
+        if not chunk:
+            raise ConnectionError("TCP connection closed")
+        chunks.append(chunk)
+        received += len(chunk)
+    return b''.join(chunks)
+
+
+def tcp_pack_metadata(gid, mac, lid, qpn, mr_addr, mr_rkey,
+                      num_layers, chunks_per_layer, chunk_size,
+                      credit_window, buf_size):
+    """Pack tcp_metadata struct for wire transmission."""
+    return struct.pack(TCP_METADATA_FMT,
+                       gid, mac, lid, qpn, mr_addr, mr_rkey,
+                       num_layers, chunks_per_layer, chunk_size,
+                       credit_window, 0, buf_size)
+
+
+def tcp_unpack_metadata(data):
+    """Unpack tcp_metadata struct from wire bytes."""
+    fields = struct.unpack(TCP_METADATA_FMT, data)
+    return {
+        "gid": fields[0],
+        "mac": fields[1],
+        "lid": fields[2],
+        "qpn": fields[3],
+        "mr_addr": fields[4],
+        "mr_rkey": fields[5],
+        "num_layers": fields[6],
+        "chunks_per_layer": fields[7],
+        "chunk_size": fields[8],
+        "credit_window": fields[9],
+        "buf_size": fields[11],
+    }
+
+
+def tcp_send_metadata(sock, **kwargs):
+    """Pack and send tcp_metadata over TCP."""
+    data = tcp_pack_metadata(**kwargs)
+    tcp_send_all(sock, data)
+
+
+def tcp_recv_metadata(sock):
+    """Receive and unpack tcp_metadata from TCP."""
+    data = tcp_recv_all(sock, TCP_METADATA_SZ)
+    return tcp_unpack_metadata(data)
+
+
+def tcp_send_json(sock, obj):
+    """Send a JSON object with 4-byte big-endian length prefix."""
+    payload = json.dumps(obj).encode('utf-8')
+    tcp_send_all(sock, struct.pack('!I', len(payload)))
+    tcp_send_all(sock, payload)
+
+
+def tcp_recv_json(sock):
+    """Receive a JSON object with 4-byte big-endian length prefix."""
+    hdr = tcp_recv_all(sock, 4)
+    length = struct.unpack('!I', hdr)[0]
+    payload = tcp_recv_all(sock, length)
+    return json.loads(payload.decode('utf-8'))
+
 
 # ── GPU tensor alignment helper (for PyTorch) ────────────────────────────
 
@@ -454,6 +605,8 @@ if __name__ == "__main__":
         "post_recv_params": (FMT_POST_RECV, 16),
         "poll_recv_params": (FMT_POLL_RECV, 32),
         "remote_op_params": (FMT_REMOTE_OP, 32),
+        "peer_info": (FMT_PEER_INFO, 40),
+        "tcp_metadata": (TCP_METADATA_FMT, 72),
     }
     all_ok = True
     for name, (fmt, exp_sz) in expected.items():
@@ -474,6 +627,9 @@ if __name__ == "__main__":
         ("TEARDOWN_RDMA", IOCTL_TEARDOWN_RDMA),
         ("REGISTER_MR", IOCTL_REGISTER_MR),
         ("DEREGISTER_MR", IOCTL_DEREGISTER_MR),
+        ("INIT_PEER", IOCTL_RDMA_INIT_PEER),
+        ("CONNECT_PEER", IOCTL_RDMA_CONNECT_PEER),
+        ("DESTROY_PEER", IOCTL_RDMA_DESTROY_PEER),
         ("WRITE_IMM", IOCTL_RDMA_WRITE_IMM),
         ("POST_RECV", IOCTL_RDMA_POST_RECV),
         ("POLL_RECV", IOCTL_RDMA_POLL_RECV),

@@ -50,6 +50,13 @@ sudo pip install torch transformers accelerate
 - TinyLlama-1.1B-Chat model (auto-downloaded on first run, ~2 GB)
 - `dmaplane.ko` loaded + Soft-RoCE configured
 
+### Disaggregated inference servers (prefill_server.py, decode_server.py)
+
+Same as end-to-end test above, plus:
+- Both machines need `dmaplane.ko` loaded + Soft-RoCE configured
+- Both machines need the same model weights (TinyLlama auto-downloads)
+- TCP connectivity between machines on port 9876 (or `--port`)
+
 ## Setup
 
 ### 1. Load dmaplane and configure Soft-RoCE
@@ -86,10 +93,12 @@ Builds `kvcache_sender` (with CUDA if available) and `kvcache_receiver`.
 | `kvcache_common.h` | 853 | Shared C header: ioctl wrappers (WRITEIMM + peer), TCP helpers, credit tracker, recv helpers, latency stats, bitmap, fill/verify |
 | `kvcache_sender.c` | 1039 | Loopback + peer mode WRITEIMM sender with credit window, GPU path, TCP credit flow |
 | `kvcache_receiver.c` | 526 | Loopback self-test + peer mode receiver with TCP metadata exchange and credit flow |
-| `dmaplane_py.py` | 481 | Python `struct`/`fcntl` wrapper for all dmaplane ioctls |
+| `dmaplane_py.py` | 637 | Python `struct`/`fcntl` wrapper for all dmaplane ioctls, peer QP methods, TCP metadata exchange |
 | `test_dmaplane_py.py` | 293 | Python wrapper tests: struct sizes, ioctl round-trips, GPU pin |
-| `kvcache_inference.py` | 195 | `extract_kvcache`, `consolidate_kvcache`, `reconstruct_kvcache_zero_copy` |
-| `test_kvcache_local.py` | 472 | End-to-end test: TinyLlama prefill → WRITEIMM → reconstruct → decode |
+| `kvcache_inference.py` | 197 | `extract_kvcache`, `consolidate_kvcache`, `reconstruct_kvcache_zero_copy` |
+| `test_kvcache_local.py` | 475 | End-to-end test: TinyLlama prefill → WRITEIMM → reconstruct → decode |
+| `prefill_server.py` | 318 | Disaggregated prefill node: model prefill → WRITEIMM send |
+| `decode_server.py` | 325 | Disaggregated decode node: WRITEIMM recv → reconstruct → decode |
 | `kvcache_bench.sh` | 84 | Benchmark sweep: chunk_size x credit_window x layers → CSV |
 | `ec2_setup.sh` | 153 | EC2 g5.xlarge setup: deps, rxe, build, model download, smoke test |
 | `Makefile` | 38 | C build with CUDA detection |
@@ -141,7 +150,8 @@ sudo ./examples/kvcache/kvcache_sender --loopback --credit-window 2 --layers 8 -
 
 ```bash
 python3 examples/kvcache/dmaplane_py.py
-# Expected: all 11 struct sizes match, all ioctl numbers printed
+# Expected: all 13 struct sizes match (11 + peer_info + tcp_metadata),
+#           all 13 ioctl numbers printed
 ```
 
 ### Step 7: Python ioctl round-trip tests
@@ -233,6 +243,30 @@ sudo ./kvcache_sender --peer <machine-B-ip> --port 9876 --verify
 # Expected: cross-machine RDMA WRITEIMM transfer, data integrity PASS
 ```
 
+### Step 15: Disaggregated inference — local (two terminals, same machine)
+
+```bash
+# Terminal 1 (prefill):
+sudo python3 examples/kvcache/prefill_server.py --port 9876
+
+# Terminal 2 (decode):
+sudo python3 examples/kvcache/decode_server.py --peer 127.0.0.1 --port 9876
+# Expected: 3 prompts processed, coherent text generated for each,
+#           pipeline summary with transfer time, reconstruction time, tok/s
+```
+
+### Step 16: Disaggregated inference — two machines (EC2 or real hardware)
+
+```bash
+# Machine A (prefill, start first):
+sudo python3 prefill_server.py --port 9876
+
+# Machine B (decode):
+sudo python3 decode_server.py --peer <machine-A-ip> --port 9876
+# Expected: TinyLlama disaggregated inference across machines,
+#           tokens match single-machine model.generate() (greedy deterministic)
+```
+
 ## Expected Performance (rxe loopback)
 
 | Chunk Size | Peak Throughput | Avg Latency | P50 | P99 |
@@ -273,6 +307,26 @@ GPU source path: ~10 MB/s (117x slower than host). Each 1 MB chunk requires rxe 
 --verify              Verify data integrity after transfer
 ```
 
+## Prefill server CLI reference
+
+```
+--port <port>         TCP listen port (default: 9876)
+--model <name>        HuggingFace model (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+--chunk-size N        Bytes per WRITEIMM chunk (default: 1048576)
+--credit-window N     Max in-flight WRITEIMMs (default: 16)
+```
+
+## Decode server CLI reference
+
+```
+--peer <ip>           Prefill server IP (required)
+--port <port>         TCP port (default: 9876)
+--model <name>        HuggingFace model (default: TinyLlama/TinyLlama-1.1B-Chat-v1.0)
+--max-tokens N        Max tokens to generate per prompt (default: 100)
+--credit-window N     Max in-flight WRITEIMMs (default: 16)
+--prompts-file <path> File with one prompt per line (default: 3 built-in prompts)
+```
+
 ## Architecture notes
 
 - **No libibverbs** — all RDMA ops go through kernel ioctls, not userspace verbs
@@ -285,3 +339,7 @@ GPU source path: ~10 MB/s (117x slower than host). Each 1 MB chunk requires rxe 
 - **Zero-copy reconstruct** — `torch.as_strided` views into the RDMA landing buffer, no memcpy
 - **IMM encoding** — `KVCACHE_IMM_ENCODE(layer, chunk)` packs into 32-bit immediate (upper 16 = layer, lower 16 = chunk), `KVCACHE_SENTINEL = 0xFFFFFFFF` signals end-of-transfer
 - **Byte order** — `cpu_to_be32(imm_data)` on send, `be32_to_cpu(wc.ex.imm_data)` on recv per IB spec
+- **Host-backed RDMA** — Python servers use host buffers (not GPU-pinned MR). Data path: GPU prefill → consolidate to GPU staging → `cuda.synchronize()` → CPU copy → dmaplane host buffer → WRITEIMM. GPU-pinned RDMA is ~117x slower via rxe BAR reads.
+- **JSON manifest** — per-prompt KVCache metadata (layer offsets, shapes, dtype, first_token) sent as length-prefixed JSON over TCP, on top of the binary `tcp_metadata` exchange
+- **cuda.synchronize() fence** — mandatory between `consolidate_kvcache()` (GPU HBM→HBM async copy) and CPU read of GPU staging buffer. Without it, WRITEIMM reads stale BAR data.
+- **Recv WR sentinel replenish** — after each transfer, the sentinel's consumed recv WR is replenished before the next prompt to prevent progressive recv WR depletion across multi-prompt sessions
