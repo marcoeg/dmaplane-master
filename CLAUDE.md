@@ -6,7 +6,7 @@ dmaplane is a Linux kernel module for learning the host-side data path between A
 
 ## Current Phase
 
-Phase 9A — WRITEIMM KVCache Pipeline — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the full phase spec.
+Phase 9D — EC2 deployment — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the full phase spec.
 
 ## Key References
 
@@ -122,7 +122,8 @@ dmaplane-master/
 | 6 | **COMPLETE** | Backpressure & flow control |
 | 7 | **COMPLETE** | Instrumentation & microarchitectural awareness |
 | 8 | **COMPLETE** | GPU memory integration |
-| 9A | **CURRENT** | WRITEIMM kernel verbs + KVCache pipeline |
-| 9B-D | Planned | Cross-machine KVCache, EC2 deployment |
+| 9A | **COMPLETE** | WRITEIMM kernel verbs + KVCache pipeline |
+| 9C | **COMPLETE** | Two-machine KVCache sender/receiver |
+| 9D | **CURRENT** | EC2 deployment |
 
 Update the "Status" column and "Current Phase" section as phases are completed.
