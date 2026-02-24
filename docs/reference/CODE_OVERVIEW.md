@@ -601,15 +601,15 @@ Key implementation details: `write_imm` uses `struct ib_rdma_wr` (not `ib_send_w
 
 #### IB Access Constants and Short Aliases
 
-`DMAPLANE_IB_ACCESS_LOCAL_WRITE` (1), `DMAPLANE_IB_ACCESS_REMOTE_WRITE` (2), `DMAPLANE_IB_ACCESS_REMOTE_READ` (4). 15 short aliases inside `#ifndef __KERNEL__` (`IOCTL_CREATE_BUFFER` → `DMAPLANE_IOCTL_CREATE_BUFFER`, `BUF_TYPE_PAGES` → `DMAPLANE_BUF_TYPE_PAGES`, etc.).
+`DMAPLANE_IB_ACCESS_LOCAL_WRITE` (1), `DMAPLANE_IB_ACCESS_REMOTE_WRITE` (2), `DMAPLANE_IB_ACCESS_REMOTE_READ` (4). 18 short aliases inside `#ifndef __KERNEL__` (`IOCTL_CREATE_BUFFER` → `DMAPLANE_IOCTL_CREATE_BUFFER`, `BUF_TYPE_PAGES` → `DMAPLANE_BUF_TYPE_PAGES`, etc.), including `IOCTL_RDMA_INIT_PEER`, `IOCTL_RDMA_CONNECT_PEER`, `IOCTL_RDMA_DESTROY_PEER` (added in Phase 9C).
 
 #### `examples/kvcache/` File Inventory
 
 | File | Lines | Description |
 |------|------:|-------------|
-| `kvcache_common.h` | 585 | Ioctl wrappers, timing, credit tracker, recv helpers, latency stats, bitmap |
-| `kvcache_sender.c` | 662 | Loopback WRITEIMM sender with credit window, GPU path, verify |
-| `kvcache_receiver.c` | 357 | Loopback self-test + peer mode stub |
+| `kvcache_common.h` | 853 | Ioctl wrappers (WRITEIMM + peer), TCP helpers, credit tracker, recv helpers, latency stats, bitmap, fill/verify |
+| `kvcache_sender.c` | 1039 | Loopback + peer mode WRITEIMM sender with credit window, GPU path, TCP credit flow |
+| `kvcache_receiver.c` | 526 | Loopback self-test + peer mode receiver with TCP credit flow |
 | `dmaplane_py.py` | 481 | Python struct/fcntl wrapper for all ioctls |
 | `test_dmaplane_py.py` | 293 | Python wrapper tests (struct sizes, ioctl round-trips) |
 | `kvcache_inference.py` | 195 | extract/consolidate/reconstruct KVCache helpers |
@@ -627,3 +627,60 @@ Key implementation details: `write_imm` uses `struct ib_rdma_wr` (not `ib_send_w
 - Python struct validation: 11/11 sizes **OK**, all ioctl numbers match
 - Python ioctl round-trips: **7/7 PASSED** (WRITEIMM loopback with imm_data verification)
 - End-to-end disaggregated inference (test_kvcache_local.py): **6/6 PASSED** — KVCache extract+consolidate, as_strided reconstruction, decode token-match, WRITEIMM GPU→host loopback with real KVCache (18.9 MB/s, 135 KB TinyLlama KVCache), GPU alignment+pin, multi-prompt buffer reuse
+
+### Phase 9C: Two-Machine KVCache Sender/Receiver
+
+Phase 9C connects the WRITEIMM pipeline (Phase 9A) with the peer RDMA ioctls (Phase 8) so `kvcache_sender` and `kvcache_receiver` can run on separate machines. No kernel changes — all peer RDMA ioctls (`INIT_PEER` 0x90, `CONNECT_PEER` 0x91, `DESTROY_PEER` 0x94) already exist from Phase 8.
+
+#### Architecture
+
+```
+Machine A (Sender)                              Machine B (Receiver)
+┌──────────────────┐    TCP metadata       ┌──────────────────┐
+│ source MR        │ ←──────────────────── │ dest MR          │
+│ (host or GPU)    │    (QP+MR+config)     │ (LOCAL_WRITE |   │
+│                  │                       │  REMOTE_WRITE)   │
+│ qp_peer ─────────│── RDMA WRITE_IMM ───→ │ qp_peer          │
+│ cq_peer          │    (use_peer_qp=1)    │ cq_peer          │
+│ (send completions)│                       │ (recv completions)│
+│                  │ ←── TCP credits ───── │                  │
+└──────────────────┘                       └──────────────────┘
+```
+
+Each machine has its own independent `qp_peer + cq_peer`. The sender's `cq_peer` only sees send completions; the receiver's only sees recv completions.
+
+#### TCP Protocol
+
+1. **Metadata exchange**: Both sides call `INIT_PEER`, then exchange `struct tcp_metadata` over TCP — combines QP connection info (GID, QPN, MAC) with MR targeting info (addr, rkey) and transfer config (layers, chunks, chunk_size, credit_window).
+2. **Ready signal**: After `CONNECT_PEER` + pre-posting recvs, receiver sends 1-byte "ready" signal. Sender waits for this before starting the WRITEIMM loop.
+3. **Credit flow**: Receiver sends 1-byte TCP messages after each recv completion + replenish. Sender blocks on TCP read when credits hit 0.
+4. **Completion**: Sender sends `KVCACHE_SENTINEL`. Receiver detects it, sends 1-byte "done" ack.
+
+#### New Userspace Functions (`kvcache_common.h`)
+
+| Function | Description |
+|----------|-------------|
+| `dmaplane_init_peer()` | Wrapper for `IOCTL_RDMA_INIT_PEER` — creates qp_peer + cq_peer |
+| `dmaplane_connect_peer()` | Wrapper for `IOCTL_RDMA_CONNECT_PEER` — INIT→RTR→RTS |
+| `dmaplane_destroy_peer()` | Wrapper for `IOCTL_RDMA_DESTROY_PEER` — destroys qp_peer + cq_peer |
+| `tcp_connect()` | Sender-side TCP socket creation |
+| `tcp_listen_accept()` | Receiver-side TCP socket creation (closes listener after accept) |
+| `tcp_send_all()` / `tcp_recv_all()` | Reliable TCP I/O handling partial writes/reads |
+| `tcp_send_metadata()` / `tcp_recv_metadata()` | Serialize/deserialize `struct tcp_metadata` |
+| `tcp_metadata_from_peer_info()` | Fill metadata from `INIT_PEER` output |
+| `tcp_metadata_to_peer_info()` | Build `dmaplane_rdma_peer_info` from received metadata for `CONNECT_PEER` |
+| `tcp_send_credit()` | Send 1-byte credit (receiver → sender) |
+| `tcp_recv_credits_nonblock()` | Non-blocking credit drain (MSG_DONTWAIT) |
+| `tcp_recv_credits_blocking()` | Block for 1 credit, then drain extras non-blocking |
+| `fill_pattern()` / `verify_pattern()` | Moved from sender to shared header for receiver verification |
+
+#### Cleanup Ordering
+
+Both sides follow the same cleanup order:
+1. Close TCP (stops credit flow)
+2. Drain recv CQ (prevents QP teardown failures from pending WRs)
+3. `DESTROY_PEER` (moves qp_peer to ERR, drains WRs)
+4. `TEARDOWN_RDMA` (destroys loopback QPs, CQs, PD)
+5. Deregister MR
+6. GPU unpin + cudaFree (sender only, if `--gpu`)
+7. Destroy buffer

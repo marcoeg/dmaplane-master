@@ -18,7 +18,7 @@ Prefill GPU                                  Decode GPU
 
 The 32-bit immediate value encodes `(layer_index, chunk_index)` so the receiver knows which KVCache chunk arrived via CQ completion — no memory polling needed. A credit window provides backpressure.
 
-In loopback mode, the sender owns both MRs on the same machine (QP-A sends, QP-B receives). Two-machine peer mode is structurally stubbed for EC2 deployment.
+In loopback mode, the sender owns both MRs on the same machine (QP-A sends, QP-B receives). In peer mode (`--peer <ip>`), sender and receiver run on separate machines, connected via TCP for metadata exchange and credit flow, with RDMA WRITEIMM for data transfer via the kernel's peer QP.
 
 ## Dependencies
 
@@ -83,9 +83,9 @@ Builds `kvcache_sender` (with CUDA if available) and `kvcache_receiver`.
 
 | File | Lines | Description |
 |------|------:|-------------|
-| `kvcache_common.h` | 585 | Shared C header: ioctl wrappers, timing, credit tracker, recv loop helpers, latency stats, layer bitmap |
-| `kvcache_sender.c` | 662 | Loopback WRITEIMM sender with credit window, GPU source path, data verification |
-| `kvcache_receiver.c` | 357 | Loopback self-test + peer mode stub with recv loop skeleton |
+| `kvcache_common.h` | 853 | Shared C header: ioctl wrappers (WRITEIMM + peer), TCP helpers, credit tracker, recv helpers, latency stats, bitmap, fill/verify |
+| `kvcache_sender.c` | 1039 | Loopback + peer mode WRITEIMM sender with credit window, GPU path, TCP credit flow |
+| `kvcache_receiver.c` | 526 | Loopback self-test + peer mode receiver with TCP metadata exchange and credit flow |
 | `dmaplane_py.py` | 481 | Python `struct`/`fcntl` wrapper for all dmaplane ioctls |
 | `test_dmaplane_py.py` | 293 | Python wrapper tests: struct sizes, ioctl round-trips, GPU pin |
 | `kvcache_inference.py` | 195 | `extract_kvcache`, `consolidate_kvcache`, `reconstruct_kvcache_zero_copy` |
@@ -175,6 +175,64 @@ sudo bash examples/kvcache/kvcache_bench.sh
 #           Results written to bench_results.csv
 ```
 
+### Step 10: Peer mode — local TCP (two terminals, same machine)
+
+```bash
+# Terminal 1 (receiver):
+sudo ./examples/kvcache/kvcache_receiver --port 9876 --verify
+
+# Terminal 2 (sender):
+sudo ./examples/kvcache/kvcache_sender --peer 127.0.0.1 --port 9876 \
+    --layers 4 --chunks-per-layer 2 --verify
+# Expected: receiver creates buffer from sender config, 8 chunks transferred
+#           via peer QP, TCP credit flow, data integrity PASS on both sides
+```
+
+### Step 11: Peer mode — full 128-chunk transfer
+
+```bash
+# Terminal 1:
+sudo ./examples/kvcache/kvcache_receiver --port 9876 --verify
+
+# Terminal 2:
+sudo ./examples/kvcache/kvcache_sender --peer 127.0.0.1 --port 9876 --verify
+# Expected: 32 layers x 4 chunks = 128 chunks, 128 MB, data integrity PASS
+```
+
+### Step 12: Peer mode — credit pressure
+
+```bash
+# Terminal 1:
+sudo ./examples/kvcache/kvcache_receiver --port 9876 --verify
+
+# Terminal 2:
+sudo ./examples/kvcache/kvcache_sender --peer 127.0.0.1 --port 9876 \
+    --credit-window 2 --layers 8 --verify
+# Expected: credit stalls, lower throughput, data correct
+```
+
+### Step 13: Peer mode — GPU source (requires CUDA)
+
+```bash
+# Terminal 1:
+sudo ./examples/kvcache/kvcache_receiver --port 9876 --verify
+
+# Terminal 2:
+sudo ./examples/kvcache/kvcache_sender --peer 127.0.0.1 --port 9876 --gpu --verify
+# Expected: GPU MR as source, same peer transfer pattern, data verified
+```
+
+### Step 14: Peer mode — two machines (EC2 or real hardware)
+
+```bash
+# Machine B (receiver, start first):
+sudo ./kvcache_receiver --port 9876 --verify
+
+# Machine A (sender):
+sudo ./kvcache_sender --peer <machine-B-ip> --port 9876 --verify
+# Expected: cross-machine RDMA WRITEIMM transfer, data integrity PASS
+```
+
 ## Expected Performance (rxe loopback)
 
 | Chunk Size | Peak Throughput | Avg Latency | P50 | P99 |
@@ -192,7 +250,8 @@ GPU source path: ~10 MB/s (117x slower than host). Each 1 MB chunk requires rxe 
 
 ```
 --loopback            Self-contained loopback test (default)
---peer <ip:port>      Connect to remote receiver (stubbed)
+--peer <ip>           Connect to remote kvcache_receiver
+--port <port>         TCP port (default: 9876)
 --gpu                 GPU-backed source MR via IOCTL_GPU_PIN
 --ib-dev <name>       IB device (auto-detects rxe_* if omitted)
 --layers N            Simulated KVCache layers (default: 32)
@@ -204,11 +263,24 @@ GPU source path: ~10 MB/s (117x slower than host). Each 1 MB chunk requires rxe 
 --csv                 Single-line CSV: total_mb,throughput,avg,p50,p99
 ```
 
+## Receiver CLI reference
+
+```
+--loopback            Minimal loopback self-test (default)
+--port <port>         Listen for remote sender (default: 9876)
+--gpu                 Use GPU-backed receive MR (requires CUDA)
+--ib-dev <name>       IB device (auto-detects rxe_* if omitted)
+--verify              Verify data integrity after transfer
+```
+
 ## Architecture notes
 
 - **No libibverbs** — all RDMA ops go through kernel ioctls, not userspace verbs
 - **Fast-reg MR** — destination MR uses `ib_alloc_mr` + `IB_WR_REG_MR` for valid rkey
 - **Credit window** — sender tracks pre-posted recvs; stalls and drains when credits hit 0
+- **TCP credit flow** — in peer mode, receiver sends 1-byte TCP messages after each recv completion; sender blocks on TCP read when credits hit 0 (no direct access to receiver's CQ)
+- **TCP metadata exchange** — `struct tcp_metadata` bundles QP connection info (GID, QPN, MAC), MR targeting info (addr, rkey), and transfer config (layers, chunks, chunk_size, credit_window)
+- **Peer QP routing** — `use_peer_qp=1` routes WRITEIMM to `qp_peer/cq_peer` (cross-machine); `use_peer_qp=0` routes to `qp_a/qp_b` (loopback)
 - **64KB alignment** — GPU tensors are over-allocated and sliced for NVIDIA P2P API compatibility
 - **Zero-copy reconstruct** — `torch.as_strided` views into the RDMA landing buffer, no memcpy
 - **IMM encoding** — `KVCACHE_IMM_ENCODE(layer, chunk)` packs into 32-bit immediate (upper 16 = layer, lower 16 = chunk), `KVCACHE_SENTINEL = 0xFFFFFFFF` signals end-of-transfer
