@@ -24,6 +24,10 @@
 #include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <poll.h>
 
 #include "dmaplane_uapi.h"
 #include "kvcache_proto.h"
@@ -322,6 +326,246 @@ static inline void dmaplane_drain_recv_cq(int fd, int use_peer_qp)
 	}
 }
 
+/* ──────────────────────────────────────────────────────────────────────────
+ *  Peer RDMA wrappers — INIT_PEER, CONNECT_PEER, DESTROY_PEER
+ *
+ *  These create/connect/destroy the cross-machine peer QP (qp_peer +
+ *  cq_peer). Used by kvcache_sender and kvcache_receiver in --peer mode.
+ *  The underlying kernel ioctls were added in Phase 8.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * dmaplane_init_peer — create qp_peer + cq_peer, return local QP metadata.
+ * Must be called after dmaplane_setup_rdma() (needs PD + GID).
+ * Fills info with: qp_num, lid, gid[16], mac[6] for TCP exchange.
+ */
+static inline int dmaplane_init_peer(int fd,
+				     struct dmaplane_rdma_peer_info *info)
+{
+	memset(info, 0, sizeof(*info));
+	if (ioctl(fd, IOCTL_RDMA_INIT_PEER, info) < 0)
+		return -1;
+	if (info->status != 0) {
+		errno = EIO;
+		return -1;
+	}
+	return 0;
+}
+
+/*
+ * dmaplane_connect_peer — connect qp_peer using remote machine's metadata.
+ * Transitions qp_peer: INIT → RTR → RTS using remote's QPN, GID, DMAC.
+ */
+static inline int dmaplane_connect_peer(int fd,
+					struct dmaplane_rdma_peer_info *remote)
+{
+	if (ioctl(fd, IOCTL_RDMA_CONNECT_PEER, remote) < 0)
+		return -1;
+	return 0;
+}
+
+/*
+ * dmaplane_destroy_peer — destroy qp_peer + cq_peer.
+ * Moves QP to ERR state (drains WRs), then destroys QP and CQ.
+ * Must be called before dmaplane_teardown_rdma().
+ */
+static inline void dmaplane_destroy_peer(int fd)
+{
+	ioctl(fd, IOCTL_RDMA_DESTROY_PEER, 0);
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
+ *  TCP metadata exchange + credit flow (peer mode)
+ *
+ *  The sender and receiver exchange a tcp_metadata struct over TCP to
+ *  share QP connection info (GID, QPN, MAC) and MR targeting info
+ *  (addr, rkey). The sender also sends its transfer config (layers,
+ *  chunks, chunk_size) so the receiver can size its buffer.
+ *
+ *  After metadata exchange and CONNECT_PEER, a credit flow protocol
+ *  uses TCP as a side channel: each 1-byte message = 1 recv credit.
+ *  The receiver sends a credit after each recv completion + replenish.
+ *  The sender blocks on TCP read when credits hit 0.
+ * ────────────────────────────────────────────────────────────────────────── */
+
+struct tcp_metadata {
+	uint8_t  gid[16];          /* from INIT_PEER — 16-byte GID */
+	uint8_t  mac[6];           /* from INIT_PEER — Ethernet MAC for RoCEv2 */
+	uint16_t lid;              /* from INIT_PEER — LID (unused for RoCE) */
+	uint32_t qpn;              /* from INIT_PEER — QP number */
+	uint64_t mr_addr;          /* receiver's MR addr for RDMA targeting */
+	uint32_t mr_rkey;          /* receiver's MR rkey */
+	uint32_t num_layers;       /* sender's config */
+	uint32_t chunks_per_layer; /* sender's config */
+	uint32_t chunk_size;       /* sender's config */
+	uint32_t credit_window;    /* sender's config */
+	uint32_t _pad;             /* alignment */
+	uint64_t buf_size;         /* sender's total_bytes */
+};
+
+/* TCP connect — sender side. Returns connected socket fd or -1. */
+static inline int tcp_connect(const char *ip, int port)
+{
+	int fd;
+	struct sockaddr_in addr;
+
+	fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd < 0)
+		return -1;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	if (inet_pton(AF_INET, ip, &addr.sin_addr) != 1) {
+		close(fd);
+		return -1;
+	}
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* TCP listen + accept — receiver side. Returns client socket fd or -1. */
+static inline int tcp_listen_accept(int port)
+{
+	int sfd, cfd, opt = 1;
+	struct sockaddr_in addr;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(port);
+	addr.sin_addr.s_addr = INADDR_ANY;
+
+	sfd = socket(AF_INET, SOCK_STREAM, 0);
+	if (sfd < 0)
+		return -1;
+	setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	if (bind(sfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		close(sfd);
+		return -1;
+	}
+	if (listen(sfd, 1) < 0) {
+		close(sfd);
+		return -1;
+	}
+	cfd = accept(sfd, NULL, NULL);
+	close(sfd); /* close listener after accept */
+	return cfd;
+}
+
+/* Reliable send — handles partial writes. */
+static inline int tcp_send_all(int sockfd, const void *buf, size_t len)
+{
+	const uint8_t *p = (const uint8_t *)buf;
+
+	while (len > 0) {
+		ssize_t n = send(sockfd, p, len, 0);
+
+		if (n <= 0)
+			return -1;
+		p += n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+/* Reliable recv — handles partial reads. */
+static inline int tcp_recv_all(int sockfd, void *buf, size_t len)
+{
+	uint8_t *p = (uint8_t *)buf;
+
+	while (len > 0) {
+		ssize_t n = recv(sockfd, p, len, MSG_WAITALL);
+
+		if (n <= 0)
+			return -1;
+		p += n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
+static inline int tcp_send_metadata(int sockfd, struct tcp_metadata *m)
+{
+	return tcp_send_all(sockfd, m, sizeof(*m));
+}
+
+static inline int tcp_recv_metadata(int sockfd, struct tcp_metadata *m)
+{
+	return tcp_recv_all(sockfd, m, sizeof(*m));
+}
+
+/*
+ * Fill tcp_metadata with local INIT_PEER info. Caller fills MR and
+ * config fields separately.
+ */
+static inline void tcp_metadata_from_peer_info(struct tcp_metadata *m,
+					       struct dmaplane_rdma_peer_info *pi)
+{
+	memcpy(m->gid, pi->gid, 16);
+	memcpy(m->mac, pi->mac, 6);
+	m->lid = pi->lid;
+	m->qpn = pi->qp_num;
+}
+
+/*
+ * Build dmaplane_rdma_peer_info from received tcp_metadata for
+ * CONNECT_PEER ioctl.
+ */
+static inline void tcp_metadata_to_peer_info(struct tcp_metadata *m,
+					     struct dmaplane_rdma_peer_info *pi)
+{
+	memset(pi, 0, sizeof(*pi));
+	pi->qp_num = m->qpn;
+	pi->lid = m->lid;
+	memcpy(pi->gid, m->gid, 16);
+	memcpy(pi->mac, m->mac, 6);
+}
+
+/* Send one credit byte (receiver → sender). */
+static inline int tcp_send_credit(int sockfd)
+{
+	uint8_t one = 1;
+
+	return tcp_send_all(sockfd, &one, 1);
+}
+
+/*
+ * Non-blocking credit read — returns number of credits received (0 if none).
+ * Uses MSG_DONTWAIT so sender can interleave credit checks with the send loop.
+ */
+static inline int tcp_recv_credits_nonblock(int sockfd)
+{
+	uint8_t buf[64];
+	ssize_t n = recv(sockfd, buf, sizeof(buf), MSG_DONTWAIT);
+
+	if (n <= 0)
+		return 0;
+	return (int)n;
+}
+
+/*
+ * Blocking credit wait — blocks until at least 1 credit byte arrives.
+ * Used when the sender has 0 credits and must stall. Returns total
+ * credits received (1 + any extras drained non-blocking), or -1 on error.
+ */
+static inline int tcp_recv_credits_blocking(int sockfd)
+{
+	uint8_t byte;
+	ssize_t n;
+	int extra;
+
+	/* Block for exactly 1 byte */
+	n = recv(sockfd, &byte, 1, 0);
+	if (n <= 0)
+		return -1;
+
+	/* Drain any additional credits that arrived */
+	extra = tcp_recv_credits_nonblock(sockfd);
+	return 1 + extra;
+}
+
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
 
@@ -568,18 +812,42 @@ static inline int recv_loop_replenish(int fd, uint32_t mr_id, uint32_t size,
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
- *  MR metadata for TCP exchange (peer mode)
+ *  Pattern fill / verify — shared between sender and receiver
  * ────────────────────────────────────────────────────────────────────────── */
 
 /*
- * MR metadata exchanged over TCP in peer mode. The sender needs the
- * receiver's addr + rkey to target RDMA WRITEs. Stubbed for now —
- * used when TCP connection is un-stubbed for EC2 two-machine mode.
+ * fill_pattern / verify_pattern — deterministic per-chunk byte pattern.
+ *
+ * Each byte is f(layer, chunk, offset) so any chunk that lands at the wrong
+ * destination offset or gets corrupted in transit is immediately detectable.
+ * The primes (7, 13) ensure different layers/chunks don't alias.
  */
-struct mr_metadata {
-	uint64_t addr;
-	uint32_t rkey;
-	uint32_t size;
-};
+static inline void fill_pattern(uint8_t *buf, int layer, int chunk,
+				uint32_t chunk_size)
+{
+	for (uint32_t i = 0; i < chunk_size; i++)
+		buf[i] = (uint8_t)((layer * 7 + chunk * 13 + i) & 0xFF);
+}
+
+static inline int verify_pattern(const uint8_t *buf, int layer, int chunk,
+				 uint32_t chunk_size)
+{
+	int errs = 0;
+
+	for (uint32_t i = 0; i < chunk_size; i++) {
+		uint8_t expected = (uint8_t)((layer * 7 + chunk * 13 + i)
+					     & 0xFF);
+
+		if (buf[i] != expected) {
+			if (errs < 3)
+				fprintf(stderr,
+					"    MISMATCH L%d C%d byte %u: "
+					"expected 0x%02x got 0x%02x\n",
+					layer, chunk, i, expected, buf[i]);
+			errs++;
+		}
+	}
+	return errs;
+}
 
 #endif /* _KVCACHE_COMMON_H */

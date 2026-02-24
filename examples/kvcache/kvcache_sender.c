@@ -8,11 +8,14 @@
  * posts recvs on QP-B, sends WRITEIMMs on QP-A, polls CQ-B. Self-contained
  * test of the full WRITEIMM credit-window pipeline over rxe loopback.
  *
+ * Peer mode (--peer <ip>): connects to a remote kvcache_receiver over TCP,
+ * exchanges QP/MR metadata, then sends WRITEIMMs via the peer QP (qp_peer).
+ * Credit flow uses TCP as a side channel (1 byte = 1 recv credit).
+ *
  * GPU mode (--gpu): source MR is GPU-backed via IOCTL_GPU_PIN.
- * Peer mode (--peer): stubbed for future EC2 two-machine deployment.
  *
  * Build:  make -C examples/kvcache
- * Run:    sudo ./kvcache_sender [--loopback] [--gpu] [--verify] [--csv]
+ * Run:    sudo ./kvcache_sender [--loopback] [--peer <ip>] [--gpu] [--verify]
  */
 
 #include <stdio.h>
@@ -37,7 +40,8 @@ struct config {
 	uint32_t chunk_size;
 	int      credit_window;
 	int      iterations;
-	char     peer_addr[128];
+	int      port;            /* TCP port for peer mode (default: 9876) */
+	char     peer_addr[128];  /* peer IP address (peer mode only) */
 	char    *ib_dev;
 };
 
@@ -50,6 +54,7 @@ static void config_defaults(struct config *c)
 	c->chunk_size = 1 * 1024 * 1024;
 	c->credit_window = 16;
 	c->iterations = 1;
+	c->port = 9876;
 }
 
 static void usage(const char *prog)
@@ -57,7 +62,8 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"Usage: %s [OPTIONS]\n"
 		"  --loopback            Self-contained loopback test (default)\n"
-		"  --peer <ip:port>      Connect to remote kvcache_receiver\n"
+		"  --peer <ip>           Connect to remote kvcache_receiver\n"
+		"  --port <port>         TCP port (default: 9876)\n"
 		"  --gpu                 Use GPU-backed source MR (requires CUDA)\n"
 		"  --ib-dev <name>       IB device name (auto-detect if omitted)\n"
 		"  --layers N            Number of simulated layers (default: 32)\n"
@@ -75,6 +81,7 @@ static int parse_args(int argc, char *argv[], struct config *c)
 	static struct option opts[] = {
 		{"loopback",         no_argument,       NULL, 'l'},
 		{"peer",             required_argument, NULL, 'p'},
+		{"port",             required_argument, NULL, 'P'},
 		{"gpu",              no_argument,       NULL, 'g'},
 		{"ib-dev",           required_argument, NULL, 'd'},
 		{"layers",           required_argument, NULL, 'L'},
@@ -89,7 +96,7 @@ static int parse_args(int argc, char *argv[], struct config *c)
 	};
 	int opt;
 
-	while ((opt = getopt_long(argc, argv, "lp:gd:L:C:s:w:i:voh",
+	while ((opt = getopt_long(argc, argv, "lp:P:gd:L:C:s:w:i:voh",
 				  opts, NULL)) != -1) {
 		switch (opt) {
 		case 'l': c->loopback = 1; break;
@@ -98,6 +105,7 @@ static int parse_args(int argc, char *argv[], struct config *c)
 			snprintf(c->peer_addr, sizeof(c->peer_addr),
 				 "%s", optarg);
 			break;
+		case 'P': c->port = atoi(optarg); break;
 		case 'g': c->use_gpu = 1; break;
 		case 'd': c->ib_dev = optarg; break;
 		case 'L': c->layers = atoi(optarg); break;
@@ -112,44 +120,6 @@ static int parse_args(int argc, char *argv[], struct config *c)
 		}
 	}
 	return 0;
-}
-
-/* ──────────────────────────────────────────────────────────────────────────
- *  Pattern fill / verify
- * ────────────────────────────────────────────────────────────────────────── */
-
-/*
- * fill_pattern / verify_pattern — deterministic per-chunk byte pattern.
- *
- * Each byte is f(layer, chunk, offset) so any chunk that lands at the wrong
- * destination offset or gets corrupted in transit is immediately detectable.
- * The primes (7, 13) ensure different layers/chunks don't alias.
- */
-static void fill_pattern(uint8_t *buf, int layer, int chunk,
-			 uint32_t chunk_size)
-{
-	for (uint32_t i = 0; i < chunk_size; i++)
-		buf[i] = (uint8_t)((layer * 7 + chunk * 13 + i) & 0xFF);
-}
-
-static int verify_pattern(const uint8_t *buf, int layer, int chunk,
-			  uint32_t chunk_size)
-{
-	int errs = 0;
-
-	for (uint32_t i = 0; i < chunk_size; i++) {
-		uint8_t expected = (uint8_t)((layer * 7 + chunk * 13 + i) & 0xFF);
-
-		if (buf[i] != expected) {
-			if (errs < 3)
-				fprintf(stderr,
-					"    MISMATCH L%d C%d byte %u: "
-					"expected 0x%02x got 0x%02x\n",
-					layer, chunk, i, expected, buf[i]);
-			errs++;
-		}
-	}
-	return errs;
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -632,6 +602,415 @@ out:
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
+ *  Peer mode transfer
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/*
+ * run_peer — cross-machine WRITEIMM transfer via TCP + peer QP.
+ *
+ * Connects to a remote kvcache_receiver over TCP, exchanges QP/MR
+ * metadata, then sends KVCache chunks via RDMA WRITE WITH IMMEDIATE
+ * on the peer QP (qp_peer → cq_peer).
+ *
+ * Credit flow: the receiver pre-posts credit_window recvs, then sends
+ * 1-byte TCP messages as it replenishes.  The sender stalls on TCP read
+ * when credits hit 0 — no direct access to the receiver's CQ.
+ *
+ * Transfer flow:
+ *   1. Setup RDMA (creates PD, CQs, loopback QP pair — needed for PD)
+ *   2. Create source MR (host or GPU)
+ *   3. INIT_PEER — creates qp_peer + cq_peer, returns local QP metadata
+ *   4. TCP connect — exchange metadata with receiver
+ *   5. CONNECT_PEER — transitions qp_peer using remote's QPN/GID/MAC
+ *   6. Wait for "ready" signal (receiver has pre-posted recvs)
+ *   7. WRITEIMM loop with TCP credit flow
+ *   8. Send sentinel, wait for "done" ack
+ */
+static int run_peer(int fd, struct config *cfg)
+{
+	const char *role = "SENDER";
+	uint64_t start_ns = now_ns();
+	int total_chunks = cfg->layers * cfg->chunks_per_layer;
+	uint64_t total_bytes = (uint64_t)total_chunks * cfg->chunk_size;
+	int ret = 0;
+
+	/* Resource tracking */
+	uint32_t src_buf_id = 0;
+	int src_buf_ok = 0, src_mr_ok = 0;
+	int rdma_up = 0, peer_init = 0;
+	int tcp_fd = -1;
+	struct dmaplane_mr_params src_mr = {0};
+
+#ifdef HAVE_CUDA
+	void *gpu_ptr = NULL;
+	int gpu_pinned = 0, gpu_mr_ok = 0;
+	struct dmaplane_gpu_pin_params gpu_pp = {0};
+	struct dmaplane_gpu_mr_params gpu_gm = {0};
+#endif
+
+	struct latency_stats ls;
+	struct credit_tracker ct;
+
+	if (latency_stats_init(&ls, total_chunks + 16) < 0) {
+		fprintf(stderr, "  Failed to allocate latency stats\n");
+		return 1;
+	}
+
+	double total_mb = (double)total_bytes / (1024.0 * 1024.0);
+
+	print_trace(role, start_ns,
+		    "Peer mode: %s:%d, %d layers x %d chunks x %u KB = %.0f MB",
+		    cfg->peer_addr, cfg->port,
+		    cfg->layers, cfg->chunks_per_layer,
+		    cfg->chunk_size >> 10, total_mb);
+
+	/* [1] Setup RDMA — needed for PD and GID (peer QP shares the PD) */
+	if (dmaplane_setup_rdma(fd, cfg->ib_dev, 256,
+				cfg->credit_window + 16,
+				cfg->credit_window + 16) < 0) {
+		perror("  SETUP_RDMA");
+		ret = 1; goto out;
+	}
+	rdma_up = 1;
+
+	/* [2] Create source MR (host or GPU) — same logic as loopback */
+	if (cfg->use_gpu) {
+#ifdef HAVE_CUDA
+		cudaError_t cerr;
+		uint64_t gpu_va;
+
+		cerr = cudaMalloc(&gpu_ptr, total_bytes);
+		if (cerr != cudaSuccess) {
+			fprintf(stderr, "  cudaMalloc: %s\n",
+				cudaGetErrorString(cerr));
+			ret = 1; goto out;
+		}
+		gpu_va = (uint64_t)(uintptr_t)gpu_ptr;
+
+		if ((gpu_va & 0xFFFF) != 0) {
+			fprintf(stderr, "  cudaMalloc returned non-64KB-aligned"
+				" VA 0x%llx\n", (unsigned long long)gpu_va);
+			ret = 1; goto out;
+		}
+
+		if (cfg->verify) {
+			uint8_t *host_tmp = malloc(cfg->chunk_size);
+
+			if (!host_tmp) {
+				ret = 1; goto out;
+			}
+			for (int l = 0; l < cfg->layers; l++) {
+				for (int c = 0; c < cfg->chunks_per_layer; c++) {
+					int idx = l * cfg->chunks_per_layer + c;
+					uint64_t off = (uint64_t)idx * cfg->chunk_size;
+
+					fill_pattern(host_tmp, l, c,
+						     cfg->chunk_size);
+					cerr = cudaMemcpy(
+						(uint8_t *)gpu_ptr + off,
+						host_tmp, cfg->chunk_size,
+						cudaMemcpyHostToDevice);
+					if (cerr != cudaSuccess) {
+						fprintf(stderr,
+							"  cudaMemcpy: %s\n",
+							cudaGetErrorString(cerr));
+						free(host_tmp);
+						ret = 1; goto out;
+					}
+				}
+			}
+			free(host_tmp);
+			cudaDeviceSynchronize();
+		}
+
+		if (dmaplane_gpu_pin(fd, gpu_va, total_bytes, &gpu_pp) < 0) {
+			perror("  GPU_PIN");
+			ret = 1; goto out;
+		}
+		gpu_pinned = 1;
+
+		if (dmaplane_gpu_register_mr(fd, gpu_pp.handle, &gpu_gm) < 0) {
+			perror("  GPU_REGISTER_MR");
+			ret = 1; goto out;
+		}
+		gpu_mr_ok = 1;
+
+		src_mr.mr_id = gpu_gm.mr_id;
+		src_mr.lkey = gpu_gm.lkey;
+		print_trace(role, start_ns,
+			    "Source: GPU MR id=%u lkey=0x%x",
+			    gpu_gm.mr_id, gpu_gm.lkey);
+#else
+		fprintf(stderr, "  --gpu requires CUDA support (rebuild with CUDA)\n");
+		ret = 1; goto out;
+#endif
+	} else {
+		if (dmaplane_create_buffer(fd, total_bytes,
+					   DMAPLANE_NUMA_ANY,
+					   &src_buf_id) < 0) {
+			perror("  CREATE_BUFFER (src)");
+			ret = 1; goto out;
+		}
+		src_buf_ok = 1;
+
+		if (dmaplane_register_mr(fd, src_buf_id,
+					 DMAPLANE_IB_ACCESS_LOCAL_WRITE,
+					 &src_mr) < 0) {
+			perror("  REGISTER_MR (src)");
+			ret = 1; goto out;
+		}
+		src_mr_ok = 1;
+
+		if (cfg->verify) {
+			uint64_t msz;
+			uint8_t *src_ptr = dmaplane_mmap_buffer(
+				fd, src_buf_id, PROT_READ | PROT_WRITE, &msz);
+
+			if (src_ptr == MAP_FAILED) {
+				perror("  mmap (src)");
+				ret = 1; goto out;
+			}
+			for (int l = 0; l < cfg->layers; l++) {
+				for (int c = 0; c < cfg->chunks_per_layer; c++) {
+					int idx = l * cfg->chunks_per_layer + c;
+					uint64_t off = (uint64_t)idx *
+						       cfg->chunk_size;
+
+					fill_pattern(src_ptr + off, l, c,
+						     cfg->chunk_size);
+				}
+			}
+			munmap(src_ptr, msz);
+		}
+
+		print_trace(role, start_ns,
+			    "Source: host MR id=%u lkey=0x%x addr=0x%llx",
+			    src_mr.mr_id, src_mr.lkey,
+			    (unsigned long long)src_mr.addr);
+	}
+
+	/* [3] Initialize peer QP — creates qp_peer + cq_peer */
+	{
+		struct dmaplane_rdma_peer_info local_info;
+
+		if (dmaplane_init_peer(fd, &local_info) < 0) {
+			perror("  INIT_PEER");
+			ret = 1; goto out;
+		}
+		peer_init = 1;
+		print_trace(role, start_ns, "INIT_PEER: qp_num=%u",
+			    local_info.qp_num);
+
+		/* [4] TCP connect to receiver */
+		print_trace(role, start_ns, "TCP connect to %s:%d...",
+			    cfg->peer_addr, cfg->port);
+		tcp_fd = tcp_connect(cfg->peer_addr, cfg->port);
+		if (tcp_fd < 0) {
+			perror("  tcp_connect");
+			ret = 1; goto out;
+		}
+		print_trace(role, start_ns, "Connected.");
+
+		/* Send our metadata (QP info + transfer config) */
+		struct tcp_metadata send_meta = {0};
+
+		tcp_metadata_from_peer_info(&send_meta, &local_info);
+		send_meta.num_layers = cfg->layers;
+		send_meta.chunks_per_layer = cfg->chunks_per_layer;
+		send_meta.chunk_size = cfg->chunk_size;
+		send_meta.credit_window = cfg->credit_window;
+		send_meta.buf_size = total_bytes;
+
+		if (tcp_send_metadata(tcp_fd, &send_meta) < 0) {
+			fprintf(stderr, "  tcp_send_metadata failed\n");
+			ret = 1; goto out;
+		}
+
+		/* Receive receiver's metadata (QP info + MR addr/rkey) */
+		struct tcp_metadata recv_meta;
+
+		if (tcp_recv_metadata(tcp_fd, &recv_meta) < 0) {
+			fprintf(stderr, "  tcp_recv_metadata failed\n");
+			ret = 1; goto out;
+		}
+
+		print_trace(role, start_ns,
+			    "Remote: qpn=%u, mr_addr=0x%llx, mr_rkey=0x%x",
+			    recv_meta.qpn,
+			    (unsigned long long)recv_meta.mr_addr,
+			    recv_meta.mr_rkey);
+
+		/* [5] Connect peer QP using remote's metadata */
+		struct dmaplane_rdma_peer_info remote_info;
+
+		tcp_metadata_to_peer_info(&recv_meta, &remote_info);
+		if (dmaplane_connect_peer(fd, &remote_info) < 0) {
+			perror("  CONNECT_PEER");
+			ret = 1; goto out;
+		}
+		print_trace(role, start_ns, "CONNECT_PEER: connected.");
+
+		/* [6] Wait for receiver's "ready" signal */
+		{
+			uint8_t ready;
+
+			if (tcp_recv_all(tcp_fd, &ready, 1) < 0) {
+				fprintf(stderr, "  Failed to receive ready signal\n");
+				ret = 1; goto out;
+			}
+			print_trace(role, start_ns, "Receiver ready.");
+		}
+
+		/* [7] WRITEIMM loop with TCP credit flow */
+		uint64_t remote_addr = recv_meta.mr_addr;
+		uint32_t remote_rkey = recv_meta.mr_rkey;
+
+		for (int iter = 0; iter < cfg->iterations; iter++) {
+			uint64_t iter_start = now_ns();
+			struct layer_bitmap bm;
+
+			bitmap_init(&bm, cfg->layers, cfg->chunks_per_layer);
+			credit_init(&ct, cfg->credit_window);
+
+			for (int l = 0; l < cfg->layers; l++) {
+				for (int c = 0; c < cfg->chunks_per_layer; c++) {
+					int idx = l * cfg->chunks_per_layer + c;
+					uint64_t off = (uint64_t)idx * cfg->chunk_size;
+					uint32_t imm = KVCACHE_IMM_ENCODE(l, c);
+					uint64_t send_start = now_ns();
+					uint64_t elapsed;
+					int got;
+
+					/* Stall if no credits — block on TCP
+					 * until receiver sends credit bytes */
+					if (ct.credits <= 0) {
+						uint64_t stall_start = now_ns();
+
+						got = tcp_recv_credits_blocking(tcp_fd);
+						if (got < 0) {
+							fprintf(stderr,
+								"  TCP credit recv failed\n");
+							ret = 1; goto out;
+						}
+						ct.credits += got;
+						ct.stall_count++;
+						ct.total_stall_ns +=
+							now_ns() - stall_start;
+					}
+
+					/* Opportunistic non-blocking drain */
+					got = tcp_recv_credits_nonblock(tcp_fd);
+					if (got > 0)
+						ct.credits += got;
+
+					if (dmaplane_write_imm(fd, src_mr.mr_id, off,
+							       remote_addr + off,
+							       remote_rkey,
+							       cfg->chunk_size, imm,
+							       1, &elapsed) < 0) {
+						perror("  WRITE_IMM");
+						ret = 1; goto out;
+					}
+					ct.credits--;
+
+					if (!cfg->csv)
+						print_trace(role, start_ns,
+							    "-> WRITEIMM L%d C%d "
+							    "(%u KB) imm=0x%08x "
+							    "[credits: %d] %.1fms",
+							    l, c,
+							    cfg->chunk_size >> 10,
+							    imm, ct.credits,
+							    (double)elapsed / 1e6);
+
+					latency_stats_add(&ls,
+							  now_ns() - send_start);
+				}
+			}
+
+			/* Send sentinel */
+			if (dmaplane_write_imm(fd, src_mr.mr_id, 0,
+					       remote_addr, remote_rkey,
+					       4, KVCACHE_SENTINEL,
+					       1, NULL) < 0) {
+				perror("  WRITE_IMM (sentinel)");
+				ret = 1; goto out;
+			}
+			if (!cfg->csv)
+				print_trace(role, start_ns, "-> SENTINEL");
+
+			/* Wait for receiver's "done" ack */
+			{
+				uint8_t done;
+
+				if (tcp_recv_all(tcp_fd, &done, 1) < 0) {
+					fprintf(stderr,
+						"  Failed to receive done ack\n");
+					ret = 1; goto out;
+				}
+			}
+
+			uint64_t iter_elapsed = now_ns() - iter_start;
+			double iter_secs = (double)iter_elapsed / 1e9;
+			double throughput = total_mb / iter_secs;
+
+			if (cfg->csv) {
+				double avg, p50, p99;
+
+				latency_stats_compute(&ls, &avg, &p50, &p99);
+				printf("%.0f,%.1f,%.1f,%.1f,%.1f\n",
+				       total_mb, throughput, avg, p50, p99);
+			} else {
+				print_trace(role, start_ns,
+					    "Transfer complete: %.0f MB in %.3fs",
+					    total_mb, iter_secs);
+				print_trace(role, start_ns,
+					    "  Throughput: %.1f MB/s", throughput);
+				latency_stats_print(&ls, role, start_ns);
+				print_trace(role, start_ns,
+					    "  Credits stalled: %d times (avg: %.1fms)",
+					    ct.stall_count,
+					    ct.stall_count > 0 ?
+					    (double)ct.total_stall_ns /
+					    ct.stall_count / 1e6 : 0.0);
+				print_trace(role, start_ns,
+					    "  Chunks: %d sent",
+					    total_chunks);
+			}
+		}
+	}
+
+out:
+	/* Cleanup order:
+	 *   1. Close TCP (stops credit flow)
+	 *   2. Destroy peer QP (drains WRs on qp_peer)
+	 *   3. Teardown RDMA (destroys loopback QPs, CQs, PD)
+	 *   4. Deregister MRs
+	 *   5. GPU unpin + cudaFree
+	 *   6. Destroy buffers */
+	if (tcp_fd >= 0)
+		close(tcp_fd);
+	if (peer_init)
+		dmaplane_destroy_peer(fd);
+	if (rdma_up)
+		dmaplane_teardown_rdma(fd);
+	if (src_mr_ok)
+		dmaplane_deregister_mr(fd, src_mr.mr_id);
+#ifdef HAVE_CUDA
+	if (gpu_mr_ok)
+		dmaplane_deregister_mr(fd, gpu_gm.mr_id);
+	if (gpu_pinned)
+		dmaplane_gpu_unpin(fd, gpu_pp.handle);
+	if (gpu_ptr)
+		cudaFree(gpu_ptr);
+#endif
+	if (src_buf_ok)
+		dmaplane_destroy_buffer(fd, src_buf_id);
+	latency_stats_free(&ls);
+	return ret;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────
  *  Main
  * ────────────────────────────────────────────────────────────────────────── */
 
@@ -644,19 +1023,17 @@ int main(int argc, char *argv[])
 	if (parse_args(argc, argv, &cfg) < 0)
 		return 1;
 
-	if (!cfg.loopback) {
-		fprintf(stderr,
-			"Peer mode not yet implemented. Use --loopback.\n");
-		return 1;
-	}
-
 	fd = open(DMAPLANE_DEVICE, O_RDWR);
 	if (fd < 0) {
 		perror("open " DMAPLANE_DEVICE);
 		return 1;
 	}
 
-	ret = run_loopback(fd, &cfg);
+	if (cfg.loopback)
+		ret = run_loopback(fd, &cfg);
+	else
+		ret = run_peer(fd, &cfg);
+
 	close(fd);
 	return ret;
 }
