@@ -6,7 +6,7 @@ dmaplane is a Linux kernel module for learning the host-side data path between A
 
 ## Current Phase
 
-Phase 9D — EC2 deployment — **CURRENT**. See `docs/reference/MASTER_PLAN.md` for the full phase spec.
+Phase 9D — Disaggregated inference servers — **COMPLETE**. See `docs/reference/MASTER_PLAN.md` for the full phase spec.
 
 ## Key References
 
@@ -124,6 +124,6 @@ dmaplane-master/
 | 8 | **COMPLETE** | GPU memory integration |
 | 9A | **COMPLETE** | WRITEIMM kernel verbs + KVCache pipeline |
 | 9C | **COMPLETE** | Two-machine KVCache sender/receiver |
-| 9D | **CURRENT** | EC2 deployment |
+| 9D | **COMPLETE** | Disaggregated inference servers |
 
 Update the "Status" column and "Current Phase" section as phases are completed.
