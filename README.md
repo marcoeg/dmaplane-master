@@ -1,6 +1,7 @@
 # dmaplane
 
-A Linux kernel module for learning the host-side data path between AI frameworks (PyTorch, NCCL) and hardware (GPUs, NICs, DRAM). dmaplane exposes a character device (`/dev/dmaplane`) controlled via ioctl, implementing the buffer orchestration layer that sits beneath transport libraries — DMA allocation, NUMA-aware placement, RDMA memory registration, dma-buf zero-copy sharing, GPU BAR pinning, credit-based flow control, and disaggregated KVCache transfer. The project builds cumulatively across nine phases, each targeting a specific kernel subsystem.
+A Linux kernel module that implements the buffer orchestration layer for AI data transport from first principles.
+dmaplane exposes a character device (`/dev/dmaplane`) controlled via ioctl, implementing the buffer orchestration layer that sits beneath transport libraries and includes: DMA allocation, NUMA-aware placement, RDMA memory registration, dma-buf zero-copy sharing, GPU BAR pinning, credit-based flow control, and disaggregated KVCache transfer. The project builds cumulatively across nine phases, each targeting a specific kernel subsystem.
 
 ## Phase Index
 

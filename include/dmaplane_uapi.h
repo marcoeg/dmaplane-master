@@ -17,12 +17,18 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 
-/* Map kernel fixed-width types to userspace equivalents */
+/* Map kernel fixed-width types to userspace equivalents.
+ * Skipped when <linux/types.h> was already included (e.g., by libibverbs
+ * headers) — that header defines __u64 as 'unsigned long long' via
+ * asm-generic/int-ll64.h, which conflicts with our uint64_t typedef
+ * ('unsigned long' on x86_64). */
+#ifndef _LINUX_TYPES_H
 typedef uint8_t  __u8;
 typedef uint16_t __u16;
 typedef uint32_t __u32;
 typedef uint64_t __u64;
 typedef int32_t  __s32;
+#endif
 #endif
 
 /* Module name */
@@ -870,6 +876,12 @@ struct dmaplane_poll_recv_params {
 #define IOCTL_RDMA_INIT_PEER	DMAPLANE_IOCTL_RDMA_INIT_PEER
 #define IOCTL_RDMA_CONNECT_PEER	DMAPLANE_IOCTL_RDMA_CONNECT_PEER
 #define IOCTL_RDMA_DESTROY_PEER	DMAPLANE_IOCTL_RDMA_DESTROY_PEER
+#define IOCTL_GET_STATS		DMAPLANE_IOCTL_GET_STATS
+#define IOCTL_LOOPBACK_TEST	DMAPLANE_IOCTL_LOOPBACK_TEST
+#define IOCTL_PINGPONG_BENCH	DMAPLANE_IOCTL_PINGPONG_BENCH
+#define IOCTL_STREAMING_BENCH	DMAPLANE_IOCTL_STREAMING_BENCH
+#define IOCTL_RDMA_REMOTE_SEND	DMAPLANE_IOCTL_RDMA_REMOTE_SEND
+#define IOCTL_RDMA_REMOTE_RECV	DMAPLANE_IOCTL_RDMA_REMOTE_RECV
 #endif /* !__KERNEL__ */
 
 #endif /* _DMAPLANE_UAPI_H */
