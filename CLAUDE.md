@@ -102,9 +102,8 @@ dmaplane-master/
 │   ├── misc/                  # Standalone demos (Phase 2+)
 │   ├── streamer/              # Weight-streaming TUI (Phase 6)
 │   ├── gpu_rdma/              # GPU VRAM over RDMA (Phase 8)
-│   ├── kvcache/               # KVCache WRITEIMM pipeline (Phase 9)
-│   ├── netshare/              # Two-machine RDMA (Phase 4+)
-│   └── inference/             # Disaggregated inference (Phase 9)
+│   ├── kvcache/               # KVCache WRITEIMM pipeline + inference servers (Phase 9)
+│   └── netshare/              # Cross-machine host RDMA via rdma_cm (Phase 4)
 ├── docs/                      # Blog posts (one per phase, output)
 │   └── reference/             # Master plan, code overview, narrative (input)
 └── scripts/                   # Build, setup, benchmark automation

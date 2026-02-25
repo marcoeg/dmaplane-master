@@ -93,9 +93,8 @@ dmaplane-master/
 │   ├── misc/                  # Standalone demos: dma_explorer, dma_sweep, trace_explorer
 │   ├── gpu_rdma/              # Cross-machine GPU VRAM over RDMA (Phase 8)
 │   ├── kvcache/               # KVCache WRITEIMM pipeline + inference servers (Phase 9)
-│   ├── streamer/              # Weight-streaming TUI (Phase 6, deferred)
-│   ├── netshare/              # Two-machine RDMA (Phase 4+)
-│   └── inference/             # → see examples/kvcache/
+│   ├── streamer/              # Weight-streaming TUI (Phase 6)
+│   └── netshare/              # Cross-machine host RDMA via rdma_cm (Phase 4)
 ├── aws/                       # CloudFormation stacks for EC2 validation
 ├── docs/                      # Blog posts (one per phase)
 │   └── reference/             # Engineering plan, code overview, narrative

@@ -9,4 +9,3 @@ Progressive demos that build on each phase.
 | `streamer/` | 6 | Weight-streaming TUI (`weight_streamer_tui` — ncurses) |
 | `gpu_rdma/` | 8 | Cross-machine GPU VRAM over RDMA (`gpu_sender` / `gpu_receiver`) |
 | `kvcache/` | 9 | KVCache WRITEIMM pipeline, C sender/receiver, Python inference servers |
-| `inference/` | 9 | Redirect to `kvcache/` |
