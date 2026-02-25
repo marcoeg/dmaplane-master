@@ -5,19 +5,21 @@ dmaplane exposes a character device (`/dev/dmaplane`) controlled via ioctl, impl
 
 ## Phase Index
 
-| Phase | Status | Topic |
-|-------|--------|-------|
-| 1 | Complete | Driver foundations & concurrency |
-| 2 | Complete | DMA memory allocation |
-| 3 | Complete | dma-buf export & zero-copy sharing |
-| 4 | Complete | RDMA engine |
-| 5 | Complete | NUMA, topology & optimization |
-| 6 | Complete | Backpressure & flow control |
-| 7 | Complete | Instrumentation & latency measurement |
-| 8 | Complete | GPU memory integration |
-| 9A | Complete | WRITEIMM kernel verbs + KVCache pipeline |
-| 9C | Complete | Two-machine KVCache sender/receiver |
-| 9D | Complete | Disaggregated inference servers |
+| Phase | Tag | Topic |
+|-------|-----|-------|
+| 1 | `phase-1-complete` | Driver foundations & concurrency |
+| 2 | `phase-2-complete` | DMA memory allocation |
+| 3 | `phase-3-complete` | dma-buf export & zero-copy sharing |
+| 4 | `phase-4-complete` | RDMA engine |
+| 5 | `phase-5-complete` | NUMA, topology & optimization |
+| 6 | `phase-6-complete` | Backpressure & flow control |
+| 7 | `phase-7-complete` | Instrumentation & latency measurement |
+| 8 | `phase-8-complete` | GPU memory integration |
+| 9A | `phase-9a-complete` | WRITEIMM kernel verbs + KVCache pipeline |
+| 9C | `phase-9c-complete` | Two-machine KVCache sender/receiver |
+| 9D | `phase-9d-complete` | Disaggregated inference servers |
+
+Each tag is an immutable snapshot of the codebase at the end of that phase.
 
 ## Build & Test
 
@@ -105,7 +107,6 @@ dmaplane-master/
 
 - **[Full Engineering Plan](docs/reference/MASTER_PLAN.md)** — 9-phase spec with acceptance criteria and skill KPIs
 - **[Code Overview](docs/reference/CODE_OVERVIEW.md)** — Detailed analysis of every source file, updated each phase
-- **[Project Narrative](docs/reference/NARRATIVE_dmaplane_foundation.md)** — Technical essay on positioning, use cases, and relationship to production systems
 
 ## License
 

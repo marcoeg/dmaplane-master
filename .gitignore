@@ -65,3 +65,14 @@ examples/misc/dma_sweep
 examples/gpu_rdma/gpu_receiver
 examples/gpu_rdma/gpu_sender
 examples/misc/trace_explorer
+examples/netshare/sender
+examples/netshare/receiver
+examples/streamer/weight_streamer_tui
+
+# Local-only files (not tracked)
+phase*_claude_code_prompt*.md
+phase9*_prompt.md
+docs/reference/NARRATIVE_dmaplane_foundation.md
+docs/reference/CODE_OVERVIEW_original.md
+Notes.md
+*.tar.gz
